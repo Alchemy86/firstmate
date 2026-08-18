@@ -1244,14 +1244,14 @@ test_listener_filters() {
     "firstmate's own outbound echo was ingested as an instruction"
 
   out=$(fixture "$home" "$(msg GRPMSG 0 '99-88@g.us' true '{"conversation":"in a group"}')")
-  assert_refused "$out" 'non-direct chat' "a group message was ingested"
+  assert_refused "$out" "not the captain's direct chat" "a group message was ingested"
 
   out=$(fixture "$home" "$(msg FWDMSG 0 "$CAPTAIN@s.whatsapp.net" true \
     '{"extendedTextMessage":{"text":"do this","contextInfo":{"isForwarded":true,"forwardingScore":3}}}')")
   assert_refused "$out" 'forwarded message' "a forwarded message was ingested"
 
   out=$(fixture "$home" "$(printf '{"stanza_from":"447111111111:0@s.whatsapp.net","message":{"key":{"id":"OTHERMSG","remoteJid":"447111111111@s.whatsapp.net","fromMe":false},"messageTimestamp":%s,"message":{"conversation":"hi"}}}' "$(next_ts)")")
-  assert_refused "$out" 'chat is not the captain' \
+  assert_refused "$out" "not the captain's direct chat" \
     "a message from someone other than the captain was ingested"
 
   out=$(fixture "$home" "$(msg EMPTYMSG 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"   "}')")
@@ -1624,6 +1624,67 @@ test_removing_the_config_restores_the_home_exactly() {
   pass "removing config/whatsapp.env restores the home byte-for-byte and repeats safely"
 }
 
+# The captain's account has two identities and WhatsApp uses both: some
+# deliveries of his self-chat are addressed to his phone number, others to his
+# LID. Reproduced live on 2026-08-18 - every real message he sent arrived as
+# "<lid>@lid" and was refused as a non-direct chat, so state/wa-inbox stayed
+# empty while he believed he was messaging firstmate.
+CAPTAIN_LID=100000000000001
+
+lid_fixture() {
+  local home=$1 body=$2
+  printf '%s' "$body" | FM_WA_STATE="$home/state" FM_WA_AUTH_DIR="$home/state/wa-auth" \
+    FM_WA_CAPTAIN="$CAPTAIN" FM_WA_ALLOW_DEVICES=0 FM_WA_SELF_LID="$CAPTAIN_LID" \
+    node "$LISTENER" handle-fixture 2>/dev/null
+}
+
+lid_msg() {
+  # lid_msg <id> <chat-jid> <inner-json>
+  printf '{"stanza_from":"%s:0@lid","message":{"key":{"id":"%s","remoteJid":"%s","fromMe":true},"messageTimestamp":%s,"message":%s}}' \
+    "$CAPTAIN_LID" "$1" "$2" "$(next_ts)" "$3"
+}
+
+test_captain_reaches_us_under_either_identity() {
+  command -v node >/dev/null 2>&1 || { pass "LID identity skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/lid"
+  new_home "$home"
+
+  out=$(lid_fixture "$home" "$(lid_msg LIDMSG "$CAPTAIN_LID@lid" '{"conversation":"testing from the road"}')")
+  assert_contains "$out" 'ACCEPTED' "the captain's LID self-chat was refused, so his real messages are dropped"
+  assert_grep '"sender": "'"$CAPTAIN"'"' "$home/state/wa-inbox/LIDMSG.json"     "a LID-addressed message did not record the captain's number as the sender"
+  assert_grep '"chat_identity": "lid"' "$home/state/wa-inbox/LIDMSG.json"     "the stashed record does not say which identity the chat used"
+
+  # The same message under his phone-number identity must still work.
+  out=$(fixture "$home" "$(msg PNMSG 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"and from the desk"}')")
+  assert_contains "$out" 'ACCEPTED' "the phone-number form regressed while adding the LID form"
+
+  pass "the captain reaches firstmate under either of his two WhatsApp identities"
+}
+
+test_lid_acceptance_is_not_a_hole() {
+  command -v node >/dev/null 2>&1 || { pass "LID security skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/lidsec"
+  new_home "$home"
+
+  out=$(lid_fixture "$home" "$(lid_msg LIDGRP '445566@g.us' '{"conversation":"group message"}')")
+  assert_contains "$out" 'REJECTED' "a group message was accepted once LID chats were allowed"
+
+  out=$(lid_fixture "$home" "$(lid_msg LIDSTRANGER '999888777666@lid' '{"conversation":"not the captain"}')")
+  assert_contains "$out" 'REJECTED' "another user's LID was accepted as the captain"
+
+  out=$(lid_fixture "$home" "$(lid_msg LIDCAST '1234@broadcast' '{"conversation":"broadcast"}')")
+  assert_contains "$out" 'REJECTED' "a broadcast was accepted"
+
+  # With no LID established from our own credentials there is nothing proving a
+  # LID chat is his, so it must fail closed rather than be assumed.
+  out=$(printf '%s' "$(lid_msg LIDNOSELF "$CAPTAIN_LID@lid" '{"conversation":"no identity known"}')"     | FM_WA_STATE="$home/state" FM_WA_AUTH_DIR="$home/state/wa-auth"       FM_WA_CAPTAIN="$CAPTAIN" FM_WA_ALLOW_DEVICES=0       node "$LISTENER" handle-fixture 2>/dev/null)
+  assert_contains "$out" 'REJECTED' "a LID chat was accepted with no LID identity established"
+
+  pass "accepting the captain's LID admits only him, never a group, broadcast or stranger"
+}
+
 test_off_by_default
 test_removing_config_reverts_to_silence
 test_check_contract
@@ -1665,6 +1726,8 @@ test_dry_run_record_is_valid_json
 test_message_text_is_never_executed
 test_config_is_read_as_data
 test_listener_filters
+test_captain_reaches_us_under_either_identity
+test_lid_acceptance_is_not_a_hole
 test_listener_is_idempotent
 test_listener_captures_quoted_context
 test_echo_digest_guard

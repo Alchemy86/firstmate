@@ -330,6 +330,49 @@ function attachmentKind(message) {
 
 // ------------------------------------------------------------- accept/deny ---
 
+// The captain's own account has TWO identities, and WhatsApp uses both. His
+// self-chat arrives addressed to his phone number (@s.whatsapp.net) on some
+// deliveries and to his LID (@lid) on others, and a message addressed to the
+// LID form is still the same chat with the same person. Both identities come
+// from THIS listener's own credentials rather than from configuration or a
+// string pattern, so the pairing itself is what proves which LID is his.
+const SELF = { pn: null, lid: null }
+
+function adoptSelfIdentity(user) {
+  if (!user) return
+  const pn = jidUser(user.id)
+  const lid = jidUser(user.lid)
+  if (pn) SELF.pn = pn
+  if (lid) SELF.lid = lid
+}
+
+// Read the identities straight from the credential folder, so they are known
+// before the socket reports open and survive a reconnect.
+function loadSelfIdentityFromCreds() {
+  try {
+    const creds = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, 'creds.json'), 'utf8'))
+    adoptSelfIdentity(creds?.me)
+  } catch { /* not paired yet */ }
+  if (process.env.FM_WA_SELF_LID) SELF.lid = String(process.env.FM_WA_SELF_LID).replace(/[^0-9]/g, '') || SELF.lid
+}
+
+// The captain's direct chat, in either identity form, and nothing else.
+// Groups, broadcasts, status and newsletters can never match: they carry their
+// own server suffixes, and the user must equal one of our own two identities.
+function isCaptainDirectChat(remoteJid) {
+  const user = jidUser(remoteJid)
+  if (!user) return false
+  if (remoteJid.endsWith('@s.whatsapp.net')) {
+    return CAPTAIN === '' ? user === SELF.pn : user === CAPTAIN
+  }
+  if (remoteJid.endsWith('@lid')) {
+    // Fail closed: with no LID established from our own credentials there is
+    // nothing to prove this chat is his, so it is refused rather than assumed.
+    return SELF.lid !== null && user === SELF.lid
+  }
+  return false
+}
+
 function jidUser(jid) {
   if (typeof jid !== 'string') return null
   const at = jid.indexOf('@')
@@ -356,6 +399,7 @@ function deviceAllowed(device) {
 // ------------------------------------------------------------------ listen ---
 
 async function runListen() {
+  loadSelfIdentityFromCreds()
   ensurePrivateDir(STATE)
 
   // The status file is how bin/fm-wa-poll.sh judges the LIVE listener, and it
@@ -473,6 +517,7 @@ async function runListen() {
       if (connection === 'open') {
         backoff = 1000
         connected = true
+        adoptSelfIdentity(sock.user)
         const me = sock.user?.id ?? null
         touchBeat()
         logLine(`connected as ${me}`)
@@ -528,13 +573,11 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
     return reject('older than the history watermark', id)
   }
 
-  // Groups, broadcasts, status and newsletters are never a captain instruction.
-  if (!remoteJid.endsWith('@s.whatsapp.net')) return reject('non-direct chat', remoteJid)
-
   // The channel is the captain's own chat with himself: his phone writes it,
-  // firstmate's linked device reads it. Anything with another user on either
-  // side of the key is not that channel.
-  if (CAPTAIN !== '' && jidUser(remoteJid) !== CAPTAIN) return reject('chat is not the captain', remoteJid)
+  // firstmate's linked device reads it. He reaches it under either of his two
+  // identities, so both are accepted and everything else - groups, broadcasts,
+  // status, newsletters, another user - is refused.
+  if (!isCaptainDirectChat(remoteJid)) return reject('not the captain\'s direct chat', remoteJid)
   if (key.fromMe !== true) return reject('not from the captain account', remoteJid)
 
   const body = unwrap(msg.message)
@@ -576,7 +619,10 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
     schema: 'fm-wa-inbox-v1',
     id,
     chat_jid: remoteJid,
-    sender: jidUser(remoteJid),
+    // Always his phone number, so a consumer never has to know which identity
+    // WhatsApp happened to address this delivery to.
+    sender: CAPTAIN || SELF.pn || jidUser(remoteJid),
+    chat_identity: remoteJid.endsWith('@lid') ? 'lid' : 'phone-number',
     sender_device: device,
     from_me: true,
     timestamp,
@@ -613,6 +659,7 @@ function reject(why, detail) {
 // and prints the resulting inbox decision.
 
 async function runFixture() {
+  loadSelfIdentityFromCreds()
   ensurePrivateDir(STATE)
   ensurePrivateDir(INBOX)
   ensurePrivateDir(SEEN)
