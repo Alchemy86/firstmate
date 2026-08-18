@@ -198,6 +198,87 @@ test_repeated_listener_exits_are_reported() {
   pass "a listener that dies on every restart is reported rather than respawned forever"
 }
 
+test_slow_flap_still_reaches_the_restart_limit() {
+  local home
+  home="$TMP_ROOT/slowflap"
+  new_home "$home"
+  fake_listener "$home"
+  printf '1\n' > "$home/state/wa-listener.beat"
+  # A listener that dies on a period longer than the check interval: alive on
+  # this cycle, restarted moments ago, and already twice down.
+  printf '2\n' > "$home/state/wa-listener.restarts"
+  : > "$home/state/wa-listener.restart"
+
+  poll "$home" >/dev/null
+  assert_grep '2' "$home/state/wa-listener.restarts" \
+    "one live observation erased a flapping listener's restart history"
+
+  # No restart has been needed for a long stretch, so the listener really is up.
+  touch -t 200001010000 "$home/state/wa-listener.restart"
+  poll "$home" >/dev/null
+  assert_absent "$home/state/wa-listener.restarts" \
+    "a listener that stayed up without a restart kept its stale restart history"
+
+  pass "restart history survives a live cycle and clears only after a stable stretch"
+}
+
+test_a_refused_restart_says_why_in_the_log() {
+  local home bindir waited
+  home="$TMP_ROOT/spawnlog"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+
+  # A listener wrapper that refuses before the listener can open its own log,
+  # the way the real one does with no node or an unusable state directory. The
+  # fault line the poll eventually prints names that log, so the reason has to
+  # reach it.
+  bindir="$TMP_ROOT/spawnlog-bin"
+  mkdir -p "$bindir"
+  cp "$POLL" "$LIB" "$bindir/"
+  cat > "$bindir/fm-wa-listen.sh" <<'SH'
+#!/usr/bin/env bash
+echo "error: node is required for the WhatsApp listener" >&2
+exit 1
+SH
+  chmod +x "$bindir/fm-wa-listen.sh"
+
+  FM_HOME="$home" "$bindir/fm-wa-poll.sh" >/dev/null 2>&1
+
+  waited=0
+  while [ "$waited" -lt 25 ] \
+    && ! grep -q 'node is required' "$home/state/wa-listener.log" 2>/dev/null; do
+    sleep 0.2
+    waited=$(( waited + 1 ))
+  done
+  assert_grep 'node is required' "$home/state/wa-listener.log" \
+    "a restart that never got off the ground left no reason in the log the fault line names"
+
+  pass "a restart refused by the listener wrapper explains itself in the listener log"
+}
+
+test_outbound_digests_are_pruned() {
+  local home
+  home="$TMP_ROOT/sentjanitor"
+  new_home "$home"
+  fake_listener "$home"
+  printf '1\n' > "$home/state/wa-listener.beat"
+  mkdir -p "$home/state/wa-sent"
+  chmod 700 "$home/state/wa-sent"
+  : > "$home/state/wa-sent/aaaa.sent"
+  touch -t 200001010000 "$home/state/wa-sent/aaaa.sent"
+  : > "$home/state/wa-sent/bbbb.sent"
+
+  poll "$home" >/dev/null
+
+  assert_absent "$home/state/wa-sent/aaaa.sent" \
+    "an outbound digest long past the echo window was never pruned"
+  assert_present "$home/state/wa-sent/bbbb.sent" \
+    "pruning removed a digest that could still match a live echo"
+
+  pass "outbound digests are bounded by the poll, not only by an inbound message"
+}
+
 test_stalled_listener_is_reported() {
   local home out
   home="$TMP_ROOT/stalled"
@@ -544,6 +625,15 @@ test_listener_filters() {
   out=$(fixture "$home" "$(msg EMPTYMSG 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"   "}')")
   assert_refused "$out" 'no text to act on' "an empty message was stashed"
 
+  # A voice note with no caption is still the captain reaching out, and silence
+  # on his phone reads as being ignored.
+  out=$(fixture "$home" "$(msg VOICEMSG 0 "$CAPTAIN@s.whatsapp.net" true '{"audioMessage":{"ptt":true,"seconds":7}}')")
+  assert_contains "$out" 'ACCEPTED' "a caption-less voice note was silently discarded"
+  assert_grep '"attachment": "audio"' "$home/state/wa-inbox/VOICEMSG.json" \
+    "the stashed voice note did not name what kind of attachment it was"
+  assert_grep '"text": ""' "$home/state/wa-inbox/VOICEMSG.json" \
+    "the stashed voice note did not record that it carried no text"
+
   # Only history is older than the watermark; a second message in the same
   # second as an accepted one is a new instruction, not a redelivery.
   local same_second
@@ -672,6 +762,9 @@ test_channel_fault_and_inbox_never_share_a_cycle
 test_logged_out_listener_is_reported
 test_repeated_listener_exits_are_reported
 test_stalled_listener_is_reported
+test_slow_flap_still_reaches_the_restart_limit
+test_outbound_digests_are_pruned
+test_a_refused_restart_says_why_in_the_log
 test_listener_that_never_connects_is_reported
 test_repairing_the_link_clears_stale_listener_health
 test_listener_state_growth_is_bounded

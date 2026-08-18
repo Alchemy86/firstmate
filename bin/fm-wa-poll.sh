@@ -24,8 +24,9 @@
 #   listener down but paired         -> restart it in the background, rate-limited
 #   a configuration or listener fault -> one rate-limited "wa-channel-error ..."
 #
-# It is also the channel's janitor, silently: the listener log is capped and
-# long-expired per-message markers are pruned on the way through.
+# It is also the channel's janitor, silently: the listener log is capped, and
+# long-expired per-message markers and outbound digests are pruned on the way
+# through.
 #
 # Exactly one line is ever printed. A cycle that reports a channel fault stops
 # there rather than also announcing the inbox, because the two lines mean
@@ -55,6 +56,12 @@ LISTENER_BEAT="$FM_WA_STATE/wa-listener.beat"
 RESTART_FAILS="$FM_WA_STATE/wa-listener.restarts"
 # A listener that dies this many times in a row is not going to heal itself.
 RESTART_FAIL_LIMIT=3
+# One live observation is not proof the channel is stable: a listener dying on a
+# period longer than the check interval is seen alive on some cycles, which
+# would zero the restart history before it ever reached the limit and let the
+# channel flap forever while every cycle reported health. The history is only
+# cleared once no restart has been needed for this long.
+STABLE_INTERVAL=3600
 # The listener touches its beat only while the connection is actually open, so a
 # beat this stale means an alive process with a channel that is not working.
 STALL_INTERVAL=900
@@ -65,6 +72,9 @@ LOG_KEEP_LINES=2000
 # Well behind any watermark a redelivery could still clear, so pruning a marker
 # can never let an old message back into the inbox.
 SEEN_TTL_DAYS=30
+# Past the listener's ten-minute echo window an outbound digest is dead by
+# definition, so nothing it could still suppress is lost by sweeping it.
+SENT_TTL_MINUTES=60
 
 # Set when this cycle has already spoken, so the check keeps its one-line
 # contract.
@@ -108,11 +118,18 @@ restart_failures() {
 # setsid detaches the listener from this check's process group so the watcher
 # reaping the check never takes the listener with it. macOS has no setsid, so
 # fall back to nohup rather than failing the restart silently.
+# The wrapper's own refusals - no node, not paired, an unusable state directory,
+# an immediate exit - are raised before the listener ever opens its log, so they
+# go to that same log rather than to /dev/null. The fault line this poll prints
+# after three failed restarts names that log, and it must actually answer why.
 spawn_listener() {
+  if [ ! -e "$FM_WA_LOG" ]; then
+    ( umask 077; : >> "$FM_WA_LOG" ) 2>/dev/null || true
+  fi
   if command -v setsid >/dev/null 2>&1; then
-    FM_HOME="$FM_HOME" setsid "$SCRIPT_DIR/fm-wa-listen.sh" start >/dev/null 2>&1 </dev/null &
+    FM_HOME="$FM_HOME" setsid "$SCRIPT_DIR/fm-wa-listen.sh" start >>"$FM_WA_LOG" 2>&1 </dev/null &
   else
-    FM_HOME="$FM_HOME" nohup "$SCRIPT_DIR/fm-wa-listen.sh" start >/dev/null 2>&1 </dev/null &
+    FM_HOME="$FM_HOME" nohup "$SCRIPT_DIR/fm-wa-listen.sh" start >>"$FM_WA_LOG" 2>&1 </dev/null &
   fi
   disown 2>/dev/null || true
 }
@@ -134,9 +151,17 @@ prune_state() {
       rm -f -- "$FM_WA_LOG.trim" 2>/dev/null || true
     fi
   fi
-  [ -d "$FM_WA_SEEN" ] || return 0
-  find "$FM_WA_SEEN" -maxdepth 1 -name '*.seen' -type f -mtime "+$SEEN_TTL_DAYS" \
-    -exec rm -f -- {} + 2>/dev/null || true
+  if [ -d "$FM_WA_SEEN" ]; then
+    find "$FM_WA_SEEN" -maxdepth 1 -name '*.seen' -type f -mtime "+$SEEN_TTL_DAYS" \
+      -exec rm -f -- {} + 2>/dev/null || true
+  fi
+  # The listener only sweeps outbound digests while handling an inbound message,
+  # so a home that replies and hears nothing back never sweeps at all. This is
+  # the third growth surface and it is bounded here with the other two.
+  if [ -d "$FM_WA_SENT" ]; then
+    find "$FM_WA_SENT" -maxdepth 1 -name '*.sent' -type f -mmin "+$SENT_TTL_MINUTES" \
+      -exec rm -f -- {} + 2>/dev/null || true
+  fi
 }
 
 # The beat is the listener's proof that its connection is up, so its age is how
@@ -195,7 +220,10 @@ ensure_listener() {
 prune_state
 
 if ensure_listener; then
-  rm -f -- "$LISTENER_ERROR" "$RESTART_FAILS" 2>/dev/null || true
+  rm -f -- "$LISTENER_ERROR" 2>/dev/null || true
+  if [ "$(fm_wa_age_of "$RESTART_MARKER")" -ge "$STABLE_INTERVAL" ]; then
+    rm -f -- "$RESTART_FAILS" 2>/dev/null || true
+  fi
 fi
 
 # A fault line and an inbox line mean different things to wa-respond, and the

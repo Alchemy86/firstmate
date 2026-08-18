@@ -498,7 +498,14 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
   }
 
   const text = extractText(body)
-  if (normalizeText(text) === '') return reject('no text to act on', id)
+  const attachment = attachmentKind(body)
+  // A photo, voice note, sticker, video or document sent with no caption is
+  // still the captain reaching out, and from his phone a refusal is
+  // indistinguishable from being ignored. It is stashed with empty text and its
+  // kind named, so firstmate wakes and can answer that the media is unreadable.
+  if (normalizeText(text) === '' && attachment === null) {
+    return reject('no text to act on', id)
+  }
 
   if (await consumeOwnEcho(text)) return reject('matches firstmate outbound', id)
 
@@ -517,7 +524,7 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
     received_at: Math.floor(Date.now() / 1000),
     push_name: msg.pushName ?? null,
     text,
-    attachment: attachmentKind(body),
+    attachment,
     quoted: quotedContext(ctx),
   }
   // The inbox record is published first and its create-exclusive write is the

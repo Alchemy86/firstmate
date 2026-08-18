@@ -58,6 +58,16 @@ That does mean everything on this chat is `fromMe`, including firstmate's own re
 
 If the captain also wants to command firstmate from WhatsApp Web or Desktop, add those device numbers to `FM_WA_ALLOW_DEVICES`. Do **not** add the device mudslide uses; that is firstmate's own outbound and would loop.
 
+## Media, and what is not read yet
+
+A photo, voice note, sticker, video or document sent with no caption is stashed like any other message, with empty `text` and its kind in `attachment`.
+It is deliberately not refused: the captain messages from his phone, and no reply at all is indistinguishable from being ignored, which is the one failure he cannot debug from his end.
+Firstmate wakes on it and the `wa-respond` skill answers honestly that it cannot read the media and asks him to type it.
+
+**Voice-note transcription is a deliberate next step, not part of this change.**
+Transcribing would mean downloading and decrypting media, choosing a transcription provider, and sending the captain's private audio to it - a security and cost decision of its own, separate from getting the channel working at all.
+Until it lands, a voice note reaches firstmate and gets an honest answer rather than silence.
+
 ## Setup
 
 ### 1. Opt in
@@ -112,9 +122,13 @@ A listener that never connects at all writes no beat, so the poll measures that 
 
 Re-pairing clears the previous link's health records, so a freshly linked device is never judged by the old one's logged-out status or restart count.
 
+A restart the poll spawns writes the wrapper's own refusals into `state/wa-listener.log` as well, so a listener that never gets far enough to open that log still explains itself there.
+Restart history is only cleared once no restart has been needed for an hour, so a listener that dies slowly enough to look alive on some cycles still reaches the limit instead of flapping forever.
+
 The poll is also the channel's janitor.
 `state/wa-listener.log` is capped at 256KB by rewriting it in place, which leaves the running listener's append handle intact.
 A `state/wa-seen/` marker is pruned after thirty days, far behind any watermark that could still let an old message back into the inbox.
+A `state/wa-sent/` digest is pruned after an hour, well past the ten-minute window in which it could still match an echo.
 
 Exactly one line comes out of a cycle.
 A cycle that reports a fault does not also announce the inbox, because the two mean different things to `wa-respond` and the watcher would fold them into a single wake.
