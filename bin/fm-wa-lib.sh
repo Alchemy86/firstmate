@@ -165,6 +165,16 @@ fm_wa_json_string() {
   '
 }
 
+# Collapse whitespace runs to one space and drop one space from each end, so
+# the outbound digest survives the reformatting WhatsApp does to a message on
+# its way back. The listener's normalizeText() in bin/fm-wa-listen.mjs must
+# agree with this byte for byte or the echo guard silently stops matching, so
+# both sides stay on the ASCII class LC_ALL=C gives here rather than
+# JavaScript's Unicode-aware \s and trim().
+fm_wa_normalize_text() {
+  LC_ALL=C tr -s '[:space:]' ' ' | LC_ALL=C sed 's/^ //; s/ $//'
+}
+
 fm_wa_sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum | awk '{print $1}'

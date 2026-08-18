@@ -71,7 +71,7 @@ TO=$(printf '%s' "$TO" | tr -cd '0-9')
 # The marker is short-lived by contract: the listener ignores and prunes any
 # digest older than its echo window, so a reply the captain never echoes back
 # cannot sit there forever waiting to swallow those exact words from him.
-NORMALIZED=$(printf '%s' "$TEXT" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
+NORMALIZED=$(printf '%s' "$TEXT" | fm_wa_normalize_text)
 DIGEST=$(printf '%s' "$NORMALIZED" | fm_wa_sha256) || DIGEST=
 MARKER=
 if [ -n "$DIGEST" ] && fm_wa_id_safe "$DIGEST"; then

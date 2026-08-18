@@ -1233,6 +1233,27 @@ test_echo_digest_guard() {
   pass "an outbound reply coming back is dropped once, and only once"
 }
 
+# The digest is computed once in the shell and once in the listener, so the two
+# normalizations have to agree on exactly which characters count as whitespace.
+# A reply carrying a non-breaking space used to hash differently on each side,
+# which left the echo unrecognised and the reply stashed as a fresh instruction.
+test_echo_digest_normalization_matches() {
+  command -v node >/dev/null 2>&1 || { pass "digest normalization skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/echonorm"
+  new_home "$home"
+  printf 'Captain,\xc2\xa0that is done.\n' > "$TMP_ROOT/echo-nbsp.txt"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_DRY_RUN=1 \
+    "$SEND" --text-file "$TMP_ROOT/echo-nbsp.txt" >/dev/null 2>&1 \
+    || fail "recording the outbound reply failed"
+
+  out=$(fixture "$home" "$(msg ECHONBSP 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain,\u00a0that is done."}')")
+  assert_refused "$out" 'matches firstmate outbound' \
+    "a reply containing a non-breaking space came back as a new instruction"
+
+  pass "the outbound digest matches the listener's on non-ASCII whitespace"
+}
+
 # A home snapshot that is sensitive to any file appearing, disappearing, or
 # changing content: path plus mode plus a content digest for every regular file.
 snapshot_home() {
@@ -1334,6 +1355,7 @@ test_listener_filters
 test_listener_is_idempotent
 test_listener_captures_quoted_context
 test_echo_digest_guard
+test_echo_digest_normalization_matches
 test_stale_echo_marker_does_not_swallow_the_captain
 test_failed_send_leaves_no_echo_trap
 test_failed_dry_run_leaves_no_echo_trap

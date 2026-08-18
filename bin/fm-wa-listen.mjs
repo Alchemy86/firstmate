@@ -223,8 +223,15 @@ function writeListenerStatus(fields) {
 
 // ----------------------------------------------------------- echo guard -----
 
+// Must agree with fm_wa_normalize_text in bin/fm-wa-lib.sh byte for byte: the
+// digest is computed independently on each side and any disagreement disables
+// the echo guard without a word. The shell side runs under LC_ALL=C, so it
+// collapses only ASCII whitespace and strips one space from each end; \s and
+// trim() would additionally eat U+00A0, U+2028, U+2029, U+202F, U+3000 and
+// U+FEFF, and a reply carrying one of those would come straight back in as a
+// fresh captain instruction.
 function normalizeText(text) {
-  return String(text).replace(/\s+/g, ' ').trim()
+  return String(text).replace(/[ \t\n\v\f\r]+/g, ' ').replace(/^ /, '').replace(/ $/, '')
 }
 
 // An echo comes back within seconds, so a digest older than the TTL belongs to
@@ -538,7 +545,7 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
   // still the captain reaching out, and from his phone a refusal is
   // indistinguishable from being ignored. It is stashed with empty text and its
   // kind named, so firstmate wakes and can answer that the media is unreadable.
-  if (normalizeText(text) === '' && attachment === null) {
+  if (String(text ?? '').trim() === '' && attachment === null) {
     return reject('no text to act on', id)
   }
 
