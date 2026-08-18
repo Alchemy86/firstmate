@@ -1118,6 +1118,66 @@ test_echo_digest_guard() {
   pass "an outbound reply coming back is dropped once, and only once"
 }
 
+# A home snapshot that is sensitive to any file appearing, disappearing, or
+# changing content: path plus mode plus a content digest for every regular file.
+snapshot_home() {
+  local home=$1
+  ( cd "$home" && find . -mindepth 1 \( -type f -o -type d \) -print0 \
+      | LC_ALL=C sort -z \
+      | while IFS= read -r -d '' entry; do
+          if [ -d "$entry" ]; then
+            printf 'd %s\n' "$entry"
+          else
+            printf 'f %s %s\n' "$entry" "$(cksum < "$entry" | awk '{print $1"-"$2}')"
+          fi
+        done )
+}
+
+test_removing_the_config_restores_the_home_exactly() {
+  local home before after out
+  home="$TMP_ROOT/selfdisarm"
+  mkdir -p "$home/state" "$home/config"
+  chmod 700 "$home/state"
+  # A neighbouring home artifact that must survive: self-disarm removes only the
+  # three files the channel generates, never anything else.
+  printf 'export FM_CHECK_INTERVAL=30\n' > "$home/config/x-mode.env"
+  printf 'unrelated\n' > "$home/state/keepme"
+
+  before=$(snapshot_home "$home")
+
+  printf 'FM_WA_CAPTAIN=%s\n' "$CAPTAIN" > "$home/config/whatsapp.env"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 \
+    || fail "arm failed"
+  assert_present "$home/state/wa-watch.check.sh" "arm wrote no check shim"
+  assert_present "$home/config/wa-mode.env" "arm wrote no cadence file"
+  ( . "$ROOT/bin/fm-supervision-lib.sh"; fm_supervision_status "$home/state" >/dev/null 2>&1
+    [ -n "${FM_SUP_NEEDED:-}" ] ) || fail "an armed home was not counted as needing supervision"
+
+  # The documented opt-out, and one poll cycle to act on it.
+  rm -f "$home/config/whatsapp.env"
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "the retiring cycle spoke: $out"
+
+  assert_absent "$home/state/wa-watch.check.sh" "the check shim outlived the config"
+  assert_absent "$home/state/wa-watch.check-trust" "the registration outlived the config"
+  assert_absent "$home/config/wa-mode.env" "the cadence file outlived the config"
+  assert_present "$home/config/x-mode.env" "self-disarm removed Relay's cadence file"
+  assert_present "$home/state/keepme" "self-disarm removed an unrelated state file"
+
+  after=$(snapshot_home "$home")
+  [ "$before" = "$after" ] || {
+    printf 'before/after differ:\n%s\n' "$(diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") || true)" >&2
+    fail "the home is not byte-identical to before the channel was armed"
+  }
+
+  # Idempotent: with everything already gone it does nothing and says nothing.
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "a second retiring cycle spoke: $out"
+  [ "$(snapshot_home "$home")" = "$before" ] || fail "a second retiring cycle changed the home"
+
+  pass "removing config/whatsapp.env restores the home byte-for-byte and repeats safely"
+}
+
 test_off_by_default
 test_removing_config_reverts_to_silence
 test_check_contract
@@ -1141,6 +1201,7 @@ test_listener_that_never_connects_is_reported
 test_repairing_the_link_clears_stale_listener_health
 test_listener_state_growth_is_bounded
 test_shim_arm_register_disarm
+test_removing_the_config_restores_the_home_exactly
 test_arming_makes_an_idle_home_need_supervision
 test_arming_writes_the_watcher_cadence
 test_the_cadence_reaches_the_supervision_block

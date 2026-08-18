@@ -47,7 +47,27 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 . "$SCRIPT_DIR/fm-wa-lib.sh"
 
 # Hard no-op when the channel is off: this is what keeps the check shim inert.
-fm_wa_load_config || exit 0
+#
+# Removing config/whatsapp.env is the documented opt-out, and it has to mean
+# what it says. Once an armed shim counts as a reason to keep a watcher running,
+# a shim left behind after the config is gone would keep this home supervised
+# and sweeping every 30s for a poll that can no longer do anything. So the poll
+# retires its own generated artifacts on the first cycle after the config
+# disappears, the way Relay's bootstrap drops its shim and cadence when the
+# pairing token goes. It removes ONLY the three files bin/fm-wa-setup.sh
+# generates, never anything else under state/ or config/, and it is idempotent:
+# with the artifacts already gone it does nothing and says nothing.
+self_disarm() {
+  local state config
+  state="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+  config="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+  rm -f -- "$state/wa-watch.check.sh" "$state/wa-watch.check-trust" "$config/wa-mode.env" 2>/dev/null || true
+}
+
+if ! fm_wa_load_config; then
+  self_disarm
+  exit 0
+fi
 
 RESTART_MARKER="$FM_WA_STATE/wa-listener.restart"
 RESTART_INTERVAL=120

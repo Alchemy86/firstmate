@@ -221,7 +221,13 @@ rm config/whatsapp.env          # poll becomes a hard no-op immediately
 
 Every entry point checks the config first and exits silently when it is gone: no polling, no wake, no behaviour change. This is the equivalent of removing Relay's pairing token.
 
-To remove the artifacts too:
+Removing the config is a complete opt-out, not a partial one.
+Because an armed check shim is itself a reason to keep a watcher running, a shim left behind would keep the home supervised and sweeping every 30 seconds for a poll that can no longer do anything.
+So the first poll cycle after the config disappears retires the shim, its registration, and the cadence file, the way Relay's bootstrap drops its own generated artifacts when the pairing token goes.
+It removes only those three generated files, never anything else under `state/` or `config/`, and it is idempotent: with them already gone it does nothing and says nothing.
+After that cycle the home is byte-identical to one that never armed the channel, which `tests/fm-wa-channel.test.sh` asserts directly.
+
+To remove the artifacts immediately rather than waiting for that cycle:
 
 ```sh
 bin/fm-wa-setup.sh disarm       # removes the check shim, its registration, and the cadence
