@@ -1626,9 +1626,13 @@ test_removing_the_config_restores_the_home_exactly() {
 
 # The captain's account has two identities and WhatsApp uses both: some
 # deliveries of his self-chat are addressed to his phone number, others to his
-# LID. Reproduced live on 2026-08-18 - every real message he sent arrived as
-# "<lid>@lid" and was refused as a non-direct chat, so state/wa-inbox stayed
-# empty while he believed he was messaging firstmate.
+# LID. Reproduced live - every real message he sent arrived under his LID and
+# was refused as a non-direct chat, so state/wa-inbox stayed empty while he
+# believed he was messaging firstmate.
+#
+# A LID is a real per-account WhatsApp identifier, so this one is invented for
+# the tests, exactly as the number above is. A home's own LID is never
+# configured: the listener reads it from its own pairing credentials.
 CAPTAIN_LID=100000000000001
 
 lid_fixture() {
