@@ -51,6 +51,13 @@ fake_listener() {
   pid=$!
   FAKE_PIDS="$FAKE_PIDS $pid"
   printf '%s\n' "$pid" > "$home/state/wa-listener.pid"
+  # The poll refuses to signal a pid it cannot bind to the listener this home
+  # started, so a stand-in has to carry the same identity record a real start
+  # writes.
+  ( # shellcheck source=bin/fm-wa-lib.sh
+    . "$LIB"
+    FM_WA_STATE="$home/state" fm_wa_record_listener_identity "$pid" ) \
+    >/dev/null 2>&1 || true
 }
 
 reap_fake_listeners() {
@@ -357,7 +364,7 @@ test_a_spent_restart_block_releases_itself_after_a_while() {
   # ...but an hour later the channel gets another chance on its own, so a
   # transient cause does not leave it off until someone happens to look.
   touch -t 200001010000 "$home/state/wa-listener.restarts"
-  rm -f "$home/state/wa-listener.error"
+  rm -f "$home/state/wa-listener.error.restart-latch"
   out=$(FM_WA_FORCE_SPAWN_FALLBACK=1 poll "$home")
   assert_not_contains "$out" 'will not stay healthy' \
     "the restart block never released, so the channel stayed off for good"
@@ -383,10 +390,16 @@ SH
   # The poll's own restart must NOT clear the history, or a listener that dies
   # slowly would erase the very evidence that proves it is flapping.
   printf '3\n' > "$home/state/wa-listener.restarts"
+  # A start publishes its pid file before the listener has claimed the status
+  # file, so the predecessor's last word has to go with the process that said it.
+  printf '{"state":"connected","me":"x","at":1,"deviceHook":"unavailable"}\n' \
+    > "$home/state/wa-listener.status"
   PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_AUTOSTART=1 \
     "$LISTEN_SH" start >/dev/null 2>&1 || fail "the fake listener never started"
   assert_grep '3' "$home/state/wa-listener.restarts" \
     "an automatic restart erased the restart history that proves a flap"
+  assert_absent "$home/state/wa-listener.status" \
+    "a start left the previous listener's reported state for the new one to be judged by"
   pid=$(cat "$home/state/wa-listener.pid" 2>/dev/null) || pid=
   [ -n "$pid" ] && kill "$pid" 2>/dev/null
   rm -f "$home/state/wa-listener.pid"
@@ -401,7 +414,7 @@ SH
   # the one that repairs a listener still holding a pid. `start` would only
   # report that one already runs and change nothing.
   printf '3\n' > "$home/state/wa-listener.restarts"
-  : > "$home/state/wa-listener.error"
+  : > "$home/state/wa-listener.error.restart-latch"
   PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     "$LISTEN_SH" start >/dev/null 2>&1
   assert_grep '3' "$home/state/wa-listener.restarts" \
@@ -410,7 +423,7 @@ SH
     "$LISTEN_SH" restart >/dev/null 2>&1 || fail "restart failed"
   assert_absent "$home/state/wa-listener.restarts" \
     "the remedy the fault line names left the restart block in place"
-  assert_absent "$home/state/wa-listener.error" \
+  assert_absent "$home/state/wa-listener.error.restart-latch" \
     "the remedy the fault line names left the reported fault in place"
   pid=$(cat "$home/state/wa-listener.pid" 2>/dev/null) || pid=
   [ -n "$pid" ] && kill "$pid" 2>/dev/null
@@ -550,7 +563,7 @@ test_a_listener_that_cannot_read_sender_devices_is_reported() {
     "the report did not name what the listener cannot read"
   assert_contains "$out" 'restarting it' \
     "the fault was reported without saying the listener is being replaced"
-  assert_present "$home/state/wa-listener.error" \
+  assert_present "$home/state/wa-listener.error.device-hook" \
     "the fault was announced without being recorded"
   if kill -0 "$pid" 2>/dev/null; then
     fail "the deaf listener was left running, so the hook could never be reattached"
@@ -564,10 +577,73 @@ test_a_listener_that_cannot_read_sender_devices_is_reported() {
   date +%s > "$home/state/wa-listener.beat"
   printf '{"state":"connected","me":"x","at":3}\n' > "$home/state/wa-listener.status"
   poll "$home" >/dev/null
-  assert_absent "$home/state/wa-listener.error" \
+  assert_absent "$home/state/wa-listener.error.device-hook" \
     "the fault outlived the listener recovering its sender-device hook"
 
   pass "a listener that cannot read sender devices is reported and replaced"
+}
+
+# The pid file is written at spawn and removed only on a clean exit, so a crash
+# leaves it behind and the number in it can later belong to anything this user
+# runs. Both repair paths above signal that pid, so it has to be bound to the
+# listener this home actually started before anything is sent to it.
+test_a_recycled_pid_is_never_signalled() {
+  local home out pid
+  home="$TMP_ROOT/pidreuse"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  # An unrelated process that happens to hold the number a dead listener left in
+  # its pid file.
+  sleep 300 &
+  pid=$!
+  FAKE_PIDS="$FAKE_PIDS $pid"
+  printf '%s\n' "$pid" > "$home/state/wa-listener.pid"
+  printf 'Sat Jan  1 00:00:00 2000\n' > "$home/state/wa-listener.pid-identity"
+  # ...and everything that would otherwise make the poll stop it.
+  printf '1\n' > "$home/state/wa-listener.beat"
+  touch -t 200001010000 "$home/state/wa-listener.beat"
+  printf '{"state":"connected","me":"x","at":1,"deviceHook":"unavailable"}\n' \
+    > "$home/state/wa-listener.status"
+  # Spent, so the cycle reports instead of spawning a listener this test would
+  # then have to chase.
+  printf '3\n' > "$home/state/wa-listener.restarts"
+
+  out=$(poll "$home")
+  kill -0 "$pid" 2>/dev/null \
+    || fail "the poll signalled a process it never proved was its own listener"
+  assert_not_contains "$out" 'connection is down' \
+    "a stranger's pid was reported as the listener's own wedged connection"
+
+  pass "a pid the poll cannot bind to this home's listener is never signalled"
+}
+
+# The pid file appears the instant a replacement forks, well before that process
+# has loaded enough to claim the status file. A predecessor's last status left in
+# place is then read as the replacement's own, and the replacement is killed for
+# a fault it never had - burning a slot of the restart budget every time.
+test_a_replacement_is_not_judged_by_its_predecessor() {
+  local home pid
+  home="$TMP_ROOT/staleclaim"
+  new_home "$home"
+  fake_listener "$home"
+  date +%s > "$home/state/wa-listener.beat"
+  printf '{"state":"connected","me":"x","at":1,"deviceHook":"unavailable"}\n' \
+    > "$home/state/wa-listener.status"
+
+  poll "$home" >/dev/null
+  assert_absent "$home/state/wa-listener.status" \
+    "the deaf listener's reported state outlived the process that wrote it"
+
+  # A replacement that is up but has not written its own status yet.
+  fake_listener "$home"
+  pid=$(cat "$home/state/wa-listener.pid")
+  date +%s > "$home/state/wa-listener.beat"
+  poll "$home" >/dev/null
+  kill -0 "$pid" 2>/dev/null \
+    || fail "a healthy replacement was stopped for its predecessor's fault"
+
+  pass "a replacement listener is never judged by its predecessor's record"
 }
 
 test_a_skipped_entry_is_reported_on_a_quiet_cycle() {
@@ -1276,9 +1352,10 @@ test_the_real_echo_consumes_its_own_marker() {
 
 # A stalled listener is reported AND repaired in the same cycle, so the poll
 # carries on to the restart budget after speaking. Two fault lines in one cycle
-# would break the one-line check contract and, because both write the same
-# record, leave a record matching neither: every later cycle would then report
-# both again and re-wake firstmate for a fault it was already told about.
+# would break the one-line check contract, and a shared record would leave the
+# specific report replaced by the generic one that came after it: the captain
+# would be left holding a remedy that cannot fix what he was originally told
+# about, and the dedupe that keeps a known fault quiet would be defeated.
 test_two_faults_in_one_cycle_still_speak_once() {
   local home out lines first second
   home="$TMP_ROOT/doublefault"
@@ -1295,7 +1372,7 @@ test_two_faults_in_one_cycle_still_speak_once() {
   [ "$lines" = 1 ] || fail "the cycle printed $lines lines instead of one: $out"
   first=$out
   assert_contains "$first" 'wa-channel-error' "the stalled listener was not reported"
-  [ "$(cat "$home/state/wa-listener.error" 2>/dev/null)" = "${first#wa-channel-error }" ] \
+  [ "$(cat "$home/state/wa-listener.error.never-up" 2>/dev/null)" = "${first#wa-channel-error }" ] \
     || fail "the recorded fault does not match the one that was reported"
 
   # The fault that lost the race is not lost: it is what the next cycle finds.
@@ -1304,6 +1381,13 @@ test_two_faults_in_one_cycle_still_speak_once() {
   [ "$lines" = 1 ] || fail "the following cycle printed $lines lines instead of one: $second"
   assert_contains "$second" 'will not stay healthy after restart' \
     "the spent restart budget was never reported"
+
+  # Each fault keeps its own record, so the second one does not overwrite the
+  # first: the specific report survives the generic one that followed it.
+  [ "$(cat "$home/state/wa-listener.error.never-up" 2>/dev/null)" = "${first#wa-channel-error }" ] \
+    || fail "the second fault overwrote the record of the first"
+  [ "$(cat "$home/state/wa-listener.error.restart-latch" 2>/dev/null)" = "${second#wa-channel-error }" ] \
+    || fail "the second fault was reported without being recorded in its own right"
 
   # And having been recorded truthfully, it is said once rather than every cycle.
   [ -z "$(poll "$home")" ] \
@@ -1411,6 +1495,8 @@ test_outbound_digests_are_pruned
 test_dry_run_records_are_pruned
 test_a_spent_restart_block_releases_itself_after_a_while
 test_a_hand_run_start_releases_the_restart_block
+test_a_recycled_pid_is_never_signalled
+test_a_replacement_is_not_judged_by_its_predecessor
 test_a_restarted_listener_survives_the_check_being_reaped
 test_a_refused_restart_says_why_in_the_log
 test_listener_that_never_connects_is_reported

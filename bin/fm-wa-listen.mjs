@@ -356,19 +356,23 @@ function deviceAllowed(device) {
 // ------------------------------------------------------------------ listen ---
 
 async function runListen() {
-  const { mod, logger } = await loadBaileys()
-  const { DisconnectReason } = mod
-
   ensurePrivateDir(STATE)
-  ensurePrivateDir(INBOX)
-  ensurePrivateDir(SEEN)
-  ensurePrivateDir(SENT)
 
   // The status file is how bin/fm-wa-poll.sh judges the LIVE listener, and it
   // stops one that reports it cannot read sender devices. A predecessor's last
   // status left in place would be read as this process's own and get a healthy
-  // replacement killed, so claim the file before the first connect attempt.
+  // replacement killed, so claim the file as the very first act of the process
+  // - before the baileys import, which is a large bundle and costs seconds on a
+  // cold start while the pid file the wrapper wrote is already visible to the
+  // poll.
   writeListenerStatus({ state: 'starting', at: Date.now() })
+
+  const { mod, logger } = await loadBaileys()
+  const { DisconnectReason } = mod
+
+  ensurePrivateDir(INBOX)
+  ensurePrivateDir(SEEN)
+  ensurePrivateDir(SENT)
 
   // A first run must not ingest the account's backlog. The watermark is the
   // durable "everything at or before this second is already accounted for"

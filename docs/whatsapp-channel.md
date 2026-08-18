@@ -145,7 +145,8 @@ A connected listener is not a working one either.
 The accepted-sender-device filter is fed by a raw stanza hook, and a listener that cannot attach that hook rejects every message the captain sends while still reporting a healthy connection and touching its beat.
 The listener records that fault alongside its connection state, so the poll reports it as a `wa-channel-error` naming the sender devices it cannot read.
 The hook is attached once per connection and a healthy socket never drops on its own, so that fault is repaired the same way a stalled connection is: the listener is stopped and replaced on the same restart budget, and the report clears once the replacement attaches the hook.
-A starting listener claims the status file before its first connect attempt, so a replacement is never judged by the status its predecessor left behind.
+A replacement is never judged by the record its predecessor left behind: stopping a listener drops that listener's reported state along with its beat, and a starting one claims the status file as its very first act, before the baileys import that dominates a cold start.
+Otherwise the pid file - which appears the instant the replacement forks - would be paired with the dead listener's last word, and a healthy replacement would be stopped for a fault it never had.
 
 Re-pairing clears the previous link's health records, so a freshly linked device is never judged by the old one's logged-out status or restart count.
 
@@ -157,6 +158,10 @@ Spent restarts stop the automatic ones, but never permanently.
 The poll tries again an hour after the last attempt, so a channel held down by something transient - no network at boot, a host that was asleep - comes back on its own.
 `bin/fm-wa-listen.sh restart` run by hand releases the block immediately, and the reported fault line names that command.
 `start` is not the same repair: it reports a listener that is already running and changes nothing, which is why the fault line and the `wa-respond` skill both name `restart`.
+
+Stopping a listener means signalling a pid, and a pid alone is not the listener: the pid file is removed only on a clean exit, so a crash leaves it behind and that number can later belong to any process this user runs.
+Every start therefore records the identity of the process it launched in `state/wa-listener.pid-identity`, and the poll refuses to signal a pid whose identity no longer matches.
+It restarts the listener instead, which is the right answer for a pid file the dead listener left behind.
 
 An alive listener whose connection is down is stopped and replaced rather than only reported.
 The replacement is spawned on the same restart budget that bounds a crash loop, so a channel that cannot recover still latches and reports instead of respawning forever.
@@ -170,7 +175,8 @@ A `state/wa-outbox/` dry-run record is pruned after seven days, which is long en
 
 Exactly one line comes out of a cycle.
 A cycle that reports a fault does not also announce the inbox, because the two mean different things to `wa-respond` and the watcher would fold them into a single wake.
-The fault is deduped, so pending messages are announced on the next cycle rather than being buried behind it.
+The fault is deduped, and each distinct fault is deduped against its own record, so pending messages are announced on the next cycle rather than being buried behind it.
+Separate records are what keep a specific report from being replaced by a later, more general one: a listener that cannot read sender devices is replaced every couple of minutes and eventually trips the restart block too, and a shared record would leave the captain holding only the crash-loop wording, whose named repair cannot reattach a hook the listener program can no longer attach.
 For the same reason an inbox entry whose name cannot be used as a message id is skipped rather than aborting the announcement: the real messages beside it are still announced, and only an inbox with nothing usable left in it reports the fault instead.
 The skipped entry is still reported, on the first cycle that has no announcement to make, so it cannot sit in the inbox outliving every drain unseen.
 

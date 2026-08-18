@@ -36,6 +36,7 @@ fm_wa_paths() {
   FM_WA_OUTBOX="$FM_WA_STATE/wa-outbox"
   FM_WA_AUTH_DIR="$FM_WA_STATE/wa-auth"
   FM_WA_PIDFILE="$FM_WA_STATE/wa-listener.pid"
+  FM_WA_PIDFILE_IDENTITY="$FM_WA_STATE/wa-listener.pid-identity"
   FM_WA_LOG="$FM_WA_STATE/wa-listener.log"
   FM_WA_OFFERED="$FM_WA_STATE/wa-poll.offered"
   FM_WA_ERROR="$FM_WA_STATE/wa-poll.error"
@@ -185,14 +186,66 @@ fm_wa_sha256() {
   fi
 }
 
+# The start time of a running process, which is what makes a pid an identity: a
+# recycled pid is a different process with a different start time, and an exec
+# (nohup handing off to node, or node handing off to anything else) keeps the
+# same one, so this stays true across the whole life of the listener. Empty
+# output means this host will not say, never that the process is a different
+# one. LC_ALL=C pins the date format so an identity written under one locale
+# still matches when it is read back under another.
+fm_wa_process_identity() {
+  local pid=$1
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  COLUMNS=10000 LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null \
+    | head -n 1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+# Bind the pid file that was just written to the process it names, so anything
+# that later signals that pid can prove it is signalling this home's own
+# listener. Called right after the spawn, while the pid cannot yet have been
+# recycled.
+fm_wa_record_listener_identity() {
+  local pid=$1 identity
+  identity=$(fm_wa_process_identity "$pid") || return 1
+  [ -n "$identity" ] || return 1
+  printf '%s\n' "$identity" \
+    | fm_wa_publish_stdin "$FM_WA_STATE" wa-listener.pid-identity
+}
+
+# A pid on its own is not the listener. The pid file is written at spawn and
+# removed only on a clean exit, so a SIGKILL, an OOM kill or a host crash leaves
+# it behind, and the number in it can then be recycled by any process this user
+# owns. Every caller that trusts the pid comes through here - the poll's stalled
+# and deaf-listener repairs both signal exactly what this returns - so the
+# binding is proved once, in this one place, rather than at each kill site.
+#
+# The identity recorded at spawn is the strong form. A pid file written before
+# one was recorded falls back to the command naming this listener's program, as
+# bin/fm-afk-start.sh does for its own daemon. A host whose ps reports nothing
+# at all leaves the pid accepted: not knowing is not proof of a mismatch, and
+# refusing there would spawn a second listener onto the one credential folder
+# WhatsApp allows, which takes the channel down rather than protecting it.
 fm_wa_listener_pid() {
-  local pid
+  local pid recorded current cmdline
   [ -f "$FM_WA_PIDFILE" ] || return 1
   pid=$(cat "$FM_WA_PIDFILE" 2>/dev/null) || return 1
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
   kill -0 "$pid" 2>/dev/null || return 1
+  recorded=$(cat "$FM_WA_PIDFILE_IDENTITY" 2>/dev/null) || recorded=
+  if [ -n "$recorded" ]; then
+    current=$(fm_wa_process_identity "$pid") || current=
+    [ -z "$current" ] || [ "$current" = "$recorded" ] || return 1
+  else
+    cmdline=$(COLUMNS=10000 LC_ALL=C ps -p "$pid" -o command= 2>/dev/null) || cmdline=
+    case "$cmdline" in
+      ''|*fm-wa-listen.mjs*) ;;
+      *) return 1 ;;
+    esac
+  fi
   printf '%s' "$pid"
 }
 

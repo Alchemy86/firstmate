@@ -63,6 +63,7 @@ clear_listener_health() {
     "$FM_WA_STATE/wa-listener.status" \
     "$FM_WA_STATE/wa-listener.beat" \
     "$FM_WA_STATE/wa-listener.error" \
+    "$FM_WA_STATE"/wa-listener.error.* \
     "$FM_WA_STATE/wa-listener.restart" \
     "$FM_WA_STATE/wa-listener.restarts" 2>/dev/null || true
 }
@@ -79,10 +80,17 @@ cmd_start() {
   fi
   fm_wa_private_dir "$FM_WA_STATE" || { echo "error: state directory is unavailable" >&2; return 1; }
   fm_wa_private_dir "$FM_WA_AUTH_DIR" || { echo "error: credential directory is unavailable" >&2; return 1; }
-  # The beat belongs to the process that wrote it. Left behind, the previous
-  # listener's last beat makes this one look wedged from its very first cycle,
-  # and the poll would stop it again before it ever connected.
-  rm -f -- "$FM_WA_STATE/wa-listener.beat" 2>/dev/null || true
+  # The beat and the reported connection state belong to the process that wrote
+  # them, and so does the identity bound to the old pid. Left behind, the
+  # previous listener's records make this one look wedged, or deaf, or like a
+  # pid that is not ours, from its very first cycle - and the poll would stop it
+  # again before it ever connected. The pid file appears the instant the process
+  # is forked, well before the listener has loaded enough to claim the status
+  # file itself, so clearing them here is what closes that window.
+  rm -f -- \
+    "$FM_WA_STATE/wa-listener.beat" \
+    "$FM_WA_STATE/wa-listener.status" \
+    "$FM_WA_PIDFILE_IDENTITY" 2>/dev/null || true
   ( umask 077
     FM_WA_STATE="$FM_WA_STATE" \
     FM_WA_AUTH_DIR="$FM_WA_AUTH_DIR" \
@@ -94,6 +102,9 @@ cmd_start() {
     echo $! > "$FM_WA_PIDFILE"
   )
   chmod 600 "$FM_WA_PIDFILE" "$FM_WA_LOG" 2>/dev/null || true
+  # Bind the pid to this process now, while it is still unambiguously the one we
+  # just started, so a later stop can prove what it is signalling.
+  fm_wa_record_listener_identity "$(cat "$FM_WA_PIDFILE" 2>/dev/null)" 2>/dev/null || true
   sleep 1
   if fm_wa_listener_pid >/dev/null; then
     # A start run by hand is the operator's own repair, so it releases the
@@ -104,7 +115,8 @@ cmd_start() {
       rm -f -- \
         "$FM_WA_STATE/wa-listener.restarts" \
         "$FM_WA_STATE/wa-listener.restart" \
-        "$FM_WA_STATE/wa-listener.error" 2>/dev/null || true
+        "$FM_WA_STATE/wa-listener.error" \
+        "$FM_WA_STATE"/wa-listener.error.* 2>/dev/null || true
     fi
     echo "listener started (pid $(fm_wa_listener_pid))"
   else
@@ -117,7 +129,7 @@ cmd_stop() {
   require_config || return 1
   local pid
   if ! pid=$(fm_wa_listener_pid); then
-    rm -f -- "$FM_WA_PIDFILE"
+    rm -f -- "$FM_WA_PIDFILE" "$FM_WA_PIDFILE_IDENTITY"
     echo "listener is not running"
     return 0
   fi
@@ -128,7 +140,7 @@ cmd_stop() {
     waited=$(( waited + 1 ))
   done
   kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-  rm -f -- "$FM_WA_PIDFILE"
+  rm -f -- "$FM_WA_PIDFILE" "$FM_WA_PIDFILE_IDENTITY"
   echo "listener stopped"
   if [ -f "$FM_WA_STATE/wa-watch.check.sh" ]; then
     echo "note: the armed check restarts it within a couple of minutes;"

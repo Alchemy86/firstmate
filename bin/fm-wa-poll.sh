@@ -110,8 +110,10 @@ OUTBOX_TTL_DAYS=7
 # contract.
 EMITTED=
 
-# One diagnostic per distinct problem, not one per cycle. Listener faults and
-# poll faults keep separate markers so clearing one never re-fires the other.
+# One diagnostic per distinct problem, not one per cycle. Every fault keeps its
+# own marker - each listener fault as much as the poll's own - so clearing one
+# never re-fires another, and a fault that is still true is still reported in
+# its own words after a different one has spoken.
 # Returns 0 when it printed, 1 when the same fault was already reported.
 #
 # A cycle speaks at most once, whatever it finds. Repair paths deliberately
@@ -135,7 +137,13 @@ emit_error_once() {
   return 0
 }
 
-emit_listener_error() { emit_error_once "$LISTENER_ERROR" wa-listener.error "$1"; }
+# Each distinct listener fault keeps its own marker, so the specific report the
+# captain can act on is never replaced by a later, more generic one: a deaf
+# listener that is being replaced every couple of minutes eventually trips the
+# restart block too, and sharing one marker would leave him holding only "will
+# not stay healthy after restart" - which names a remedy that cannot fix a hook
+# the listener program can no longer attach.
+emit_listener_error() { emit_error_once "$LISTENER_ERROR.$1" "wa-listener.error.$1" "$2"; }
 emit_poll_error() { emit_error_once "$FM_WA_ERROR" wa-poll.error "$1"; }
 
 # The listener's own last reported connection state, or empty when it never
@@ -246,9 +254,16 @@ listener_down_age() {
 }
 
 # A wedged listener holds its pid forever, so reporting it is not enough: only
-# a replacement process can bring the channel back. The stale beat goes with it,
-# because it belongs to the process that stopped writing it and would otherwise
-# make the fresh listener look wedged from its first cycle.
+# a replacement process can bring the channel back. The stale beat, the stale
+# reported state and the identity bound to the dead pid all go with it, because
+# they belong to the process that stopped writing them and would otherwise make
+# the fresh listener look wedged, or deaf, from its first cycle - the pid file
+# appears the instant that replacement forks, well before it has loaded enough
+# to claim the status file itself.
+#
+# The pid reaching here is already bound to this home's own listener by
+# fm_wa_listener_pid, which is what keeps a stale pid file left by a crash from
+# aiming these signals at whatever process later inherited that number.
 stop_wedged_listener() {
   local pid=$1 waited=0
   kill "$pid" 2>/dev/null || true
@@ -260,7 +275,8 @@ stop_wedged_listener() {
     kill -9 "$pid" 2>/dev/null || true
   fi
   kill -0 "$pid" 2>/dev/null && return 1
-  rm -f -- "$FM_WA_PIDFILE" "$LISTENER_BEAT" 2>/dev/null || true
+  rm -f -- "$FM_WA_PIDFILE" "$FM_WA_PIDFILE_IDENTITY" "$LISTENER_BEAT" \
+    "$LISTENER_STATUS" 2>/dev/null || true
   return 0
 }
 
@@ -277,9 +293,9 @@ ensure_listener() {
       # bounds a crash loop, so a channel that cannot recover still latches
       # instead of respawning forever.
       if [ -f "$LISTENER_BEAT" ]; then
-        emit_listener_error "WhatsApp listener is running but its connection is down; restarting it, see state/wa-listener.log"
+        emit_listener_error stalled "WhatsApp listener is running but its connection is down; restarting it, see state/wa-listener.log"
       else
-        emit_listener_error "WhatsApp listener is running but its connection has never come up; restarting it, see state/wa-listener.log"
+        emit_listener_error never-up "WhatsApp listener is running but its connection has never come up; restarting it, see state/wa-listener.log"
       fi
       stop_wedged_listener "$pid" || return 1
     elif [ "$(listener_device_hook)" = unavailable ]; then
@@ -287,31 +303,31 @@ ensure_listener() {
       # can pick it up: a listener holding a healthy socket would otherwise
       # reject every message the captain sends for as long as that socket
       # lasts. Reported AND repaired, on the same budget as a stalled one.
-      emit_listener_error "WhatsApp listener cannot read message sender devices, so every message from the captain would be rejected; restarting it, see state/wa-listener.log"
+      emit_listener_error device-hook "WhatsApp listener cannot read message sender devices, so every message from the captain would be rejected; restarting it, see state/wa-listener.log"
       stop_wedged_listener "$pid" || return 1
     else
       return 0
     fi
   fi
   if [ "$state" = "logged-out" ]; then
-    emit_listener_error "WhatsApp listener was logged out; re-pair with bin/fm-wa-listen.sh unpair then pair"
+    emit_listener_error logged-out "WhatsApp listener was logged out; re-pair with bin/fm-wa-listen.sh unpair then pair"
     return 1
   fi
   if ! fm_wa_paired; then
-    emit_listener_error "WhatsApp listener is not paired; run bin/fm-wa-listen.sh pair"
+    emit_listener_error unpaired "WhatsApp listener is not paired; run bin/fm-wa-listen.sh pair"
     return 1
   fi
   fails=$(restart_failures)
   if [ "$fails" -ge "$RESTART_FAIL_LIMIT" ] \
     && [ "$(fm_wa_age_of "$RESTART_FAILS")" -lt "$LATCH_RETRY_INTERVAL" ]; then
-    emit_listener_error "WhatsApp listener will not stay healthy after restart; see state/wa-listener.log, then run bin/fm-wa-listen.sh restart"
+    emit_listener_error restart-latch "WhatsApp listener will not stay healthy after restart; see state/wa-listener.log, then run bin/fm-wa-listen.sh restart"
     return 1
   fi
   if [ "$(fm_wa_age_of "$RESTART_MARKER")" -lt "$RESTART_INTERVAL" ]; then
     return 1
   fi
   if ! spawn_listener; then
-    emit_listener_error "WhatsApp listener cannot be restarted: this host has neither setsid nor perl to detach it"
+    emit_listener_error no-detach "WhatsApp listener cannot be restarted: this host has neither setsid nor perl to detach it"
     return 1
   fi
   : | fm_wa_publish_stdin "$FM_WA_STATE" "wa-listener.restart" 2>/dev/null || true
@@ -323,7 +339,7 @@ ensure_listener() {
 prune_state
 
 if ensure_listener; then
-  rm -f -- "$LISTENER_ERROR" 2>/dev/null || true
+  rm -f -- "$LISTENER_ERROR" "$LISTENER_ERROR".* 2>/dev/null || true
   if [ "$(fm_wa_age_of "$RESTART_MARKER")" -ge "$STABLE_INTERVAL" ]; then
     rm -f -- "$RESTART_FAILS" 2>/dev/null || true
   fi
