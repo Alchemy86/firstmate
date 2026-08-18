@@ -381,9 +381,11 @@ test_a_hand_run_start_releases_the_restart_block() {
   mkdir -p "$home/state/wa-auth"
   printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
   fakebin=$(fm_fakebin "$TMP_ROOT/handstart")
+  # A real listener's command names the program it is running, and the start
+  # binds the pid to that command, so the stand-in has to keep it too.
   cat > "$fakebin/node" <<'SH'
 #!/usr/bin/env bash
-exec sleep 30
+exec -a "node $*" sleep 30
 SH
   chmod +x "$fakebin/node"
 
@@ -616,6 +618,35 @@ test_a_recycled_pid_is_never_signalled() {
     "a stranger's pid was reported as the listener's own wedged connection"
 
   pass "a pid the poll cannot bind to this home's listener is never signalled"
+}
+
+# The identity is written by whoever started the listener and read back by
+# whoever later checks it, and those two can run under different timezones. A
+# false mismatch is worse here than a refused stop: the poll concludes there is
+# no listener at all and starts a second one onto the single credential folder
+# WhatsApp allows, which is the break the binding exists to prevent.
+test_a_listener_binding_survives_a_timezone_change() {
+  local home listener_pid bound
+  home="$TMP_ROOT/identitytz"
+  new_home "$home"
+  sleep 300 &
+  listener_pid=$!
+  FAKE_PIDS="$FAKE_PIDS $listener_pid"
+  printf '%s\n' "$listener_pid" > "$home/state/wa-listener.pid"
+  ( # shellcheck source=bin/fm-wa-lib.sh
+    . "$LIB"
+    TZ=UTC FM_WA_STATE="$home/state" fm_wa_record_listener_identity "$listener_pid" ) >/dev/null 2>&1 \
+    || fail "the identity of a running process was not recorded"
+
+  bound=$( # shellcheck source=bin/fm-wa-lib.sh
+    . "$LIB"
+    FM_HOME="$home"
+    fm_wa_paths
+    TZ=America/New_York fm_wa_listener_pid ) || bound=
+  [ "$bound" = "$listener_pid" ] \
+    || fail "a live listener stopped being its own recorded identity under another timezone"
+
+  pass "a listener stays bound to its own identity across a timezone change"
 }
 
 # The pid file appears the instant a replacement forks, well before that process
@@ -1496,6 +1527,7 @@ test_dry_run_records_are_pruned
 test_a_spent_restart_block_releases_itself_after_a_while
 test_a_hand_run_start_releases_the_restart_block
 test_a_recycled_pid_is_never_signalled
+test_a_listener_binding_survives_a_timezone_change
 test_a_replacement_is_not_judged_by_its_predecessor
 test_a_restarted_listener_survives_the_check_being_reaped
 test_a_refused_restart_says_why_in_the_log

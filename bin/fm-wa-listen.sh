@@ -69,6 +69,7 @@ clear_listener_health() {
 }
 
 cmd_start() {
+  local started_pid waited
   require_config || return 1
   if fm_wa_listener_pid >/dev/null; then
     echo "listener already running (pid $(fm_wa_listener_pid))"
@@ -103,8 +104,21 @@ cmd_start() {
   )
   chmod 600 "$FM_WA_PIDFILE" "$FM_WA_LOG" 2>/dev/null || true
   # Bind the pid to this process now, while it is still unambiguously the one we
-  # just started, so a later stop can prove what it is signalling.
-  fm_wa_record_listener_identity "$(cat "$FM_WA_PIDFILE" 2>/dev/null)" 2>/dev/null || true
+  # just started, so a later stop can prove what it is signalling. The forked
+  # pid does not name the listener until nohup has handed it to node by exec,
+  # and the identity carries the command, so this waits for that handoff first;
+  # a pid that never reaches it is bound to nothing and falls back to the
+  # command check rather than carrying a binding that is already wrong.
+  started_pid=$(cat "$FM_WA_PIDFILE" 2>/dev/null) || started_pid=
+  waited=0
+  while [ "$waited" -lt 20 ] && ! fm_wa_process_is_listener "$started_pid"; do
+    kill -0 "$started_pid" 2>/dev/null || break
+    sleep 0.1 2>/dev/null || sleep 1
+    waited=$(( waited + 1 ))
+  done
+  if fm_wa_process_is_listener "$started_pid"; then
+    fm_wa_record_listener_identity "$started_pid" 2>/dev/null || true
+  fi
   sleep 1
   if fm_wa_listener_pid >/dev/null; then
     # A start run by hand is the operator's own repair, so it releases the

@@ -10,6 +10,8 @@
 # bin/fm-wa-setup.sh. docs/whatsapp-channel.md owns the operator-facing setup,
 # the one-connection-per-credential-folder constraint, and the opt-out path.
 
+FM_WA_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Capture the environment's own overrides BEFORE the defaults below clear them,
 # so `FM_WA_DRY_RUN=1 fm-wa-send.sh ...` still works for a single command.
 FM_WA_DRY_RUN_ENV="${FM_WA_DRY_RUN:-}"
@@ -186,26 +188,54 @@ fm_wa_sha256() {
   fi
 }
 
-# The start time of a running process, which is what makes a pid an identity: a
-# recycled pid is a different process with a different start time, and an exec
-# (nohup handing off to node, or node handing off to anything else) keeps the
-# same one, so this stays true across the whole life of the listener. Empty
-# output means this host will not say, never that the process is a different
-# one. LC_ALL=C pins the date format so an identity written under one locale
-# still matches when it is read back under another.
+# The command a pid is running, which is also how a pid file written before an
+# identity was recorded is judged. Empty output means this host will not say.
+fm_wa_process_command() {
+  local pid=$1
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  COLUMNS=10000 LC_ALL=C ps -p "$pid" -o command= 2>/dev/null | head -n 1
+}
+
+# True only when the pid is running this listener's own program. A pid still
+# inside nohup's handoff to node names the wrapper rather than the listener, so
+# the identity below must not be bound to it until this holds.
+fm_wa_process_is_listener() {
+  case "$(fm_wa_process_command "$1")" in
+    *fm-wa-listen.mjs*) return 0 ;;
+  esac
+  return 1
+}
+
+# What makes a pid an identity: a recycled pid is a different process with a
+# different start time, and carrying the command with it keeps a reuse inside
+# the same start-time tick a mismatch too. bin/fm-wake-lib.sh already solved
+# this for the watcher and prefers /proc's starttime over ps lstart, because a
+# timezone change or a boot-time correction re-renders that date and would
+# evict a live process, so its helper is reused here rather than restated in a
+# weaker form. Its globals are declared local so borrowing that one helper
+# leaves nothing behind in the scripts that source this library. Empty output
+# means this host will not say, never that the process is a different one.
 fm_wa_process_identity() {
   local pid=$1
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  COLUMNS=10000 LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null \
-    | head -n 1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+  local FM_WAKE_LIB_DIR FM_WAKE_DEFAULT_ROOT FM_ROOT FM_HOME STATE
+  local FM_WAKE_QUEUE FM_WAKE_QUEUE_LOCK FM_LOCK_STALE_AFTER _FM_UNAME
+  STATE="$FM_WA_STATE"
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$FM_WA_LIB_DIR/fm-wake-lib.sh" || return 1
+  fm_pid_identity "$pid"
 }
 
 # Bind the pid file that was just written to the process it names, so anything
 # that later signals that pid can prove it is signalling this home's own
 # listener. Called right after the spawn, while the pid cannot yet have been
-# recycled.
+# recycled, and only once fm_wa_process_is_listener holds: the identity carries
+# the command, so binding it mid-handoff would record the wrapper's own and
+# reject the live listener from the very next check.
 fm_wa_record_listener_identity() {
   local pid=$1 identity
   identity=$(fm_wa_process_identity "$pid") || return 1
@@ -240,7 +270,7 @@ fm_wa_listener_pid() {
     current=$(fm_wa_process_identity "$pid") || current=
     [ -z "$current" ] || [ "$current" = "$recorded" ] || return 1
   else
-    cmdline=$(COLUMNS=10000 LC_ALL=C ps -p "$pid" -o command= 2>/dev/null) || cmdline=
+    cmdline=$(fm_wa_process_command "$pid") || cmdline=
     case "$cmdline" in
       ''|*fm-wa-listen.mjs*) ;;
       *) return 1 ;;

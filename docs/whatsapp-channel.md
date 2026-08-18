@@ -161,6 +161,7 @@ The poll tries again an hour after the last attempt, so a channel held down by s
 
 Stopping a listener means signalling a pid, and a pid alone is not the listener: the pid file is removed only on a clean exit, so a crash leaves it behind and that number can later belong to any process this user runs.
 Every start therefore records the identity of the process it launched in `state/wa-listener.pid-identity`, and the poll refuses to signal a pid whose identity no longer matches.
+That identity is the process's own start time and command, taken through the same helper the watcher uses for its own, so a timezone change or a corrected boot clock cannot re-render it into a mismatch and leave the channel starting a second listener.
 It restarts the listener instead, which is the right answer for a pid file the dead listener left behind.
 
 An alive listener whose connection is down is stopped and replaced rather than only reported.
