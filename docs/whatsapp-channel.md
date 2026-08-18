@@ -139,6 +139,10 @@ The poll reports one `wa-channel-error` line instead of respawning when the devi
 That last one is why the listener touches `state/wa-listener.beat` only while it is actually connected: a live process is not a live channel.
 A listener that never connects at all writes no beat, so the poll measures that fifteen minutes from when the listener was started, and a channel that has never come up is reported exactly like one that stopped working.
 
+A connected listener is not a working one either.
+The accepted-sender-device filter is fed by a raw stanza hook, and a listener that cannot attach that hook rejects every message the captain sends while still reporting a healthy connection and touching its beat.
+The listener records that fault alongside its connection state, so the poll reports it as a `wa-channel-error` naming the sender devices it cannot read, and clears it by itself once a reconnect attaches the hook again.
+
 Re-pairing clears the previous link's health records, so a freshly linked device is never judged by the old one's logged-out status or restart count.
 
 A restart the poll spawns writes the wrapper's own refusals into `state/wa-listener.log` as well, so a listener that never gets far enough to open that log still explains itself there.

@@ -521,6 +521,43 @@ test_stalled_listener_is_replaced_not_only_reported() {
   pass "a listener whose connection is down is replaced, not reported forever"
 }
 
+# The sender-device filter is the guard that keeps firstmate's own replies out
+# of the inbox, and it is fed by a raw stanza hook. A listener that cannot
+# attach that hook still connects and still beats, so nothing else in the poll
+# would notice that every message from the captain is being thrown away.
+test_a_listener_that_cannot_read_sender_devices_is_reported() {
+  local home out
+  home="$TMP_ROOT/nodevicehook"
+  new_home "$home"
+  fake_listener "$home"
+  date +%s > "$home/state/wa-listener.beat"
+  stash_message "$home" MSGHOOK
+
+  printf '{"state":"connected","me":"x","at":1}\n' > "$home/state/wa-listener.status"
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-message 1 pending, including MSGHOOK' \
+    "a healthy listener did not reach the inbox announcement"
+
+  printf '{"state":"connected","me":"x","at":2,"deviceHook":"unavailable"}\n' \
+    > "$home/state/wa-listener.status"
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-channel-error' \
+    "a listener that rejects every message looked perfectly healthy"
+  assert_contains "$out" 'sender devices' \
+    "the report did not name what the listener cannot read"
+  assert_present "$home/state/wa-listener.error" \
+    "the fault was announced without being recorded"
+
+  # It clears itself the moment a reconnect attaches the hook again, so the
+  # captain is not left with a fault that outlives the problem.
+  printf '{"state":"connected","me":"x","at":3}\n' > "$home/state/wa-listener.status"
+  poll "$home" >/dev/null
+  assert_absent "$home/state/wa-listener.error" \
+    "the fault outlived the listener recovering its sender-device hook"
+
+  pass "a listener that cannot read sender devices is reported, not trusted"
+}
+
 test_a_skipped_entry_is_reported_on_a_quiet_cycle() {
   local home out
   home="$TMP_ROOT/badnamesaid"
@@ -688,6 +725,84 @@ test_arming_makes_an_idle_home_need_supervision() {
     && fail "a disarmed home was still counted as needing supervision"
 
   pass "an armed channel keeps an idle home supervised, and only while it is armed"
+}
+
+# The primary harnesses that decide for themselves when to arm each carry their
+# own copy of the "does this home need a watcher" question. An armed channel is
+# a supervision reason in bin/fm-supervision-lib.sh, so a primary that misses it
+# leaves the captain's messages sitting in the inbox with nothing to announce
+# them.
+test_every_primary_arms_for_an_armed_channel() {
+  local home probe out
+  home="$TMP_ROOT/primaryarm"
+  new_home "$home"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 \
+    || fail "arm failed"
+
+  if ! command -v node >/dev/null 2>&1; then
+    pass "an armed channel is a supervision reason on every self-arming primary (skipped: no node)"
+    return
+  fi
+
+  # The predicate is private to the plugin, so it is lifted out and answered
+  # directly rather than by driving a whole OpenCode session.
+  probe="$home/shouldarm.mjs"
+  cat > "$probe" <<'PROBE'
+import fs from 'node:fs'
+const [file, state, config] = process.argv.slice(2)
+const src = fs.readFileSync(file, 'utf8')
+const body = src.match(/function shouldArm\(paths\) \{[\s\S]*?\n\}/)
+if (!body) { process.stderr.write('no shouldArm in the OpenCode plugin\n'); process.exit(1) }
+const shouldArm = new Function('existsSync', 'readdirSync', `${body[0]}; return shouldArm`)(fs.existsSync, fs.readdirSync)
+process.stdout.write(String(shouldArm({ state, config })))
+PROBE
+
+  out=$(node "$probe" "$ROOT/.opencode/plugins/fm-primary-watch-arm.js" \
+    "$home/state" "$home/config" 2>&1) \
+    || fail "could not evaluate the OpenCode arm predicate: $out"
+  [ "$out" = true ] \
+    || fail "the OpenCode primary would not arm a watcher for an armed channel"
+
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" disarm >/dev/null 2>&1 \
+    || fail "disarm failed"
+  out=$(node "$probe" "$ROOT/.opencode/plugins/fm-primary-watch-arm.js" \
+    "$home/state" "$home/config" 2>&1) \
+    || fail "could not evaluate the OpenCode arm predicate: $out"
+  [ "$out" = false ] \
+    || fail "the OpenCode primary would arm a watcher for a home with nothing to watch"
+
+  pass "an armed channel is a supervision reason on every self-arming primary"
+}
+
+# The cadence is only worth generating if the process that launches the watcher
+# actually inherits it, so every primary that builds its own arm command has to
+# source it exactly as it sources Relay's.
+test_every_primary_arm_command_sources_the_cadence() {
+  local home cmd out
+  home="$TMP_ROOT/primarycadence"
+  mkdir -p "$home/config"
+  printf 'export FM_CHECK_INTERVAL=30\n' > "$home/config/wa-mode.env"
+  cat > "$home/arm.sh" <<'ARM'
+#!/usr/bin/env bash
+printf 'interval=%s\n' "${FM_CHECK_INTERVAL:-unset}"
+ARM
+  chmod +x "$home/arm.sh"
+
+  for cmd in \
+    "$(sed -n "s/.*spawn(\"bash\", \[\"-lc\", '\(config_dir=.*--restart\)'.*/\1/p" \
+        "$ROOT/.opencode/plugins/fm-primary-watch-arm.js" | head -n 1)" \
+    "$(sed -n 's/.*spawn("bash", \["-lc", "\(config_dir=.*--restart\)".*/\1/p' \
+        "$ROOT/.pi/extensions/fm-primary-pi-watch.ts" | head -n 1 | sed 's/\\"/"/g')"
+  do
+    [ -n "$cmd" ] || fail "could not read a primary's arm command"
+    cmd=${cmd//\"\$FM_ROOT_OVERRIDE\/bin\/fm-watch-arm.sh\"/\"\$FM_WATCH_ARM_SCRIPT\"}
+    out=$(FM_CONFIG_OVERRIDE="$home/config" FM_HOME="$home" \
+      FM_WATCH_ARM_SCRIPT="$home/arm.sh" bash -c "$cmd" 2>/dev/null)
+    assert_contains "$out" 'interval=30' \
+      "a primary's arm command did not source the generated cadence: $cmd"
+  done
+
+  pass "every primary's arm command inherits the generated cadence"
 }
 
 test_arming_writes_the_watcher_cadence() {
@@ -1189,6 +1304,7 @@ test_logged_out_listener_is_reported
 test_repeated_listener_exits_are_reported
 test_stalled_listener_is_reported
 test_stalled_listener_is_replaced_not_only_reported
+test_a_listener_that_cannot_read_sender_devices_is_reported
 test_a_skipped_entry_is_reported_on_a_quiet_cycle
 test_slow_flap_still_reaches_the_restart_limit
 test_outbound_digests_are_pruned
@@ -1203,6 +1319,8 @@ test_listener_state_growth_is_bounded
 test_shim_arm_register_disarm
 test_removing_the_config_restores_the_home_exactly
 test_arming_makes_an_idle_home_need_supervision
+test_every_primary_arms_for_an_armed_channel
+test_every_primary_arm_command_sources_the_cadence
 test_arming_writes_the_watcher_cadence
 test_the_cadence_reaches_the_supervision_block
 test_stop_says_the_armed_check_restarts_it

@@ -136,6 +136,16 @@ listener_state() {
     "$LISTENER_STATUS" 2>/dev/null | tail -n 1
 }
 
+# The listener reports this only while its sender-device filter has no raw
+# stanza hook to feed it. The connection is healthy and the beat is fresh, so
+# nothing else in this poll would notice that every inbound message is being
+# rejected.
+listener_device_hook() {
+  [ -f "$LISTENER_STATUS" ] || return 0
+  sed -n 's/.*"deviceHook"[[:space:]]*:[[:space:]]*"\([A-Za-z-]*\)".*/\1/p' \
+    "$LISTENER_STATUS" 2>/dev/null | tail -n 1
+}
+
 restart_failures() {
   local n
   n=$(cat "$RESTART_FAILS" 2>/dev/null) || n=0
@@ -262,6 +272,9 @@ ensure_listener() {
         emit_listener_error "WhatsApp listener is running but its connection has never come up; restarting it, see state/wa-listener.log"
       fi
       stop_wedged_listener "$pid" || return 1
+    elif [ "$(listener_device_hook)" = unavailable ]; then
+      emit_listener_error "WhatsApp listener cannot read message sender devices, so every message from the captain would be rejected; see state/wa-listener.log"
+      return 1
     else
       return 0
     fi

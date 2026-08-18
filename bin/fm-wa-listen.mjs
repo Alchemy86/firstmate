@@ -206,9 +206,18 @@ function writeWatermark(ts) {
   fs.renameSync(tmp, WATERMARK)
 }
 
+// The accepted-sender-device filter is the guard that separates the captain
+// from firstmate's own echo, and it reads a baileys internal. When that hook
+// cannot be attached the connection still comes up perfectly, so the fault
+// rides along on every status the listener writes rather than being overwritten
+// by the next `connected` line, and bin/fm-wa-poll.sh raises it as a channel
+// error instead of the home going silently deaf.
+let deviceHookFault = false
+
 function writeListenerStatus(fields) {
+  const body = deviceHookFault ? { ...fields, deviceHook: 'unavailable' } : fields
   const tmp = `${LISTENER_STATUS}.tmp-${process.pid}`
-  fs.writeFileSync(tmp, `${JSON.stringify(fields)}\n`, { mode: 0o600 })
+  fs.writeFileSync(tmp, `${JSON.stringify(body)}\n`, { mode: 0o600 })
   fs.renameSync(tmp, LISTENER_STATUS)
 }
 
@@ -425,7 +434,17 @@ async function runListen() {
   const connect = async () => {
     const sock = await makeSocket(mod, logger)
     current = sock
-    if (sock.ws?.on) sock.ws.on('CB:message', rememberDevice)
+    if (typeof sock.ws?.on === 'function') {
+      sock.ws.on('CB:message', rememberDevice)
+      deviceHookFault = false
+    } else if (ALLOW_DEVICES === '*') {
+      deviceHookFault = false
+      logLine('raw stanza hook unavailable; every device is accepted, so the sender-device filter is not needed')
+    } else {
+      deviceHookFault = true
+      logLine('raw stanza hook unavailable: sender devices cannot be read, so every message would be rejected by FM_WA_ALLOW_DEVICES')
+      writeListenerStatus({ state: 'degraded', at: Date.now() })
+    }
 
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update
