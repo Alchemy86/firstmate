@@ -1362,6 +1362,70 @@ SH
   pass "a failed send leaves no digest to suppress the captain saying the same thing"
 }
 
+# mudslide parses its own arguments with commander, so a reply that opens with
+# a dash is read as an unknown option and never reaches the captain unless
+# option parsing is ended first.
+test_a_dash_leading_reply_still_reaches_the_send() {
+  local home out argv fakebin
+  home="$TMP_ROOT/dashsend"
+  new_home "$home"
+  printf -- '- PR is up: https://example.invalid/pr/1\n' > "$TMP_ROOT/dash-reply.txt"
+  fakebin=$(fm_fakebin "$TMP_ROOT/dashsend-bin")
+  argv="$TMP_ROOT/dashsend-argv"
+  cat > "$fakebin/mudslide" <<'SH'
+#!/usr/bin/env bash
+# Stands in for mudslide's commander parser: a dash-leading argument is an
+# option until `--` ends option parsing.
+ended=0
+args=()
+for a in "$@"; do
+  if [ "$ended" -eq 0 ] && [ "$a" = "--" ]; then ended=1; continue; fi
+  if [ "$ended" -eq 0 ]; then
+    case "$a" in
+      -*) echo "error: unknown option '$a'" >&2; exit 1 ;;
+    esac
+  fi
+  args+=("$a")
+done
+printf '%s\n' "${args[@]}" > "$FAKE_MUDSLIDE_ARGV"
+SH
+  chmod +x "$fakebin/mudslide"
+
+  out=$(PATH="$fakebin:$PATH" FAKE_MUDSLIDE_ARGV="$argv" FM_HOME="$home" \
+    FM_ROOT_OVERRIDE="$ROOT" "$SEND" --text-file "$TMP_ROOT/dash-reply.txt" 2>&1) \
+    || fail "a reply beginning with a dash was never sent: $out"
+
+  [ -f "$argv" ] || fail "the send never reached mudslide"
+  assert_contains "$(tail -n 1 "$argv")" '- PR is up: https://example.invalid/pr/1' \
+    "the dash-leading reply did not arrive as message text"
+
+  pass "a reply beginning with a dash reaches the send instead of being read as an option"
+}
+
+# A reply that never arrives is the one failure this channel cannot afford, so
+# the send must say what mudslide said rather than only that it failed.
+test_a_failed_send_says_why() {
+  local home out fakebin
+  home="$TMP_ROOT/sendwhy"
+  new_home "$home"
+  printf 'this never left the building\n' > "$TMP_ROOT/sendwhy-reply.txt"
+  fakebin=$(fm_fakebin "$TMP_ROOT/sendwhy-bin")
+  cat > "$fakebin/mudslide" <<'SH'
+#!/usr/bin/env bash
+echo "error: not logged in, run mudslide login" >&2
+exit 1
+SH
+  chmod +x "$fakebin/mudslide"
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/sendwhy-reply.txt" 2>&1) \
+    && fail "a failing mudslide reported success: $out"
+
+  assert_contains "$out" 'not logged in' "the failed send discarded the reason it failed"
+
+  pass "a failed reply reports what mudslide said, not just that it failed"
+}
+
 test_failed_dry_run_leaves_no_echo_trap() {
   local home out
   home="$TMP_ROOT/faileddry"
@@ -1609,4 +1673,6 @@ test_two_faults_in_one_cycle_still_speak_once
 test_echo_digest_normalization_matches
 test_stale_echo_marker_does_not_swallow_the_captain
 test_failed_send_leaves_no_echo_trap
+test_a_dash_leading_reply_still_reaches_the_send
+test_a_failed_send_says_why
 test_failed_dry_run_leaves_no_echo_trap

@@ -75,6 +75,7 @@ That does mean everything on this chat is `fromMe`, including firstmate's own re
    An echo returns within seconds, so a digest older than ten minutes is swept instead of matched.
    Otherwise the first time the captain himself typed something firstmate once said, his instruction would be swallowed as an echo.
    A send that fails drops its own digest for the same reason: nothing went out, so nothing can come back.
+   It also reports what mudslide said, so a reply that never reached the captain names its own cause instead of failing silently.
 
 If the captain also wants to command firstmate from WhatsApp Web or Desktop, add those device numbers to `FM_WA_ALLOW_DEVICES`. Do **not** add the device mudslide uses; that is firstmate's own outbound and would loop.
 
@@ -220,6 +221,7 @@ A dry run records the same outbound digest under `state/wa-sent/` that a real se
 Inbound WhatsApp text is untrusted input arriving over a network into a shell environment.
 
 - Message text is **never** interpolated into a command. `bin/fm-wa-send.sh` takes it from a file and hands it to mudslide as one argument-vector element; nothing goes through `eval` or `sh -c`.
+  That element is passed after a `--`, which ends mudslide's own option parsing, so a reply that opens with a dash - a bulleted line, say - is sent as text rather than read as an unknown option and never delivered.
 - Message ids are validated against `[A-Za-z0-9._-]{1,128}` before any path is built from them.
 - The listener accepts only a direct chat with the configured captain number, only `fromMe`, and only from an accepted device. Group chats, broadcasts, status, newsletters and forwarded messages are refused and logged.
 - `config/whatsapp.env` is read as data, key by key, never sourced, so a stray backtick in it cannot execute.
