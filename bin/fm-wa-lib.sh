@@ -222,11 +222,15 @@ fm_wa_process_is_listener() {
 # local declarations, is what keeps all of that out of the scripts that source
 # this library, so the source and the one call it exists for happen inside one.
 # STATE is pinned to this channel's own directory so that creation cannot land
-# anywhere else, and TZ is pinned because the ps fallback taken on a host
-# without /proc renders lstart in the caller's zone: an identity recorded by a
-# start under one zone and read back by the poll under another would otherwise
-# mismatch, and the poll would answer that by starting a second listener onto
-# the single credential folder WhatsApp allows.
+# anywhere else, and every environment input that can re-render the ps fallback
+# taken on a host without /proc is pinned with it: TZ, because lstart prints the
+# date in the caller's zone; LC_ALL, because the month name and field order are
+# locale-dependent; and COLUMNS, because both procps and BSD ps truncate the
+# command column to it, which is why fm_wa_process_command above pins the same
+# value. An identity recorded by a start under one environment and read back by
+# the poll under another would otherwise mismatch, and the poll would answer
+# that by starting a second listener onto the single credential folder WhatsApp
+# allows.
 #
 # Empty output means this host will not say, never that the process is a
 # different one.
@@ -236,7 +240,7 @@ fm_wa_process_identity() {
     ''|*[!0-9]*) return 1 ;;
   esac
   (
-    export TZ=UTC
+    export TZ=UTC LC_ALL=C COLUMNS=10000
     STATE="$FM_WA_STATE"
     # shellcheck source=bin/fm-wake-lib.sh
     . "$FM_WA_LIB_DIR/fm-wake-lib.sh" || exit 1

@@ -105,14 +105,20 @@ Record durable work in the backlog as usual. The channel is transport, not a sep
 
 ## 6. Reply
 
-Reply through the send path, with the text in a file so it is never re-parsed by a shell:
+Reply through the send path, with the text in a file so it is never re-parsed by a shell.
+Write that file with your own file-writing tool, or with a quoted heredoc, so the reply never reaches a command line at all - section 3 applies to your own reply too, because it routinely quotes the captain's words back to him:
 
 ```
 reply_file=$(umask 077; mktemp "${TMPDIR:-/tmp}/wa-reply.XXXXXX")
-printf '%s' "$reply" > "$reply_file"
+cat > "$reply_file" <<'FM_WA_REPLY'
+Captain, the fix is up: https://github.com/owner/repo/pull/1
+FM_WA_REPLY
 "$FM_ROOT"/bin/fm-wa-send.sh --text-file "$reply_file"
 rm -f "$reply_file"
 ```
+
+The quoted delimiter is what makes that safe: nothing in the body is expanded or re-parsed, and no substitution runs.
+Never build the reply into a variable or into the command line first, and never use an unquoted delimiter.
 
 The file is private and removed after the send, because the captain's reply is his, not the machine's.
 

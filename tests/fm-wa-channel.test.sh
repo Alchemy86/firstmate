@@ -621,57 +621,84 @@ test_a_recycled_pid_is_never_signalled() {
 }
 
 # The identity is written by whoever started the listener and read back by
-# whoever later checks it, and those two can run under different timezones. A
-# false mismatch is worse here than a refused stop: the poll concludes there is
-# no listener at all and starts a second one onto the single credential folder
-# WhatsApp allows, which is the break the binding exists to prevent.
-test_a_listener_binding_survives_a_timezone_change() {
-  local home listener_pid bound
-  home="$TMP_ROOT/identitytz"
+# whoever later checks it, and those two run under whatever environment their
+# own caller had. A false mismatch is worse here than a refused stop: the poll
+# concludes there is no listener at all and starts a second one onto the single
+# credential folder WhatsApp allows, which is the break the binding exists to
+# prevent. Timezone, locale and COLUMNS each re-render the ps form of that
+# identity, so all three are varied between the write and every read below.
+test_a_listener_binding_survives_an_environment_change() {
+  local home listener_pid long bound recorded reread no_proc
+  home="$TMP_ROOT/identityenv"
   new_home "$home"
-  sleep 300 &
+  # ps truncates the command column to COLUMNS, so the process this binds to
+  # needs a command line long enough for that truncation to be visible at all.
+  long="$home/$(printf 'x%.0s' $(seq 1 200))"
+  ln -s "$(command -v sleep)" "$long"
+  "$long" 300 &
   listener_pid=$!
   FAKE_PIDS="$FAKE_PIDS $listener_pid"
   printf '%s\n' "$listener_pid" > "$home/state/wa-listener.pid"
   ( # shellcheck source=bin/fm-wa-lib.sh
     . "$LIB"
-    TZ=UTC FM_WA_STATE="$home/state" fm_wa_record_listener_identity "$listener_pid" ) >/dev/null 2>&1 \
+    TZ=UTC LC_ALL=C COLUMNS=200 FM_WA_STATE="$home/state" \
+      fm_wa_record_listener_identity "$listener_pid" ) >/dev/null 2>&1 \
     || fail "the identity of a running process was not recorded"
+  recorded=$(cat "$home/state/wa-listener.pid-identity")
+
+  reread=$( # shellcheck source=bin/fm-wa-lib.sh
+    . "$LIB"
+    TZ=America/New_York LC_ALL=en_US.UTF-8 COLUMNS=40 FM_WA_STATE="$home/state" \
+      fm_wa_process_identity "$listener_pid" )
+  [ "$reread" = "$recorded" ] \
+    || fail "the same live process rendered a different identity under another environment"
 
   bound=$( # shellcheck source=bin/fm-wa-lib.sh
     . "$LIB"
     FM_HOME="$home"
     fm_wa_paths
-    TZ=America/New_York fm_wa_listener_pid ) || bound=
+    TZ=America/New_York LC_ALL=en_US.UTF-8 COLUMNS=40 fm_wa_listener_pid ) || bound=
   [ "$bound" = "$listener_pid" ] \
-    || fail "a live listener stopped being its own recorded identity under another timezone"
+    || fail "a live listener stopped being its own recorded identity under another environment"
 
   # On a host without a readable /proc - macOS, which this channel supports -
-  # the identity falls back to ps lstart, which is the form that renders the
-  # date in the caller's own zone. Everything above passes on Linux without
-  # ever reaching it, so the fallback is pinned here in its own right.
-  local no_proc
+  # the identity falls back to ps, which is the form that renders the date in
+  # the caller's own zone and locale and cuts the command at the caller's
+  # COLUMNS. Everything above passes on Linux without ever reaching it, so the
+  # fallback is pinned here in its own right.
   no_proc="$home/no-proc"
   mkdir -p "$no_proc"
   rm -f "$home/state/wa-listener.pid-identity"
   ( # shellcheck source=bin/fm-wa-lib.sh
     . "$LIB"
-    export FM_PROC_ROOT_OVERRIDE="$no_proc"
-    TZ=UTC FM_WA_STATE="$home/state" fm_wa_record_listener_identity "$listener_pid" ) >/dev/null 2>&1 \
+    FM_PROC_ROOT_OVERRIDE="$no_proc" TZ=UTC LC_ALL=C COLUMNS=200 FM_WA_STATE="$home/state" \
+      fm_wa_record_listener_identity "$listener_pid" ) >/dev/null 2>&1 \
     || fail "a host without /proc recorded no identity for a running process"
   grep -q 'starttime=' "$home/state/wa-listener.pid-identity" \
     && fail "the no-/proc case never exercised the ps fallback it exists to pin"
+  recorded=$(cat "$home/state/wa-listener.pid-identity")
+  case "$recorded" in
+    *xxxxxxxxxx*) ;;
+    *) fail "the recorded identity carries no command, so truncation could never show" ;;
+  esac
+
+  reread=$( # shellcheck source=bin/fm-wa-lib.sh
+    . "$LIB"
+    FM_PROC_ROOT_OVERRIDE="$no_proc" TZ=America/New_York LC_ALL=en_US.UTF-8 COLUMNS=40 \
+      FM_WA_STATE="$home/state" fm_wa_process_identity "$listener_pid" )
+  [ "$reread" = "$recorded" ] \
+    || fail "without /proc, the environment changed how the same process renders its identity"
 
   bound=$( # shellcheck source=bin/fm-wa-lib.sh
     . "$LIB"
-    export FM_PROC_ROOT_OVERRIDE="$no_proc"
     FM_HOME="$home"
     fm_wa_paths
-    TZ=America/New_York fm_wa_listener_pid ) || bound=
+    FM_PROC_ROOT_OVERRIDE="$no_proc" TZ=America/New_York LC_ALL=en_US.UTF-8 COLUMNS=40 \
+      fm_wa_listener_pid ) || bound=
   [ "$bound" = "$listener_pid" ] \
-    || fail "without /proc, a live listener stopped being its own identity under another timezone"
+    || fail "without /proc, a live listener stopped being its own identity under another environment"
 
-  pass "a listener stays bound to its own identity across a timezone change"
+  pass "a listener stays bound to its own identity across an environment change"
 }
 
 # The pid file appears the instant a replacement forks, well before that process
@@ -1552,7 +1579,7 @@ test_dry_run_records_are_pruned
 test_a_spent_restart_block_releases_itself_after_a_while
 test_a_hand_run_start_releases_the_restart_block
 test_a_recycled_pid_is_never_signalled
-test_a_listener_binding_survives_a_timezone_change
+test_a_listener_binding_survives_an_environment_change
 test_a_replacement_is_not_judged_by_its_predecessor
 test_a_restarted_listener_survives_the_check_being_reaped
 test_a_refused_restart_says_why_in_the_log
