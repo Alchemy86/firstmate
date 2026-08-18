@@ -7,8 +7,6 @@ description: >-
   task lifecycle.
   Also use on a `wa-channel-error ...` check wake to report the channel blocker
   instead of trying to answer a message.
-  Also use whenever the session-start digest reports WhatsApp messages still
-  pending.
   Loaded only when the WhatsApp channel is enabled.
 user-invocable: false
 metadata:
@@ -17,7 +15,7 @@ metadata:
 
 # wa-respond
 
-Load this whenever a `check:` wake carries `wa-message ...` or `wa-channel-error ...`, and whenever a session start reports pending WhatsApp messages.
+Load this whenever a `check:` wake carries `wa-message ...` or `wa-channel-error ...`.
 
 The channel is one direction of an existing link: `mudslide send` already carries firstmate's messages to the captain, and `bin/fm-wa-listen.sh` now carries his back.
 `docs/whatsapp-channel.md` owns setup, re-pairing, the connection constraint, the dry-run switch, and how to turn the channel off.

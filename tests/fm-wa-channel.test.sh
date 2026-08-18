@@ -14,6 +14,8 @@ POLL="$ROOT/bin/fm-wa-poll.sh"
 SETUP="$ROOT/bin/fm-wa-setup.sh"
 SEND="$ROOT/bin/fm-wa-send.sh"
 LISTENER="$ROOT/bin/fm-wa-listen.mjs"
+LISTEN_SH="$ROOT/bin/fm-wa-listen.sh"
+LIB="$ROOT/bin/fm-wa-lib.sh"
 CAPTAIN=447700900123
 TMP_ROOT=$(fm_test_tmproot fm-wa-channel)
 
@@ -212,6 +214,86 @@ test_stalled_listener_is_reported() {
   pass "a running listener whose connection is down is reported, not trusted"
 }
 
+test_listener_that_never_connects_is_reported() {
+  local home out
+  home="$TMP_ROOT/nevercame"
+  new_home "$home"
+  fake_listener "$home"
+  # No beat at all: a listener that started but never got a connection up. Its
+  # own start time is how long the channel has been down.
+  touch -t 200001010000 "$home/state/wa-listener.pid"
+
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-channel-error' "a listener that never connected looked healthy"
+  assert_contains "$out" 'never come up' "the report did not name the connection that never came up"
+
+  # A listener started moments ago has no beat either, and must be given the
+  # same grace a working one gets between beats.
+  rm -f "$home/state/wa-listener.error"
+  touch "$home/state/wa-listener.pid"
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "a listener that has just started was reported as faulty: $out"
+
+  pass "a listener whose connection never came up is reported, not trusted"
+}
+
+test_repairing_the_link_clears_stale_listener_health() {
+  command -v node >/dev/null 2>&1 || { pass "re-pairing check skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/repair"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  # The wreckage of the old link: logged out, and out of restart attempts.
+  printf '{"state":"logged-out"}\n' > "$home/state/wa-listener.status"
+  printf '3\n' > "$home/state/wa-listener.restarts"
+  : > "$home/state/wa-listener.restart"
+  printf 'stale\n' > "$home/state/wa-listener.error"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" unpair 2>&1) \
+    || fail "unpair failed: $out"
+  assert_absent "$home/state/wa-listener.status" "unpair left the old link's connection state behind"
+  assert_absent "$home/state/wa-listener.restarts" "unpair left the old link's restart count behind"
+  assert_absent "$home/state/wa-listener.restart" "unpair left the old link's restart marker behind"
+  assert_absent "$home/state/wa-listener.error" "unpair left the old link's fault behind"
+
+  out=$(poll "$home")
+  assert_contains "$out" 'not paired' "the poll did not name the missing pairing after unpair"
+  assert_not_contains "$out" 'logged out' "the poll still reported the removed link as logged out"
+  assert_not_contains "$out" 'keeps exiting' "the poll still reported the removed link's restart count"
+
+  pass "unpairing clears the old link's health, so the poll names the real next step"
+}
+
+test_listener_state_growth_is_bounded() {
+  local home before after i
+  home="$TMP_ROOT/janitor"
+  new_home "$home"
+  fake_listener "$home"
+  printf '1\n' > "$home/state/wa-listener.beat"
+  mkdir -p "$home/state/wa-seen"
+  chmod 700 "$home/state/wa-seen"
+  printf 'handled long ago\n' > "$home/state/wa-seen/OLDMSG.seen"
+  touch -t 200001010000 "$home/state/wa-seen/OLDMSG.seen"
+  printf 'handled just now\n' > "$home/state/wa-seen/NEWMSG.seen"
+  i=1
+  while [ "$i" -le 6000 ]; do
+    printf 'listener line %s padding padding padding padding padding padding\n' "$i"
+    i=$(( i + 1 ))
+  done > "$home/state/wa-listener.log"
+  before=$(wc -c < "$home/state/wa-listener.log" | tr -d '[:space:]')
+
+  poll "$home" >/dev/null
+
+  after=$(wc -c < "$home/state/wa-listener.log" | tr -d '[:space:]')
+  [ "$after" -lt "$before" ] || fail "the listener log grew past its cap unchecked ($after bytes)"
+  assert_grep 'listener line 6000' "$home/state/wa-listener.log" "capping the log dropped its newest lines"
+  assert_absent "$home/state/wa-seen/OLDMSG.seen" "a long-expired handled-message marker was never pruned"
+  assert_present "$home/state/wa-seen/NEWMSG.seen" "pruning removed a marker that still guards against redelivery"
+
+  pass "the listener log and its handled-message markers are both bounded"
+}
+
 # --- the check shim ---------------------------------------------------------
 
 test_shim_arm_register_disarm() {
@@ -297,6 +379,67 @@ SH
     || fail "the dry run recorded no echo marker"
 
   pass "FM_WA_DRY_RUN records the reply and transmits nothing"
+}
+
+test_json_encoder_round_trips_hostile_text() {
+  command -v node >/dev/null 2>&1 || { pass "JSON encoder check skipped: node is unavailable"; return 0; }
+  local encoded decoded
+  # Every character class a JSON string has to escape, plus multi-byte UTF-8
+  # that must survive untouched.
+  printf 'quote " backslash \\ tab\tcontrol \001 caf\xc3\xa9\nsecond line' \
+    > "$TMP_ROOT/encoder-input.txt"
+
+  # shellcheck source=bin/fm-wa-lib.sh
+  encoded=$( . "$LIB"; fm_wa_json_string < "$TMP_ROOT/encoder-input.txt" )
+  decoded=$(printf '%s' "$encoded" | node -e '
+    const chunks = []
+    process.stdin.on("data", (c) => chunks.push(c))
+    process.stdin.on("end", () => {
+      const value = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+      if (typeof value !== "string") { process.stderr.write("not a JSON string\n"); process.exit(1) }
+      process.stdout.write(value)
+    })
+  ') || fail "bin/fm-wa-lib.sh produced text that is not a JSON string"
+  [ "$decoded" = "$(cat "$TMP_ROOT/encoder-input.txt")" ] \
+    || fail "the JSON encoder did not round-trip the text it was given"
+
+  pass "the JSON encoder in bin/fm-wa-lib.sh escapes what JSON requires and nothing else"
+}
+
+test_dry_run_record_is_valid_json() {
+  command -v node >/dev/null 2>&1 || { pass "dry-run JSON check skipped: node is unavailable"; return 0; }
+  local home record decoded fakebin
+  home="$TMP_ROOT/dryrunjson"
+  new_home "$home"
+  # Quotes, a backslash, a tab, a line break and non-ASCII: everything a record
+  # named .json has to survive.
+  printf 'he said "go" \\ now\tstill\nsecond line caf\xc3\xa9\n' > "$TMP_ROOT/tricky.txt"
+
+  # A jq that fails proves the encoding never depended on it.
+  fakebin=$(fm_fakebin "$TMP_ROOT/dryrunjson-bin")
+  cat > "$fakebin/jq" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/jq"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_DRY_RUN=1 \
+    "$SEND" --text-file "$TMP_ROOT/tricky.txt" >/dev/null 2>&1 \
+    || fail "the dry-run send failed"
+
+  record=$(find "$home/state/wa-outbox" -name '*.json' -type f | head -n 1)
+  [ -n "$record" ] || fail "the dry run recorded nothing to state/wa-outbox"
+  decoded=$(node -e '
+    const fs = require("fs")
+    const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
+    if (r.schema !== "fm-wa-outbox-v1") { process.stderr.write("wrong schema\n"); process.exit(1) }
+    if (r.dry_run !== true) { process.stderr.write("not marked dry-run\n"); process.exit(1) }
+    process.stdout.write(r.text)
+  ' "$record") || fail "the dry-run record is not valid fm-wa-outbox-v1 JSON"
+  [ "$decoded" = "$(cat "$TMP_ROOT/tricky.txt")" ] \
+    || fail "the dry-run record did not carry the reply text back unchanged"
+
+  pass "a dry-run record is valid JSON that round-trips the reply, with or without jq"
 }
 
 test_message_text_is_never_executed() {
@@ -529,9 +672,14 @@ test_channel_fault_and_inbox_never_share_a_cycle
 test_logged_out_listener_is_reported
 test_repeated_listener_exits_are_reported
 test_stalled_listener_is_reported
+test_listener_that_never_connects_is_reported
+test_repairing_the_link_clears_stale_listener_health
+test_listener_state_growth_is_bounded
 test_shim_arm_register_disarm
 test_shim_runs_the_poll_the_way_the_watcher_does
 test_dry_run_records_and_sends_nothing
+test_json_encoder_round_trips_hostile_text
+test_dry_run_record_is_valid_json
 test_message_text_is_never_executed
 test_config_is_read_as_data
 test_listener_filters

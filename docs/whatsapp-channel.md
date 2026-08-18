@@ -20,13 +20,19 @@ It is the same shape Relay uses for public mentions, for the same reasons:
 Nothing in `bin/fm-watch.sh`, `bin/fm-watch-arm.sh`, `bin/fm-wake-lib.sh` or the away-mode daemon changes.
 The check runs through the ordinary registered-custom-check path that firstmate already uses for a task's merge poll: `bin/fm-wa-setup.sh arm` writes the shim and binds it with `bin/fm-check-register.sh`, and the watcher hashes it against that binding before running it.
 
+### Deliberately not reported at session start
+
+Relay lists a pending public commitment in the session-start digest; this channel deliberately does not list a pending inbox there.
+Reporting it would mean editing session-start code, and the whole point of the shape above is that the channel stays purely additive so it can never destabilise the supervision backbone.
+After a restart an undrained inbox is resurfaced by `FM_WA_REANNOUNCE` instead: the announcement marker goes stale, the next poll cycle announces the pending set again, and the wake arrives through the same path every other message uses.
+
 One thing differs from Relay by necessity. Relay's poll makes the network call itself; WhatsApp cannot work that way, because a WhatsApp connection takes tens of seconds to establish and re-establish. So `bin/fm-wa-listen.sh` runs one long-lived connection that stashes messages as they arrive, and `bin/fm-wa-poll.sh` is a local directory read that also nudges the listener back up if it died. The poll finishes in about 25 milliseconds, far inside `FM_CHECK_TIMEOUT`.
 
 ## The connection constraint, and what was chosen
 
 **baileys allows one live connection per credential folder.** A listener holding mudslide's session fights `mudslide send` for it.
 
-That is not theoretical. A listener pointed at mudslide's own folder at `/home/aaron/.local/share/mudslide` fails with `statusCode 405` on connect and loops reconnecting, and repeated 405 reconnects put the existing pairing at risk.
+That is not theoretical. A listener pointed at mudslide's own folder at `~/.local/share/mudslide` fails with `statusCode 405` on connect and loops reconnecting, and repeated 405 reconnects put the existing pairing at risk.
 
 **This channel takes option (b): a second linked device with its own credential folder.**
 WhatsApp permits up to four linked devices. The listener pairs its own, and keeps its credentials in `state/wa-auth/`, which is private to this home and gitignored.
@@ -39,7 +45,7 @@ The rejected alternative, option (a) - one process that both listens and sends, 
 
 ## Which chat this is
 
-The mudslide device is linked to the captain's own account (`447700900123`), so the channel is his **chat with himself** - "Message yourself" on his phone.
+The mudslide device is linked to the captain's own account, so the channel is his **chat with himself** - "Message yourself" on his phone.
 He types there, his linked devices see it, and firstmate's replies land in the same place. No group, no third party, nothing to route.
 
 That does mean everything on this chat is `fromMe`, including firstmate's own replies coming back. Two independent guards stop firstmate reading its own words as new instructions:
@@ -102,6 +108,13 @@ bin/fm-wa-setup.sh arm
 A restart is not a substitute for reporting, because some faults never heal.
 The poll reports one `wa-channel-error` line instead of respawning when the device was logged out, when the listener has died on three restarts in a row, or when a listener is alive but its connection has been down for fifteen minutes.
 That last one is why the listener touches `state/wa-listener.beat` only while it is actually connected: a live process is not a live channel.
+A listener that never connects at all writes no beat, so the poll measures that fifteen minutes from when the listener was started, and a channel that has never come up is reported exactly like one that stopped working.
+
+Re-pairing clears the previous link's health records, so a freshly linked device is never judged by the old one's logged-out status or restart count.
+
+The poll is also the channel's janitor.
+`state/wa-listener.log` is capped at 256KB by rewriting it in place, which leaves the running listener's append handle intact.
+A `state/wa-seen/` marker is pruned after thirty days, far behind any watermark that could still let an old message back into the inbox.
 
 Exactly one line comes out of a cycle.
 A cycle that reports a fault does not also announce the inbox, because the two mean different things to `wa-respond` and the watcher would fold them into a single wake.
@@ -125,7 +138,7 @@ bin/fm-wa-listen.sh pair --rounds 20
 bin/fm-wa-listen.sh start
 ```
 
-`unpair` never touches `/home/aaron/.local/share/mudslide`. Nothing in this channel ever reads or writes that folder.
+`unpair` never touches `~/.local/share/mudslide`. Nothing in this channel ever reads or writes that folder.
 
 ## Dry-run
 
@@ -136,6 +149,8 @@ FM_WA_DRY_RUN=1 bin/fm-wa-send.sh --text-file /tmp/reply.txt
 ```
 
 Set it in `config/whatsapp.env` to make it the standing mode for the home, or in the environment for one command.
+
+The record is `fm-wa-outbox-v1` JSON, encoded by `bin/fm-wa-lib.sh` rather than by `jq`, so a host without `jq` still gets valid JSON instead of a `.json` file holding raw text.
 
 A dry run records the same outbound digest under `state/wa-sent/` that a real send does, so the echo guard behaves identically either way.
 

@@ -24,6 +24,9 @@
 #   listener down but paired         -> restart it in the background, rate-limited
 #   a configuration or listener fault -> one rate-limited "wa-channel-error ..."
 #
+# It is also the channel's janitor, silently: the listener log is capped and
+# long-expired per-message markers are pruned on the way through.
+#
 # Exactly one line is ever printed. A cycle that reports a channel fault stops
 # there rather than also announcing the inbox, because the two lines mean
 # different things to the wa-respond skill and the watcher folds them into one
@@ -55,6 +58,13 @@ RESTART_FAIL_LIMIT=3
 # The listener touches its beat only while the connection is actually open, so a
 # beat this stale means an alive process with a channel that is not working.
 STALL_INTERVAL=900
+# Housekeeping bounds. The listener logs a line per message and per reconnect,
+# and keeps a durable marker per handled message, so both need a ceiling.
+LOG_MAX_BYTES=262144
+LOG_KEEP_LINES=2000
+# Well behind any watermark a redelivery could still clear, so pruning a marker
+# can never let an old message back into the inbox.
+SEEN_TTL_DAYS=30
 
 # Set when this cycle has already spoken, so the check keeps its one-line
 # contract.
@@ -107,6 +117,40 @@ spawn_listener() {
   disown 2>/dev/null || true
 }
 
+# This poll is the channel's only regular janitor, and it must stay silent while
+# it works: neither branch below ever prints. The log is rewritten in place so
+# the running listener's append handle keeps writing to the same file.
+prune_state() {
+  local size
+  if [ -f "$FM_WA_LOG" ]; then
+    size=$(wc -c < "$FM_WA_LOG" 2>/dev/null | tr -d '[:space:]') || size=0
+    case "$size" in
+      ''|*[!0-9]*) size=0 ;;
+    esac
+    if [ "$size" -ge "$LOG_MAX_BYTES" ]; then
+      if ( umask 077; tail -n "$LOG_KEEP_LINES" "$FM_WA_LOG" > "$FM_WA_LOG.trim" ) 2>/dev/null; then
+        cat "$FM_WA_LOG.trim" > "$FM_WA_LOG" 2>/dev/null || true
+      fi
+      rm -f -- "$FM_WA_LOG.trim" 2>/dev/null || true
+    fi
+  fi
+  [ -d "$FM_WA_SEEN" ] || return 0
+  find "$FM_WA_SEEN" -maxdepth 1 -name '*.seen' -type f -mtime "+$SEEN_TTL_DAYS" \
+    -exec rm -f -- {} + 2>/dev/null || true
+}
+
+# The beat is the listener's proof that its connection is up, so its age is how
+# long the channel has been down. A listener that has never connected writes no
+# beat at all, which is the same fault seen from the start rather than from a
+# working connection, so the pid file's own age stands in for it.
+listener_down_age() {
+  if [ -f "$LISTENER_BEAT" ]; then
+    fm_wa_age_of "$LISTENER_BEAT"
+  else
+    fm_wa_age_of "$FM_WA_PIDFILE"
+  fi
+}
+
 # Keep the one long-lived connection up without ever blocking this check: the
 # start is a detached background spawn and its outcome is reported next cycle.
 # A pid alone is not health, so a live listener is still judged by the state it
@@ -115,9 +159,12 @@ ensure_listener() {
   local state fails
   state=$(listener_state)
   if fm_wa_listener_pid >/dev/null 2>&1; then
-    if [ -f "$LISTENER_BEAT" ] \
-      && [ "$(fm_wa_age_of "$LISTENER_BEAT")" -ge "$STALL_INTERVAL" ]; then
-      emit_listener_error "WhatsApp listener is running but its connection is down; see state/wa-listener.log"
+    if [ "$(listener_down_age)" -ge "$STALL_INTERVAL" ]; then
+      if [ -f "$LISTENER_BEAT" ]; then
+        emit_listener_error "WhatsApp listener is running but its connection is down; see state/wa-listener.log"
+      else
+        emit_listener_error "WhatsApp listener is running but its connection has never come up; see state/wa-listener.log"
+      fi
       return 1
     fi
     return 0
@@ -144,6 +191,8 @@ ensure_listener() {
   spawn_listener
   return 1
 }
+
+prune_state
 
 if ensure_listener; then
   rm -f -- "$LISTENER_ERROR" "$RESTART_FAILS" 2>/dev/null || true

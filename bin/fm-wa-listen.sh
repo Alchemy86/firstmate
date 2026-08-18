@@ -55,6 +55,18 @@ listener_env() {
   node "$LISTENER" "$@"
 }
 
+# Pairing state changed, so every record of the OLD link's health is stale.
+# Left behind, they make the poll report a fault that has just been repaired and
+# suppress the restart that would bring the new link up.
+clear_listener_health() {
+  rm -f -- \
+    "$FM_WA_STATE/wa-listener.status" \
+    "$FM_WA_STATE/wa-listener.beat" \
+    "$FM_WA_STATE/wa-listener.error" \
+    "$FM_WA_STATE/wa-listener.restart" \
+    "$FM_WA_STATE/wa-listener.restarts" 2>/dev/null || true
+}
+
 cmd_start() {
   require_config || return 1
   if fm_wa_listener_pid >/dev/null; then
@@ -136,8 +148,12 @@ cmd_status() {
     printf 'last connection event: '
     cat "$FM_WA_STATE/wa-listener.status"
   fi
+  # A live pid is not a live channel, so say plainly when the connection has
+  # never come up rather than leaving the beat line out.
   if [ -f "$FM_WA_STATE/wa-listener.beat" ]; then
     echo "last connected beat: $(fm_wa_age_of "$FM_WA_STATE/wa-listener.beat")s ago"
+  else
+    echo "last connected beat: never"
   fi
 }
 
@@ -163,12 +179,14 @@ cmd_pair() {
   echo "On the captain's phone: WhatsApp > Settings > Linked Devices >"
   echo "Link a Device > Link with phone number instead, then enter the code below."
   [ "$rounds" -gt 1 ] && echo "A fresh code is issued automatically for up to $rounds windows."
-  listener_env pair "$number" "$rounds"
+  listener_env pair "$number" "$rounds" || return 1
+  clear_listener_health
 }
 
 cmd_unpair() {
   require_config || return 1
   cmd_stop >/dev/null 2>&1 || true
+  clear_listener_health
   if [ -d "$FM_WA_AUTH_DIR" ] && [ ! -L "$FM_WA_AUTH_DIR" ]; then
     rm -rf -- "$FM_WA_AUTH_DIR"
     echo "removed this listener's credentials; mudslide's session is untouched"

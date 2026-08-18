@@ -83,11 +83,12 @@ fi
 if [ -n "$FM_WA_DRY_RUN" ]; then
   STAMP=$(date +%s)
   BASE="$STAMP-$$.json"
-  if printf '%s' "$TEXT" \
-    | { command -v jq >/dev/null 2>&1 \
-        && jq -Rs --arg to "$TO" --arg digest "${DIGEST:-}" \
-             '{schema:"fm-wa-outbox-v1", dry_run:true, to:$to, digest:$digest, text:.}' \
-        || cat; } \
+  # Built with the library's own encoder rather than jq: the record is read back
+  # as fm-wa-outbox-v1 JSON, so a host without jq must still produce valid JSON
+  # instead of a .json file holding raw text.
+  JSON_TEXT=$(printf '%s' "$TEXT" | fm_wa_json_string) || JSON_TEXT=
+  if [ -n "$JSON_TEXT" ] && printf '{"schema":"fm-wa-outbox-v1","dry_run":true,"to":"%s","digest":"%s","text":%s}\n' \
+    "$TO" "${DIGEST:-}" "$JSON_TEXT" \
     | fm_wa_publish_stdin "$FM_WA_OUTBOX" "$BASE"; then
     echo "dry-run: recorded state/wa-outbox/$BASE (nothing sent)"
     exit 0

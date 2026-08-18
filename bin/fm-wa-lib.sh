@@ -140,6 +140,31 @@ fm_wa_id_safe() {
   [ "${#id}" -le 128 ]
 }
 
+# Encode stdin as one complete JSON string, quotes included. A recorded reply is
+# named .json and read back as JSON, so the encoding cannot depend on jq being
+# installed: without it the record would be raw text wearing a .json name.
+# Byte-oriented on purpose (LC_ALL=C), so UTF-8 passes through untouched.
+fm_wa_json_string() {
+  LC_ALL=C awk '
+    BEGIN {
+      for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i
+      printf "\""
+    }
+    {
+      if (NR > 1) printf "\\n"
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (c == "\\") printf "\\\\"
+        else if (c == "\"") printf "\\\""
+        else if (ord[c] < 32) printf "\\u%04x", ord[c]
+        else printf "%s", c
+      }
+    }
+    END { printf "\"" }
+  '
+}
+
 fm_wa_sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum | awk '{print $1}'
