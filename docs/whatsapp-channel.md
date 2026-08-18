@@ -116,23 +116,30 @@ bin/fm-wa-setup.sh arm
 `bin/fm-wa-poll.sh` restarts the listener by itself if it dies, at most once every two minutes, so a crash heals without anyone watching.
 
 A restart is not a substitute for reporting, because some faults never heal.
-The poll reports one `wa-channel-error` line instead of respawning when the device was logged out, when the listener has died on three restarts in a row, or when a listener is alive but its connection has been down for fifteen minutes.
+The poll reports one `wa-channel-error` line instead of respawning when the device was logged out, when three restarts have been spent without the listener settling, or when a listener is alive but its connection has been down for fifteen minutes.
 That last one is why the listener touches `state/wa-listener.beat` only while it is actually connected: a live process is not a live channel.
 A listener that never connects at all writes no beat, so the poll measures that fifteen minutes from when the listener was started, and a channel that has never come up is reported exactly like one that stopped working.
 
 Re-pairing clears the previous link's health records, so a freshly linked device is never judged by the old one's logged-out status or restart count.
 
 A restart the poll spawns writes the wrapper's own refusals into `state/wa-listener.log` as well, so a listener that never gets far enough to open that log still explains itself there.
+It is also spawned into its own process group, so the watcher tidying up after the check never takes the listener with it.
 Restart history is only cleared once no restart has been needed for an hour, so a listener that dies slowly enough to look alive on some cycles still reaches the limit instead of flapping forever.
+
+Spent restarts stop the automatic ones, but never permanently.
+The poll tries again an hour after the last attempt, so a channel held down by something transient - no network at boot, a host that was asleep - comes back on its own.
+`bin/fm-wa-listen.sh start` run by hand releases the block immediately, and the reported fault line names that command.
 
 The poll is also the channel's janitor.
 `state/wa-listener.log` is capped at 256KB by rewriting it in place, which leaves the running listener's append handle intact.
 A `state/wa-seen/` marker is pruned after thirty days, far behind any watermark that could still let an old message back into the inbox.
 A `state/wa-sent/` digest is pruned after an hour, well past the ten-minute window in which it could still match an echo.
+A `state/wa-outbox/` dry-run record is pruned after seven days, which is long enough to read back a test and short enough that a home left in dry-run does not grow without end.
 
 Exactly one line comes out of a cycle.
 A cycle that reports a fault does not also announce the inbox, because the two mean different things to `wa-respond` and the watcher would fold them into a single wake.
 The fault is deduped, so pending messages are announced on the next cycle rather than being buried behind it.
+For the same reason an inbox entry whose name cannot be used as a message id is skipped rather than aborting the announcement: the real messages beside it are still announced, and only an inbox with nothing usable left in it reports the fault instead.
 
 ### 4. Confirm
 

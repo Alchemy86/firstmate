@@ -28,7 +28,7 @@ Report the concrete blocker to the captain in plain language and stop:
 
 - not paired: the WhatsApp link needs setting up again, and the captain has to enter a code on his phone.
 - logged out: the captain removed or expired the linked device, so it has to be linked again from his phone.
-- listener will not stay up, or its connection is down: run `bin/fm-wa-listen.sh logs` and report what it says.
+- listener will not stay up, or its connection is down: run `bin/fm-wa-listen.sh logs` and report what it says, then run `bin/fm-wa-listen.sh start`, which both restarts the listener and releases the block that stopped the automatic restarts.
 - anything else: relay the concrete missing requirement.
 
 A fault wake never carries pending messages with it, so nothing here is being skipped.
@@ -106,9 +106,13 @@ Record durable work in the backlog as usual. The channel is transport, not a sep
 Reply through the send path, with the text in a file so it is never re-parsed by a shell:
 
 ```
-printf '%s' "$reply" > "$TMPDIR/wa-reply.txt"
-"$FM_ROOT"/bin/fm-wa-send.sh --text-file "$TMPDIR/wa-reply.txt"
+reply_file=$(umask 077; mktemp "${TMPDIR:-/tmp}/wa-reply.XXXXXX")
+printf '%s' "$reply" > "$reply_file"
+"$FM_ROOT"/bin/fm-wa-send.sh --text-file "$reply_file"
+rm -f "$reply_file"
 ```
+
+The file is private and removed after the send, because the captain's reply is his, not the machine's.
 
 Write the reply the way the captain reads it on a phone: short, direct, addressed to him, plain sentences rather than a wall of markdown.
 Give a full `https://...` URL for any PR.

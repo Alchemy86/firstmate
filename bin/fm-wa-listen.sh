@@ -92,6 +92,16 @@ cmd_start() {
   chmod 600 "$FM_WA_PIDFILE" "$FM_WA_LOG" 2>/dev/null || true
   sleep 1
   if fm_wa_listener_pid >/dev/null; then
+    # A start run by hand is the operator's own repair, so it releases the
+    # poll's restart history and the block it holds. An automatic restart the
+    # poll spawned must not, or a listener that dies slowly would erase the very
+    # history that proves it is flapping.
+    if [ -z "${FM_WA_AUTOSTART:-}" ]; then
+      rm -f -- \
+        "$FM_WA_STATE/wa-listener.restarts" \
+        "$FM_WA_STATE/wa-listener.restart" \
+        "$FM_WA_STATE/wa-listener.error" 2>/dev/null || true
+    fi
     echo "listener started (pid $(fm_wa_listener_pid))"
   else
     echo "error: listener exited immediately; see state/wa-listener.log" >&2

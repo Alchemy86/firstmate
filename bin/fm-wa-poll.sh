@@ -56,6 +56,12 @@ LISTENER_BEAT="$FM_WA_STATE/wa-listener.beat"
 RESTART_FAILS="$FM_WA_STATE/wa-listener.restarts"
 # A listener that dies this many times in a row is not going to heal itself.
 RESTART_FAIL_LIMIT=3
+# ...but "not going to heal itself" must not mean "off until a human notices".
+# The restart history is refreshed on every attempt, so once it has gone this
+# long untouched the poll tries once more. The channel therefore recovers on its
+# own from a transient cause (no network at boot, a host that was asleep) while
+# a genuinely broken one still reports rather than respawning every cycle.
+LATCH_RETRY_INTERVAL=3600
 # One live observation is not proof the channel is stable: a listener dying on a
 # period longer than the check interval is seen alive on some cycles, which
 # would zero the restart history before it ever reached the limit and let the
@@ -75,6 +81,9 @@ SEEN_TTL_DAYS=30
 # Past the listener's ten-minute echo window an outbound digest is dead by
 # definition, so nothing it could still suppress is lost by sweeping it.
 SENT_TTL_MINUTES=60
+# Dry-run records are evidence to read back, not durable state, and a home can
+# run dry for good. Kept long enough to inspect a test, like Relay's contexts.
+OUTBOX_TTL_DAYS=7
 
 # Set when this cycle has already spoken, so the check keeps its one-line
 # contract.
@@ -115,21 +124,33 @@ restart_failures() {
   printf '%s' "$n"
 }
 
-# setsid detaches the listener from this check's process group so the watcher
-# reaping the check never takes the listener with it. macOS has no setsid, so
-# fall back to nohup rather than failing the restart silently.
+# The restart MUST leave this check's process group, because the watcher signals
+# the whole group once the check returns and would otherwise reap the listener it
+# just started. setsid does that; macOS has no setsid, so fall back to perl's own
+# setpgrp exactly as bin/fm-watch.sh does for the same reason. nohup is not a
+# substitute: it only ignores SIGHUP and leaves the process in this group.
 # The wrapper's own refusals - no node, not paired, an unusable state directory,
 # an immediate exit - are raised before the listener ever opens its log, so they
 # go to that same log rather than to /dev/null. The fault line this poll prints
 # after three failed restarts names that log, and it must actually answer why.
+# FM_WA_FORCE_SPAWN_FALLBACK=1 drives the fallback on a host that has setsid, so
+# the branch a macOS host depends on is testable here, as FM_CHECK_FORCE_FALLBACK
+# does for the watcher's own timeout path.
 spawn_listener() {
   if [ ! -e "$FM_WA_LOG" ]; then
     ( umask 077; : >> "$FM_WA_LOG" ) 2>/dev/null || true
   fi
-  if command -v setsid >/dev/null 2>&1; then
-    FM_HOME="$FM_HOME" setsid "$SCRIPT_DIR/fm-wa-listen.sh" start >>"$FM_WA_LOG" 2>&1 </dev/null &
+  if [ "${FM_WA_FORCE_SPAWN_FALLBACK:-0}" != 1 ] && command -v setsid >/dev/null 2>&1; then
+    FM_HOME="$FM_HOME" FM_WA_AUTOSTART=1 setsid \
+      "$SCRIPT_DIR/fm-wa-listen.sh" start >>"$FM_WA_LOG" 2>&1 </dev/null &
+  elif command -v perl >/dev/null 2>&1; then
+    # shellcheck disable=SC2016  # single quotes are deliberate: perl expands its own variables.
+    FM_HOME="$FM_HOME" FM_WA_AUTOSTART=1 perl -e 'setpgrp(0, 0); exec @ARGV' \
+      "$SCRIPT_DIR/fm-wa-listen.sh" start >>"$FM_WA_LOG" 2>&1 </dev/null &
   else
-    FM_HOME="$FM_HOME" nohup "$SCRIPT_DIR/fm-wa-listen.sh" start >>"$FM_WA_LOG" 2>&1 </dev/null &
+    # Spawning into this group would only feed the listener to the watcher's
+    # own tidy-up, so refuse and say so rather than burning the restart budget.
+    return 1
   fi
   disown 2>/dev/null || true
 }
@@ -158,10 +179,17 @@ prune_state() {
   # The listener only sweeps outbound digests while handling an inbound message,
   # so a home that replies and hears nothing back never sweeps at all. This is
   # the third growth surface and it is bounded here with the other two.
+  if [ -d "$FM_WA_OUTBOX" ]; then
+    find "$FM_WA_OUTBOX" -maxdepth 1 -name '*.json' -type f -mtime "+$OUTBOX_TTL_DAYS" \
+      -exec rm -f -- {} + 2>/dev/null || true
+  fi
   if [ -d "$FM_WA_SENT" ]; then
     find "$FM_WA_SENT" -maxdepth 1 -name '*.sent' -type f -mmin "+$SENT_TTL_MINUTES" \
       -exec rm -f -- {} + 2>/dev/null || true
   fi
+  # A standing dry-run home records a reply per send and never reads most of
+  # them back, so the outbox is the fourth growth surface and is bounded here
+  # with the rest rather than being the one the janitor skips.
 }
 
 # The beat is the listener's proof that its connection is up, so its age is how
@@ -203,17 +231,21 @@ ensure_listener() {
     return 1
   fi
   fails=$(restart_failures)
-  if [ "$fails" -ge "$RESTART_FAIL_LIMIT" ]; then
-    emit_listener_error "WhatsApp listener keeps exiting after restart; see state/wa-listener.log"
+  if [ "$fails" -ge "$RESTART_FAIL_LIMIT" ] \
+    && [ "$(fm_wa_age_of "$RESTART_FAILS")" -lt "$LATCH_RETRY_INTERVAL" ]; then
+    emit_listener_error "WhatsApp listener keeps exiting after restart; see state/wa-listener.log, then run bin/fm-wa-listen.sh start"
     return 1
   fi
   if [ "$(fm_wa_age_of "$RESTART_MARKER")" -lt "$RESTART_INTERVAL" ]; then
     return 1
   fi
+  if ! spawn_listener; then
+    emit_listener_error "WhatsApp listener cannot be restarted: this host has neither setsid nor perl to detach it"
+    return 1
+  fi
   : | fm_wa_publish_stdin "$FM_WA_STATE" "wa-listener.restart" 2>/dev/null || true
   printf '%s\n' "$(( fails + 1 ))" \
     | fm_wa_publish_stdin "$FM_WA_STATE" "wa-listener.restarts" 2>/dev/null || true
-  spawn_listener
   return 1
 }
 
@@ -236,14 +268,39 @@ fi
 # named id is just the first in that order - WhatsApp ids are not chronological,
 # so the wake line names one for traceability and the skill drains them all.
 # `find -printf` is a GNU extension, so the basename is taken with sed instead.
-PENDING=$(find "$FM_WA_INBOX" -maxdepth 1 -name '*.json' -type f 2>/dev/null \
+FOUND=$(find "$FM_WA_INBOX" -maxdepth 1 -name '*.json' -type f 2>/dev/null \
   | sed 's#.*/##' | LC_ALL=C sort) || exit 0
-[ -n "$PENDING" ] || { rm -f -- "$FM_WA_ERROR" "$FM_WA_OFFERED" 2>/dev/null; exit 0; }
+
+# An entry whose stem cannot be used as an id is dropped from the set rather
+# than aborting the announcement: total silence is the one outcome this channel
+# exists to prevent, and the messages behind it are real. The listener's own id
+# check keeps this unreachable through the normal path.
+PENDING=
+UNUSABLE=
+while IFS= read -r entry; do
+  [ -n "$entry" ] || continue
+  if fm_wa_id_safe "${entry%.json}"; then
+    PENDING=${PENDING}${entry}$'\n'
+  else
+    UNUSABLE=1
+  fi
+done <<EOF
+$FOUND
+EOF
+PENDING=${PENDING%$'\n'}
+
+if [ -z "$PENDING" ]; then
+  if [ -n "$UNUSABLE" ]; then
+    emit_poll_error "inbox holds an unusable message id"
+  else
+    rm -f -- "$FM_WA_ERROR" "$FM_WA_OFFERED" 2>/dev/null
+  fi
+  exit 0
+fi
 
 COUNT=$(printf '%s\n' "$PENDING" | wc -l | tr -d ' ')
 FIRST=$(printf '%s\n' "$PENDING" | head -n 1)
 FIRST=${FIRST%.json}
-fm_wa_id_safe "$FIRST" || { emit_poll_error "inbox holds an unusable message id"; exit 0; }
 
 SIG=$(printf '%s\n' "$PENDING" | fm_wa_sha256) || exit 0
 [ -n "$SIG" ] || exit 0

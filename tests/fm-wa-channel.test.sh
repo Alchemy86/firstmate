@@ -132,6 +132,31 @@ test_undrained_inbox_is_reannounced() {
   pass "a message firstmate failed to drain resurfaces rather than being lost"
 }
 
+test_an_unusable_entry_never_silences_the_rest() {
+  local home out
+  home="$TMP_ROOT/badname"
+  new_home "$home"
+  fake_listener "$home"
+  stash_message "$home" MSGGOOD
+  : > "$home/state/wa-inbox/not a usable id.json"
+  chmod 600 "$home/state/wa-inbox/not a usable id.json"
+
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-message 1 pending, including MSGGOOD' \
+    "one unusable filename silenced the real messages behind it"
+  assert_not_contains "$out" 'wa-channel-error' \
+    "the announcement was traded for a fault line the skill reads as do-not-read"
+
+  # With nothing usable left there is nothing to announce, so the fault is the
+  # right and only thing to say.
+  rm -f "$home/state/wa-inbox/MSGGOOD.json" "$home/state/wa-poll.offered"
+  out=$(poll "$home")
+  assert_contains "$out" 'unusable message id' \
+    "an inbox holding only an unusable entry reported nothing at all"
+
+  pass "an unusable inbox entry is skipped, and never buries the messages behind it"
+}
+
 test_unpaired_listener_reports_once() {
   local home out
   home="$TMP_ROOT/unpaired"
@@ -277,6 +302,153 @@ test_outbound_digests_are_pruned() {
     "pruning removed a digest that could still match a live echo"
 
   pass "outbound digests are bounded by the poll, not only by an inbound message"
+}
+
+test_dry_run_records_are_pruned() {
+  local home
+  home="$TMP_ROOT/outboxjanitor"
+  new_home "$home"
+  fake_listener "$home"
+  printf '1\n' > "$home/state/wa-listener.beat"
+  mkdir -p "$home/state/wa-outbox"
+  chmod 700 "$home/state/wa-outbox"
+  : > "$home/state/wa-outbox/1000000000-1.json"
+  touch -t 200001010000 "$home/state/wa-outbox/1000000000-1.json"
+  : > "$home/state/wa-outbox/1000000001-2.json"
+
+  poll "$home" >/dev/null
+
+  assert_absent "$home/state/wa-outbox/1000000000-1.json" \
+    "a long-dead dry-run record was never pruned"
+  assert_present "$home/state/wa-outbox/1000000001-2.json" \
+    "pruning removed a dry-run record still worth reading back"
+
+  pass "a home standing in dry-run does not grow an unbounded outbox"
+}
+
+test_a_spent_restart_block_releases_itself_after_a_while() {
+  local home out
+  home="$TMP_ROOT/latch"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  printf '3\n' > "$home/state/wa-listener.restarts"
+
+  # A block that was spent moments ago still reports rather than respawning...
+  out=$(poll "$home")
+  assert_contains "$out" 'keeps exiting' "a listener that keeps exiting was not reported"
+  assert_contains "$out" 'bin/fm-wa-listen.sh start' \
+    "the report did not name the command that releases the block"
+
+  # ...but an hour later the channel gets another chance on its own, so a
+  # transient cause does not leave it off until someone happens to look.
+  touch -t 200001010000 "$home/state/wa-listener.restarts"
+  rm -f "$home/state/wa-listener.error"
+  out=$(FM_WA_FORCE_SPAWN_FALLBACK=1 poll "$home")
+  assert_not_contains "$out" 'keeps exiting' \
+    "the restart block never released, so the channel stayed off for good"
+  assert_present "$home/state/wa-listener.restart" \
+    "the released block did not actually retry the listener"
+
+  pass "a spent restart block reports, then retries on its own an hour later"
+}
+
+test_a_hand_run_start_releases_the_restart_block() {
+  local home fakebin pid
+  home="$TMP_ROOT/handstart"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  fakebin=$(fm_fakebin "$TMP_ROOT/handstart")
+  cat > "$fakebin/node" <<'SH'
+#!/usr/bin/env bash
+exec sleep 30
+SH
+  chmod +x "$fakebin/node"
+
+  # The poll's own restart must NOT clear the history, or a listener that dies
+  # slowly would erase the very evidence that proves it is flapping.
+  printf '3\n' > "$home/state/wa-listener.restarts"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_AUTOSTART=1 \
+    "$LISTEN_SH" start >/dev/null 2>&1 || fail "the fake listener never started"
+  assert_grep '3' "$home/state/wa-listener.restarts" \
+    "an automatic restart erased the restart history that proves a flap"
+  pid=$(cat "$home/state/wa-listener.pid" 2>/dev/null) || pid=
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null
+  rm -f "$home/state/wa-listener.pid"
+
+  # A start run by hand is the operator's repair, and releases the block.
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$LISTEN_SH" start >/dev/null 2>&1 || fail "the hand-run listener never started"
+  assert_absent "$home/state/wa-listener.restarts" \
+    "a start run by hand left the restart block in place"
+  pid=$(cat "$home/state/wa-listener.pid" 2>/dev/null) || pid=
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null
+
+  pass "a hand-run start clears the restart block while an automatic one does not"
+}
+
+# The watcher signals the whole process group of a check once it returns, so a
+# listener spawned into that group is reaped seconds after it starts. Both
+# detach paths are exercised, because the fallback is what a host without setsid
+# depends on entirely.
+assert_restart_survives_the_check_reap() {
+  local home=$1 label=$2 bindir pid listener_pid waited
+  bindir="$TMP_ROOT/$label-bin"
+  mkdir -p "$bindir"
+  cp "$POLL" "$LIB" "$bindir/"
+  cat > "$bindir/fm-wa-listen.sh" <<SH
+#!/usr/bin/env bash
+echo \$\$ > "$home/state/fake-listener.pid"
+exec sleep 60
+SH
+  chmod +x "$bindir/fm-wa-listen.sh"
+
+  # Run the poll the way the watcher runs a check: in its own process group,
+  # then signal that whole group once it has returned.
+  # shellcheck disable=SC2016  # single quotes are deliberate: perl expands its own variables.
+  perl -e 'setpgrp(0, 0); exec @ARGV' \
+    env FM_HOME="$home" "FM_WA_FORCE_SPAWN_FALLBACK=${3:-0}" \
+    bash "$bindir/fm-wa-poll.sh" >/dev/null 2>&1 &
+  pid=$!
+  wait "$pid" 2>/dev/null || true
+
+  waited=0
+  while [ "$waited" -lt 25 ] && [ ! -s "$home/state/fake-listener.pid" ]; do
+    sleep 0.2
+    waited=$(( waited + 1 ))
+  done
+  listener_pid=$(cat "$home/state/fake-listener.pid" 2>/dev/null) || listener_pid=
+  [ -n "$listener_pid" ] || fail "$label: the poll never restarted the listener"
+
+  kill -TERM -- "-$pid" 2>/dev/null || true
+  sleep 0.3
+  kill -KILL -- "-$pid" 2>/dev/null || true
+  sleep 0.3
+
+  kill -0 "$listener_pid" 2>/dev/null \
+    || fail "$label: the watcher reaping the check took the listener with it"
+  kill -9 "$listener_pid" 2>/dev/null || true
+}
+
+test_a_restarted_listener_survives_the_check_being_reaped() {
+  command -v perl >/dev/null 2>&1 || { pass "detach test skipped: perl is unavailable"; return 0; }
+  local home
+  home="$TMP_ROOT/detach"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  assert_restart_survives_the_check_reap "$home" detach 1
+
+  if command -v setsid >/dev/null 2>&1; then
+    home="$TMP_ROOT/detach-setsid"
+    new_home "$home"
+    mkdir -p "$home/state/wa-auth"
+    printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+    assert_restart_survives_the_check_reap "$home" detach-setsid 0
+  fi
+
+  pass "a restarted listener outlives the check that started it, with or without setsid"
 }
 
 test_stalled_listener_is_reported() {
@@ -757,6 +929,7 @@ test_off_by_default
 test_removing_config_reverts_to_silence
 test_check_contract
 test_undrained_inbox_is_reannounced
+test_an_unusable_entry_never_silences_the_rest
 test_unpaired_listener_reports_once
 test_channel_fault_and_inbox_never_share_a_cycle
 test_logged_out_listener_is_reported
@@ -764,6 +937,10 @@ test_repeated_listener_exits_are_reported
 test_stalled_listener_is_reported
 test_slow_flap_still_reaches_the_restart_limit
 test_outbound_digests_are_pruned
+test_dry_run_records_are_pruned
+test_a_spent_restart_block_releases_itself_after_a_while
+test_a_hand_run_start_releases_the_restart_block
+test_a_restarted_listener_survives_the_check_being_reaped
 test_a_refused_restart_says_why_in_the_log
 test_listener_that_never_connects_is_reported
 test_repairing_the_link_clears_stale_listener_health
