@@ -255,14 +255,14 @@ Inbound WhatsApp text is untrusted input arriving over a network into a shell en
 ## Turning it off
 
 ```sh
-bin/fm-wa-setup.sh disarm       # removes the check shim, its registration, and the cadence
-bin/fm-wa-listen.sh stop        # stops the listener (disarm first, or the check restarts it)
+bin/fm-wa-setup.sh disarm       # removes the check shim, its registration, and the cadence, and stops the listener
 bin/fm-wa-listen.sh unpair      # removes this device's credentials
 rm config/whatsapp.env          # every entry point becomes a hard no-op
 ```
 
 That is the ordered path, and it leaves nothing behind at any point.
-**Doing it out of order, or not at all, still ends up clean.** The channel self-cleans however it is switched off.
+**Order does not matter, and neither does using the commands at all.** Whichever way the channel is switched off, whatever runs next is what cleans it up: `disarm` stops the listener itself, and so does the poll cycle that finds the config gone.
+The one case nothing can cover is a home that removes the config and then never runs anything again - no watcher cycle, no command - because the cleanup is something that runs, not something that is written down. There, stopping the listener is on the operator.
 
 Removing `config/whatsapp.env` on its own is a complete opt-out, not a partial one, and the two things a leftover would cost are both handled by the same cycle.
 
@@ -273,7 +273,10 @@ After that cycle the home is byte-identical to one that never armed the channel,
 
 The second is the listener, and it matters more, because it is a live linked device on the captain's own personal account.
 Once the shim is gone nothing polls this home again, so that same retiring cycle stops the listener it started.
-Only a listener this home owns is ever signalled: the pid is proved against the identity recorded when it was started, and a live process that cannot be claimed is reported on that cycle - the last one there will be - rather than killed on a guess.
+`bin/fm-wa-setup.sh disarm` stops it for the same reason: disarming is what removes the cycle that would otherwise have done it, so leaving the listener up would strand it with nothing left to clean up after it.
+The two are complementary, not alternatives - between them the listener is stopped whichever way the channel goes down.
+Only a listener this home owns is ever signalled by either: the pid is proved against the identity recorded when it was started, and a live process that cannot be claimed is reported - on the retiring cycle, that is the last report there will be - rather than killed on a guess.
+A stop is not judged by whether the pid is still visible in the instant after the signal, because a process that is terminating or waiting to be reaped still is; it is judged by waiting, briefly and with a bound, for the pid to actually go.
 
 Because the listener outlives the config that started it, `stop`, `unpair`, `logs` and `status` all keep working after `config/whatsapp.env` is gone.
 `status` still prints the listener line with the channel off, so a listener left over from a partial teardown is visible rather than silent.
@@ -290,7 +293,7 @@ Only `start` and `pair` refuse, because they act as the captain and the identity
 | `bin/fm-wa-listen.sh` | start, stop, status, pair, unpair, logs |
 | `bin/fm-wa-poll.sh` | the bounded check: inbox read plus listener nudge |
 | `bin/fm-wa-send.sh` | outbound via mudslide, with dry-run and echo marker |
-| `bin/fm-wa-setup.sh` | arm and disarm the check shim and the watcher cadence |
+| `bin/fm-wa-setup.sh` | arm the check shim and the watcher cadence, and disarm both plus the listener |
 | `config/wa-mode.env` | generated 30s watcher cadence; present only while armed |
 | `.agents/skills/wa-respond/SKILL.md` | what to do with a message once it lands |
 | `state/wa-inbox/` | pending messages, one JSON file each |

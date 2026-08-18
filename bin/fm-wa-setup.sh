@@ -3,7 +3,8 @@
 #
 # Usage:
 #   fm-wa-setup.sh arm       write state/wa-watch.check.sh and register it
-#   fm-wa-setup.sh disarm    remove the check and its registration
+#   fm-wa-setup.sh disarm    remove the check and its registration, and stop
+#                            the listener this home started
 #   fm-wa-setup.sh status    report what is armed
 #
 # Arming writes the check shim into the home's gitignored state/ tree and binds
@@ -26,7 +27,14 @@
 #     polls the home afterwards and a listener left behind would keep a linked
 #     device on the captain's own account with nothing watching it
 #   - run disarm: the check artifact, its registration, and the cadence file are
-#     removed too, and the home stops counting as needing supervision
+#     removed, the home stops counting as needing supervision, and the listener
+#     this home started is stopped as well - disarm is what removes the cycle
+#     that would otherwise have stopped it, so it has to do that itself
+
+# shellcheck disable=SC2030,SC2031 # bin/fm-wa-lib.sh reads a process identity
+# inside a subshell that sources bin/fm-wake-lib.sh, and that library assigns its
+# own FM_HOME, FM_ROOT and STATE. The subshell IS the containment, so this file's
+# own values are unaffected and every later read of them is the value it always had.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -119,20 +127,49 @@ cmd_arm() {
   fi
 }
 
+# Disarming takes the channel down, so it stops the listener too.
+#
+# Retiring the shim is what removes the one cycle that would otherwise have
+# stopped the listener, so a disarm that left it running would be the one path
+# that strands a live linked device on the captain's own account with nothing
+# watching it, and no poll left to clean up after it. There is no useful state in
+# between: a listener with no armed check piles messages into state/wa-inbox/
+# with nothing left to wake firstmate for them.
+#
+# The artifacts go first, so the poll cannot spawn a replacement in the gap
+# between the stop and the shim's removal. The stop itself is
+# fm_wa_stop_listener's, the same ownership-proving path the retiring cycle uses:
+# the pid is proved against the identity recorded when it was started, and a live
+# process this home cannot claim is reported rather than signalled on a guess.
+# With nothing running it is silent, so re-running a disarm after a stop says
+# only that there was nothing armed.
 cmd_disarm() {
   paths
-  local removed=0
+  local removed=0 running='' rc=0
   for artifact in "$CHECK" "$TRUST" "$CADENCE"; do
     if [ -e "$artifact" ] || [ -L "$artifact" ]; then
       rm -f -- "$artifact" && removed=1
     fi
   done
+  fm_wa_listener_pid >/dev/null 2>&1 && running=1
+  fm_wa_stop_listener 10 || rc=$?
   if [ "$removed" -eq 1 ]; then
-    echo "disarmed: removed the inbound WhatsApp check and its cadence; the listener is untouched"
-    echo "stop the listener too with: bin/fm-wa-listen.sh stop"
+    echo "disarmed: removed the inbound WhatsApp check and its cadence"
   else
     echo "nothing armed"
   fi
+  case "$rc" in
+    1)
+      echo "error: the recorded listener pid names a live process this home cannot prove is its own listener; check state/wa-listener.pid by hand" >&2
+      return 1
+      ;;
+    2)
+      echo "error: the listener did not exit; check state/wa-listener.pid by hand" >&2
+      return 1
+      ;;
+  esac
+  [ -n "$running" ] && echo "stopped the listener; mudslide's own session is untouched"
+  return 0
 }
 
 cmd_status() {

@@ -5,6 +5,11 @@
 # accept/reject rules are driven through its handle-fixture command, and the
 # send path through FM_WA_DRY_RUN. Pairing itself needs the captain's phone and
 # is out of scope for an automated test.
+
+# shellcheck disable=SC2030,SC2031 # bin/fm-wa-lib.sh reads a process identity
+# inside a subshell that sources bin/fm-wake-lib.sh, and that library assigns its
+# own FM_HOME, FM_ROOT and STATE. The subshell IS the containment, so this file's
+# own values are unaffected and every later read of them is the value it always had.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -60,10 +65,39 @@ fake_listener() {
     >/dev/null 2>&1 || true
 }
 
+# The same stand-in, but one that ignores SIGTERM, so the stop paths are driven
+# all the way to the SIGKILL they only reach for a genuinely wedged listener.
+# Orphaned on purpose, exactly as the real listener is: a child of this shell
+# would linger as a zombie after it is killed and still answer `kill -0`, which
+# would make this fixture prove the bug rather than the fix. An ignored signal
+# survives exec, so the sleep that replaces the shell inherits the deaf handler.
+DEAF_PID=
+deaf_listener() {
+  local home=$1 pidfile waited=0
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  pidfile="$TMP_ROOT/deaf.$$.$RANDOM.pid"
+  rm -f "$pidfile"
+  ( bash -c 'trap "" TERM; printf "%s\n" "$$" > "$1"; exec sleep 300' _ "$pidfile" >/dev/null 2>&1 & )
+  while [ ! -s "$pidfile" ] && [ "$waited" -lt 50 ]; do
+    sleep 0.1 2>/dev/null || sleep 1
+    waited=$(( waited + 1 ))
+  done
+  DEAF_PID=$(cat "$pidfile" 2>/dev/null) || DEAF_PID=
+  [ -n "$DEAF_PID" ] || fail "could not start a stand-in listener that ignores SIGTERM"
+  FAKE_PIDS="$FAKE_PIDS $DEAF_PID"
+  printf '%s\n' "$DEAF_PID" > "$home/state/wa-listener.pid"
+  ( # shellcheck source=bin/fm-wa-lib.sh
+    . "$LIB"
+    FM_WA_STATE="$home/state" fm_wa_record_listener_identity "$DEAF_PID" ) \
+    >/dev/null 2>&1 || true
+}
+
 reap_fake_listeners() {
   local pid
   for pid in $FAKE_PIDS; do
     kill "$pid" 2>/dev/null || true
+    kill -9 "$pid" 2>/dev/null || true
   done
   FAKE_PIDS=
 }
@@ -1921,9 +1955,167 @@ test_a_host_that_cannot_hash_says_so() {
   pass "a host with no digest tool reports why instead of losing the inbox silently"
 }
 
+# A kill returns once the signal is delivered, not once the target is gone, so a
+# process read in the very next command is still there - terminating, or waiting
+# to be reaped. Every path that reaches SIGKILL is a repair for a listener that
+# already stopped behaving, so a stop that judged itself on that one read would
+# report failure exactly where the repair matters, and refuse the restart, the
+# unpair and the switch-off that depend on it.
+test_a_deaf_listener_is_reported_as_stopped_once_it_is() {
+  local home out pid
+  home="$TMP_ROOT/deafstop"
+  new_home "$home"
+  deaf_listener "$home"
+  pid=$DEAF_PID
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" stop 2>&1) \
+    || fail "stop reported failure for a listener it had in fact killed: $out"
+  assert_contains "$out" 'listener stopped' "stop did not report stopping the deaf listener"
+  if kill -0 "$pid" 2>/dev/null; then
+    fail "a listener that ignored SIGTERM was left running after a stop"
+  fi
+  assert_absent "$home/state/wa-listener.pid" \
+    "stop reported success but kept the pid record of a listener that is gone"
+  assert_absent "$home/state/wa-listener.pid-identity" \
+    "stop left the identity binding of a listener that is gone"
+
+  pass "a listener that ignores SIGTERM is reported as stopped once SIGKILL has taken effect"
+}
+
+test_a_deaf_wedged_listener_is_cleaned_up_and_replaced() {
+  local home bindir out pid waited=0
+  home="$TMP_ROOT/deafwedge"
+  new_home "$home"
+  deaf_listener "$home"
+  pid=$DEAF_PID
+  # Alive, but with a connection that went away long ago.
+  printf '1\n' > "$home/state/wa-listener.beat"
+  touch -t 200001010000 "$home/state/wa-listener.beat"
+  printf '{"state":"connected","me":"x","at":1}\n' > "$home/state/wa-listener.status"
+
+  # A stand-in for the listener wrapper, so the replacement the cycle promises is
+  # something this test can actually observe rather than infer.
+  bindir="$TMP_ROOT/deafwedge-bin"
+  mkdir -p "$bindir"
+  cp "$POLL" "$LIB" "$bindir/"
+  cat > "$bindir/fm-wa-listen.sh" <<SH
+#!/usr/bin/env bash
+printf 'spawned\n' > "$home/state/replacement-spawned"
+SH
+  chmod +x "$bindir/fm-wa-listen.sh"
+
+  out=$(FM_HOME="$home" "$bindir/fm-wa-poll.sh" 2>/dev/null)
+  assert_contains "$out" 'restarting it' \
+    "a wedged listener was reported without saying it is being replaced"
+  if kill -0 "$pid" 2>/dev/null; then
+    fail "a wedged listener that ignored SIGTERM was left holding the channel"
+  fi
+  assert_absent "$home/state/wa-listener.pid" "the wedged listener's pid record outlived it"
+  assert_absent "$home/state/wa-listener.pid-identity" \
+    "the wedged listener's identity binding outlived it"
+  assert_absent "$home/state/wa-listener.beat" "the wedged listener's beat outlived it"
+  assert_absent "$home/state/wa-listener.status" "the wedged listener's reported state outlived it"
+  while [ ! -s "$home/state/replacement-spawned" ] && [ "$waited" -lt 50 ]; do
+    sleep 0.2
+    waited=$(( waited + 1 ))
+  done
+  assert_present "$home/state/replacement-spawned" \
+    "the cycle announced a restart and then never spawned the replacement"
+
+  pass "a wedged listener that ignores SIGTERM is cleaned up and actually replaced"
+}
+
+# Disarming is what removes the one cycle that would otherwise have stopped the
+# listener, so it is the sequence that strands a live linked device on the
+# captain's own account unless disarm stops it itself.
+test_disarm_stops_the_listener() {
+  local home out pid
+  home="$TMP_ROOT/disarmstop"
+  new_home "$home"
+  fake_listener "$home"
+  pid=$(cat "$home/state/wa-listener.pid")
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" disarm 2>&1) \
+    || fail "disarm reported failure: $out"
+  assert_contains "$out" 'disarmed' "disarm did not report retiring the check"
+  assert_contains "$out" 'stopped the listener' "disarm did not report stopping the listener"
+  if kill -0 "$pid" 2>/dev/null; then
+    fail "disarm removed the cycle that would have stopped the listener and left it running"
+  fi
+  assert_absent "$home/state/wa-listener.pid" "disarm left the pid record behind"
+  assert_absent "$home/state/wa-watch.check.sh" "disarm left the check shim armed"
+  assert_absent "$home/config/wa-mode.env" "disarm left the watcher cadence behind"
+
+  # The config never had to go for any of that, and removing it afterwards is
+  # still a hard no-op rather than a second cleanup.
+  rm -f "$home/config/whatsapp.env"
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "the poll spoke after a disarm had already cleaned up: $out"
+
+  pass "disarm stops the listener as well as retiring the check it needs to do that"
+}
+
+test_disarm_is_quiet_with_nothing_to_stop() {
+  local home out
+  home="$TMP_ROOT/disarmquiet"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" disarm 2>&1) \
+    || fail "disarm reported failure with no listener running: $out"
+  case "$out" in
+    *'stopped the listener'*) fail "disarm claimed to stop a listener that was never running: $out" ;;
+  esac
+
+  # And again, on a home that is already fully disarmed.
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" disarm 2>&1) \
+    || fail "a second disarm reported failure: $out"
+  assert_contains "$out" 'nothing armed' "a repeated disarm did not report an already-clean home"
+  case "$out" in
+    *'stopped the listener'*) fail "a repeated disarm claimed to stop a listener: $out" ;;
+  esac
+
+  pass "disarm is idempotent and says nothing about a listener that is not running"
+}
+
+test_disarm_never_signals_a_listener_this_home_cannot_claim() {
+  local home out pid
+  home="$TMP_ROOT/disarmforeign"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  # An unrelated process holding the number a dead listener left behind.
+  sleep 300 &
+  pid=$!
+  FAKE_PIDS="$FAKE_PIDS $pid"
+  printf '%s\n' "$pid" > "$home/state/wa-listener.pid"
+  printf 'Sat Jan  1 00:00:00 2000\n' > "$home/state/wa-listener.pid-identity"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" disarm 2>&1) \
+    && fail "disarm reported success over a live process it could not claim: $out"
+  kill -0 "$pid" 2>/dev/null \
+    || fail "disarm killed a process it never proved was this home's listener"
+  assert_contains "$out" 'cannot prove' "disarm did not say why it signalled nothing"
+  assert_present "$home/state/wa-listener.pid" \
+    "disarm discarded the record of a process it refused to signal"
+  assert_absent "$home/state/wa-watch.check.sh" \
+    "disarm left the check shim armed after refusing to signal the recorded pid"
+
+  pass "disarm reports a live process it cannot claim instead of killing it on a guess"
+}
+
 test_stopping_works_after_the_config_is_gone
 test_the_retiring_cycle_stops_the_listener
 test_status_reports_a_stranded_listener
 test_a_listener_this_home_does_not_own_is_never_signalled
+test_a_deaf_listener_is_reported_as_stopped_once_it_is
+test_a_deaf_wedged_listener_is_cleaned_up_and_replaced
+test_disarm_stops_the_listener
+test_disarm_is_quiet_with_nothing_to_stop
+test_disarm_never_signals_a_listener_this_home_cannot_claim
 test_a_dot_leading_id_is_never_stashed
 test_a_host_that_cannot_hash_says_so

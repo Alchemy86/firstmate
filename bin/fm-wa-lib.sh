@@ -313,15 +313,52 @@ fm_wa_listener_pid_foreign() {
   return 0
 }
 
+# Wait, bounded, for a pid that has been signalled to actually leave the process
+# table. The bound is in tenths of a second.
+#
+# A kill returns once the signal is delivered, not once the target is gone: even
+# SIGKILL only schedules the teardown, and a child of this shell stays visible as
+# a zombie until it is reaped. Reading `kill -0` in the very next command
+# therefore reports a process that is already dead as alive - measurably, on
+# every attempt against a detached process - so deciding a SIGKILL failed from
+# that one read is a false negative rather than an observation.
+#
+# Every caller here is a repair path whose whole point is a listener that stopped
+# behaving, so this waits rather than concluding, and returns the instant the pid
+# goes so a cooperative process costs nothing. The wait is bounded because a
+# check cycle cannot hang; a host without fractional sleep polls once a second
+# for the same span rather than sleeping a full second per tenth.
+fm_wa_await_exit() {
+  local pid=$1 limit=${2:-20} waited=0 fine=1
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  sleep 0.1 2>/dev/null || fine=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$fine" -eq 1 ]; then
+      waited=$(( waited + 1 ))
+    else
+      waited=$(( waited + 10 ))
+    fi
+    [ "$waited" -ge "$limit" ] && return 1
+    if [ "$fine" -eq 1 ]; then
+      sleep 0.1
+    else
+      sleep 1
+    fi
+  done
+  return 0
+}
+
 # Stop the listener this home started, and only that one.
 #
 # Every path that takes the channel down comes through here - the operator's own
-# stop and unpair, and the cycle that finds the channel switched off - so
-# ownership is proved in one place rather than at each kill site, and the
-# channel cleans itself up however it is switched off. A listener left running
-# holds a linked device on the captain's own account with nothing watching it,
-# so this must not be reachable only by an operator who read the documentation
-# and did the steps in the right order.
+# stop and unpair, the disarm that retires the check, and the cycle that finds
+# the channel switched off - so ownership is proved in one place rather than at
+# each kill site, and the channel cleans itself up however it is switched off. A
+# listener left running holds a linked device on the captain's own account with
+# nothing watching it, so this must not be reachable only by an operator who read
+# the documentation and did the steps in the right order.
 #
 # Outcomes, because callers word them differently: 0 nothing left running,
 # 1 alive but not provably ours so nothing was signalled, 2 still alive after
@@ -339,8 +376,10 @@ fm_wa_stop_listener() {
     sleep 1
     waited=$(( waited + 1 ))
   done
-  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-  kill -0 "$pid" 2>/dev/null && return 2
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+    fm_wa_await_exit "$pid" 20 || return 2
+  fi
   rm -f -- "$FM_WA_PIDFILE" "$FM_WA_PIDFILE_IDENTITY" 2>/dev/null || true
   return 0
 }

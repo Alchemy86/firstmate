@@ -178,7 +178,7 @@ cmd_stop() {
   fi
   if [ -f "$FM_WA_STATE/wa-watch.check.sh" ]; then
     echo "note: the armed check restarts it within a couple of minutes;"
-    echo "      run bin/fm-wa-setup.sh disarm first to keep it down"
+    echo "      run bin/fm-wa-setup.sh disarm to keep it down - it stops the listener too"
   fi
 }
 

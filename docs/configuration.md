@@ -463,7 +463,7 @@ It is captain-private and is **not** inherited by secondmate homes.
 `bin/fm-wa-setup.sh arm` turns that configuration into generated local state: `state/wa-watch.check.sh`, an identity shim for `bin/fm-wa-poll.sh` bound through `bin/fm-check-register.sh`, and `config/wa-mode.env`, which exports `FM_CHECK_INTERVAL=30` for watcher processes in that home.
 The cadence contract is the Relay one above, and the value is deliberately identical so a home running both channels cannot end up with two cadences that disagree.
 An armed `state/wa-watch.check.sh` counts as a reason to supervise the home in `bin/fm-supervision-lib.sh`, the same way `state/x-watch.check.sh` does, because the captain messages precisely when nothing else is running.
-`bin/fm-wa-setup.sh disarm` removes those artifacts, and the first poll cycle after `config/whatsapp.env` disappears retires them itself and stops the listener this home started, so the channel self-cleans however it is switched off.
+`bin/fm-wa-setup.sh disarm` removes those artifacts and stops the listener this home started, and the first poll cycle after `config/whatsapp.env` disappears retires the artifacts itself and stops that listener too, so whichever way the channel is switched off, whatever runs next cleans it up.
 
 [whatsapp-channel.md](whatsapp-channel.md) owns everything else about this channel: the one-connection-per-credential-folder constraint and the second-linked-device decision it forced, pairing and re-pairing, the two captain identities the listener accepts, the accepted-device and echo-suppression guards, the dry-run switch, the listener health and restart contract, and the full turn-off procedure.
 

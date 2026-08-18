@@ -40,6 +40,11 @@
 # The announcement marker is a digest of the pending id set, not a per-message
 # claim: one wake covers everything waiting, and draining the inbox is what
 # clears it. A check that printed on every cycle would wake firstmate constantly.
+
+# shellcheck disable=SC2030,SC2031 # bin/fm-wa-lib.sh reads a process identity
+# inside a subshell that sources bin/fm-wake-lib.sh, and that library assigns its
+# own FM_HOME, FM_ROOT and STATE. The subshell IS the containment, so this file's
+# own values are unaffected and every later read of them is the value it always had.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -285,22 +290,16 @@ listener_down_age() {
 # appears the instant that replacement forks, well before it has loaded enough
 # to claim the status file itself.
 #
-# The pid reaching here is already bound to this home's own listener by
-# fm_wa_listener_pid, which is what keeps a stale pid file left by a crash from
-# aiming these signals at whatever process later inherited that number.
+# The kill itself is fm_wa_stop_listener's, not a second copy of it: it proves
+# ownership before signalling anything, and it waits for a SIGKILLed process to
+# actually leave the process table instead of reading `kill -0` in the next
+# command and concluding from a still-terminating pid that the stop failed. A
+# wedged listener is exactly the one that reaches the SIGKILL, so a repair with
+# its own kill sequence would be the one place that answer is always wrong. The
+# grace is short because a check cycle has far less room than a typed command.
 stop_wedged_listener() {
-  local pid=$1 waited=0
-  kill "$pid" 2>/dev/null || true
-  while [ "$waited" -lt 3 ] && kill -0 "$pid" 2>/dev/null; do
-    sleep 1
-    waited=$(( waited + 1 ))
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -9 "$pid" 2>/dev/null || true
-  fi
-  kill -0 "$pid" 2>/dev/null && return 1
-  rm -f -- "$FM_WA_PIDFILE" "$FM_WA_PIDFILE_IDENTITY" "$LISTENER_BEAT" \
-    "$LISTENER_STATUS" 2>/dev/null || true
+  fm_wa_stop_listener 3 || return 1
+  rm -f -- "$LISTENER_BEAT" "$LISTENER_STATUS" 2>/dev/null || true
   return 0
 }
 
@@ -309,9 +308,9 @@ stop_wedged_listener() {
 # A pid alone is not health, so a live listener is still judged by the state it
 # reports and by its beat.
 ensure_listener() {
-  local state fails pid
+  local state fails
   state=$(listener_state)
-  if pid=$(fm_wa_listener_pid 2>/dev/null); then
+  if fm_wa_listener_pid >/dev/null 2>&1; then
     if [ "$(listener_down_age)" -ge "$STALL_INTERVAL" ]; then
       # Reported AND repaired: the restart below runs on the same budget that
       # bounds a crash loop, so a channel that cannot recover still latches
@@ -321,14 +320,14 @@ ensure_listener() {
       else
         emit_listener_error never-up "WhatsApp listener is running but its connection has never come up; restarting it, see state/wa-listener.log"
       fi
-      stop_wedged_listener "$pid" || return 1
+      stop_wedged_listener || return 1
     elif [ "$(listener_device_hook)" = unavailable ]; then
       # The hook is attached once per connection, so only a replacement process
       # can pick it up: a listener holding a healthy socket would otherwise
       # reject every message the captain sends for as long as that socket
       # lasts. Reported AND repaired, on the same budget as a stalled one.
       emit_listener_error device-hook "WhatsApp listener cannot read message sender devices, so every message from the captain would be rejected; restarting it, see state/wa-listener.log"
-      stop_wedged_listener "$pid" || return 1
+      stop_wedged_listener || return 1
     else
       return 0
     fi
