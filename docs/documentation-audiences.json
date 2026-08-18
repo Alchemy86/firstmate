@@ -26,6 +26,7 @@
   "readmeSetupTargets": [
     "docs/configuration.md",
     "docs/wedge-alarm.md",
+    "docs/whatsapp-channel.md",
     "docs/tmux-backend.md",
     "docs/herdr-backend.md",
     "docs/zellij-backend.md",
@@ -154,6 +155,10 @@
     },
     {
       "path": ".agents/skills/harness-adapters/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
+      "path": ".agents/skills/wa-respond/SKILL.md",
       "audience": "agent-runtime"
     },
     {
@@ -331,6 +336,10 @@
     {
       "path": "docs/trace-context.md",
       "audience": "maintainer-architecture"
+    },
+    {
+      "path": "docs/whatsapp-channel.md",
+      "audience": "operator-current"
     },
     {
       "path": "docs/turnend-guard.md",
