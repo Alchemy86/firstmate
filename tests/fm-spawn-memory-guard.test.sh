@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Behavior tests for fm-spawn.sh's memory guard.
 #
-# The guard runs before argument parsing, so these tests drive the real
+# The guard runs before argument parsing, so most of these tests drive the real
 # fm-spawn.sh with no arguments against an isolated firstmate home and read the
 # process result. A refusal prints "refusing to spawn:" and exits 1; passing the
 # guard falls through to the ordinary "--mode" argument error, so reaching that
-# message is the positive signal that the guard allowed the spawn. Neither
-# outcome starts a backend, so no endpoint or metadata is ever created.
+# message is the positive signal that the guard allowed the spawn. The cases that
+# depend on what the command line asks for - a relaunch, a remote secondmate -
+# pass those arguments and read the ordinary handling they fall through to
+# instead. No outcome starts a backend, so no endpoint or metadata is ever
+# created, and the remote case runs against a stub transport.
 #
 # FM_SPAWN_NO_GUARD=1 skips the unrelated watcher guard only; the memory guard
 # has no such skip and still runs, exactly as it does for each pair of a batch.
@@ -19,26 +22,43 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# The refusal tells operators to export FM_SPAWN_FORCE=1, so a developer running
+# this suite may well be carrying that or another tuning knob in their shell.
+# Each case supplies its own values as a command prefix, so drop the ambient ones
+# rather than letting them decide the result.
+unset FM_SPAWN_FORCE FM_MAX_CREWS FM_MIN_FREE_MB FM_STATE_OVERRIDE
+
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-memory-guard)
 
 REFUSAL='refusing to spawn:'
 PASSED_GUARD='ship spawns require --mode'
 
-# make_home <name> <live-crew-count>: isolated home with N live task metas.
+# make_home <name> <live-crew-count> [secondmate-count]: isolated home with N
+# live task metas and, optionally, M persistent secondmate metas.
 make_home() {
-  local home=$TMP_ROOT/$1 count=$2 i
-  mkdir -p "$home/state"
+  local home=$TMP_ROOT/$1 count=$2 secondmates=${3:-0} i
+  mkdir -p "$home/state" "$home/data"
   for ((i = 1; i <= count; i++)); do
     : > "$home/state/task$i.meta"
+  done
+  for ((i = 1; i <= secondmates; i++)); do
+    printf 'kind=secondmate\n' > "$home/state/sub$i.meta"
   done
   printf '%s\n' "$home"
 }
 
 # run_spawn <home>: run fm-spawn with the guard reachable, echo output, return code.
 run_spawn() {
+  run_spawn_args "$1"
+}
+
+# run_spawn_args <home> [arg...]: the same run with real spawn arguments, for the
+# cases whose behaviour depends on what the command line asks for.
+run_spawn_args() {
   local home=$1
-  FM_SPAWN_NO_GUARD=1 FM_HOME="$home" bash "$SPAWN" 2>&1
+  shift
+  FM_SPAWN_NO_GUARD=1 FM_HOME="$home" bash "$SPAWN" "$@" 2>&1
 }
 
 test_cap_refuses_when_live_crews_reach_the_cap() {
@@ -158,6 +178,89 @@ test_crew_count_follows_the_state_override() {
   pass 'crew count follows the state override'
 }
 
+# A persistent secondmate holds a meta from provisioning until retirement, so
+# counting them would refuse a spawn in a home with no live crews at all.
+test_secondmate_metas_are_not_counted_as_live_crews() {
+  local home out
+  home=$(make_home cap-secondmates 2 8)
+  out=$(FM_MIN_FREE_MB=1 run_spawn "$home")
+  assert_not_contains "$out" "$REFUSAL" 'secondmate records must not be counted as live crews'
+  assert_contains "$out" "$PASSED_GUARD" 'a home with two crews must reach ordinary argument handling'
+  pass 'secondmate metas are not counted as live crews'
+}
+
+# A relaunch replaces a crew rather than adding one, and the control plane has
+# already stopped the previous agent by the time this runs, so refusing here
+# would leave the task with a recorded endpoint and no agent.
+test_relaunch_is_not_refused_by_the_cap() {
+  local home out
+  home=$(make_home relaunch-cap 9)
+  out=$(FM_MIN_FREE_MB=1 run_spawn_args "$home" nosuchtask --relaunch)
+  assert_not_contains "$out" "$REFUSAL" 'the cap must not refuse a relaunch'
+  assert_contains "$out" 'needs an existing task record' 'a relaunch must reach ordinary relaunch handling'
+  pass 'a relaunch is not refused by the cap'
+}
+
+test_relaunch_still_honours_the_memory_refusal() {
+  local home out rc
+  home=$(make_home relaunch-mem 0)
+  out=$(FM_MAX_CREWS=99 FM_MIN_FREE_MB=99999999 run_spawn_args "$home" nosuchtask --relaunch); rc=$?
+  expect_code 1 "$rc" 'a relaunch below the memory threshold must refuse'
+  assert_contains "$out" "$REFUSAL" 'a relaunch must still be refused when memory is short'
+  pass 'a relaunch still honours the memory refusal'
+}
+
+# A remote secondmate's agent runs on its own host, so neither this machine's
+# crew count nor its free memory describes what that spawn costs.
+test_remote_secondmate_skips_the_guard() {
+  local home out
+  home=$(make_home remote-secondmate 9)
+  printf -- '- rsm - remote helper (host: fixture.invalid; root: /srv/fm; home: /srv/fm/home; scope: things; projects: ; added 2026-08-18)\n' \
+    > "$home/data/secondmates.md"
+  out=$(FM_MIN_FREE_MB=99999999 FM_SSH_BIN=/bin/false run_spawn_args "$home" rsm --secondmate)
+  assert_not_contains "$out" "$REFUSAL" 'a remote secondmate must not be refused by local resources'
+  assert_contains "$out" 'rsm' 'a remote secondmate spawn must reach its own route handling'
+  pass 'a remote secondmate skips the guard'
+}
+
+# A non-numeric knob used to make the comparison exit 2, which inside an `if` is
+# merely false, silently disabling the branch the operator was widening.
+test_non_numeric_cap_is_refused_by_name() {
+  local home out rc
+  home=$(make_home bad-cap 0)
+  out=$(FM_MIN_FREE_MB=1 FM_MAX_CREWS=none run_spawn "$home"); rc=$?
+  expect_code 1 "$rc" 'a non-numeric FM_MAX_CREWS must refuse'
+  assert_contains "$out" 'FM_MAX_CREWS must be a whole number' 'the refusal must name the bad knob'
+  pass 'a non-numeric cap is refused by name'
+}
+
+test_non_numeric_min_free_is_refused_by_name() {
+  local home out rc
+  home=$(make_home bad-minfree 0)
+  out=$(FM_MIN_FREE_MB=8000MB run_spawn "$home"); rc=$?
+  expect_code 1 "$rc" 'a non-numeric FM_MIN_FREE_MB must refuse'
+  assert_contains "$out" 'FM_MIN_FREE_MB must be a whole number' 'the refusal must name the bad knob'
+  pass 'a non-numeric memory floor is refused by name'
+}
+
+test_force_off_does_not_override_the_guard() {
+  local home out rc
+  home=$(make_home force-off 9)
+  out=$(FM_MIN_FREE_MB=1 FM_SPAWN_FORCE=0 run_spawn "$home"); rc=$?
+  expect_code 1 "$rc" 'FM_SPAWN_FORCE=0 must leave the guard on'
+  assert_contains "$out" "$REFUSAL" 'FM_SPAWN_FORCE=0 must not override the cap'
+  pass 'FM_SPAWN_FORCE=0 does not override the guard'
+}
+
+test_unrecognised_force_value_is_refused() {
+  local home out rc
+  home=$(make_home force-bogus 0)
+  out=$(FM_MIN_FREE_MB=1 FM_SPAWN_FORCE=maybe run_spawn "$home"); rc=$?
+  expect_code 1 "$rc" 'an unrecognised FM_SPAWN_FORCE must refuse'
+  assert_contains "$out" 'FM_SPAWN_FORCE must be 1' 'the refusal must name the documented value'
+  pass 'an unrecognised FM_SPAWN_FORCE value is refused'
+}
+
 test_cap_refuses_when_live_crews_reach_the_cap
 test_cap_refuses_above_the_cap
 test_cap_allows_below_the_cap
@@ -170,5 +273,13 @@ test_force_overrides_the_cap
 test_force_overrides_the_memory_refusal
 test_crew_count_reads_the_resolved_state_directory
 test_crew_count_follows_the_state_override
+test_secondmate_metas_are_not_counted_as_live_crews
+test_relaunch_is_not_refused_by_the_cap
+test_relaunch_still_honours_the_memory_refusal
+test_remote_secondmate_skips_the_guard
+test_non_numeric_cap_is_refused_by_name
+test_non_numeric_min_free_is_refused_by_name
+test_force_off_does_not_override_the_guard
+test_unrecognised_force_value_is_refused
 
 echo "# all fm-spawn-memory-guard tests passed"

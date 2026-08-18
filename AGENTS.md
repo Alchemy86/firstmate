@@ -285,7 +285,7 @@ An unregistered project or absent registry resolves to `no-mistakes` with yolo o
 Record the resulting mode, yolo, and the one-line reason for any deviation in the backlog item note.
 
 Treat file or subsystem overlap as a risk signal rather than an automatic reason to wait, and dispatch isolated work immediately with no concurrency cap when each change can be independently implemented and validated and the selected delivery path can reconcile ordinary rebases or conflicts.
-Serialize only for a true semantic dependency, shared mutable external state, incompatible concurrent migration, or another concrete condition that makes independent progress or reconciliation unsafe; same-file editing alone is insufficient, and genuine blockers remain durable.
+Serialize only for a true semantic dependency, shared mutable external state, incompatible concurrent migration, a machine resource limit that refuses the spawn - a resource limit, not a concurrency policy, whose knobs live in `bin/fm-spawn.sh`'s header - or another concrete condition that makes independent progress or reconciliation unsafe; same-file editing alone is insufficient, and genuine blockers remain durable.
 Write the task-specific brief under section 11 before spawning.
 
 ### Dispatch and supervision handoff

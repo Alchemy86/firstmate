@@ -199,6 +199,10 @@
 #   FM_MAX_CREWS      hard cap on concurrent crews (default 8)
 #   FM_MIN_FREE_MB    refuse to spawn below this much available memory (default 6000)
 #   FM_SPAWN_FORCE=1  override both, deliberately
+#   The cap counts this home's live crews and ignores persistent secondmates. It
+#   does not apply to --relaunch, which replaces a crew rather than adding one,
+#   and neither refusal applies to a remote secondmate, whose agent runs on
+#   another host and consumes none of this machine's memory.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -280,25 +284,124 @@ fm_refuse_if_gate_agent
 # count against RAM, never against ambition.
 #
 # The variables that tune and override this guard are documented in the header.
-fm_memory_guard() {
-  [ -z "${FM_SPAWN_FORCE:-}" ] || return 0
-  local cap="${FM_MAX_CREWS:-8}" minfree="${FM_MIN_FREE_MB:-6000}" live avail meta
-  live=0
-  for meta in "$STATE"/*.meta; do
-    [ -f "$meta" ] || continue
-    live=$((live + 1))
+
+# The guard runs before argument parsing, so it reads the two facts it needs
+# straight off the command line: whether this invocation is a --relaunch, and
+# the task id, which is the first argument that is neither a flag nor a flag's
+# value. Only the flags that take a separate value have to be recognised here.
+fm_guard_scan_args() {
+  local a want_value=
+  GUARD_RELAUNCH=0
+  GUARD_TASK_ID=
+  for a in "$@"; do
+    if [ -n "$want_value" ]; then
+      want_value=
+      continue
+    fi
+    case "$a" in
+      --relaunch) GUARD_RELAUNCH=1 ;;
+      --harness|--model|--effort|--backend|--mode|--yolo|--traceparent) want_value=1 ;;
+      --*) ;;
+      *) [ -n "$GUARD_TASK_ID" ] || GUARD_TASK_ID=$a ;;
+    esac
   done
-  if [ "${live:-0}" -ge "$cap" ]; then
-    printf 'refusing to spawn: %s crews already live (cap %s).
-' "$live" "$cap" >&2
-    printf '  Crews are multi-GB each; exceeding this has hard-locked the machine.
-' >&2
-    printf '  Let some finish, raise FM_MAX_CREWS deliberately, or set FM_SPAWN_FORCE=1.
-' >&2
-    return 1
+}
+
+# A whole number, refused by name rather than silently disabling the branch it
+# was reached for: `[ x -ge y ]` on a non-numeric value exits 2, which inside an
+# `if` is merely false, so a typo in the knob an operator reaches for after a
+# refusal would turn that refusal off.
+fm_guard_whole_number() {
+  local name=$1 value=$2
+  case "$value" in
+    ''|*[!0-9]*)
+      echo "error: $name must be a whole number, not '$value'" >&2
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# A remote secondmate's agent is launched on its own host (spawn_remote_secondmate
+# below), so this machine's crew count and free memory measure neither what the
+# spawn will consume nor where it will land.
+fm_guard_spawn_is_remote() {
+  local id=$1
+  [ -n "$id" ] || return 1
+  [ -z "$(fm_meta_get "$STATE/$id.meta" remote_host)" ] || return 0
+  [ "$(secondmate_registry_field "$DATA/secondmates.md" "$id" remote 2>/dev/null || true)" = 1 ]
+}
+
+# Available memory in MiB, or empty when this platform exposes neither source.
+# Linux publishes MemAvailable directly; macOS has no equivalent counter, so
+# derive one from the vm_stat pages that are free or reclaimable on demand.
+fm_guard_available_mb() {
+  if [ -r /proc/meminfo ]; then
+    awk '/^MemAvailable:/{print int($2/1024); exit}' /proc/meminfo 2>/dev/null || true
+    return 0
   fi
-  avail=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 99999)
-  if [ "${avail:-99999}" -lt "$minfree" ]; then
+  command -v vm_stat >/dev/null 2>&1 || return 0
+  vm_stat 2>/dev/null | awk '
+    /page size of/ { for (i = 1; i < NF; i++) if ($i == "of") { page = $(i + 1) + 0; break } }
+    /^Pages free:/ { free = $3 + 0 }
+    /^Pages inactive:/ { inactive = $3 + 0 }
+    /^Pages speculative:/ { speculative = $3 + 0 }
+    END { if (page > 0) printf "%d\n", (free + inactive + speculative) * page / 1048576 }
+  ' || true
+}
+
+fm_memory_guard() {
+  local cap minfree live avail meta
+  # Only the documented override disables the guard. Treating any non-empty
+  # value as force turned FM_SPAWN_FORCE=0 - the natural way to write "off"
+  # after exporting it once - into a full override.
+  case "${FM_SPAWN_FORCE:-}" in
+    ''|0|no|off|false) ;;
+    1|yes|on|true) return 0 ;;
+    *)
+      echo "error: FM_SPAWN_FORCE must be 1 to override the spawn guard, or empty to leave it on, not '$FM_SPAWN_FORCE'" >&2
+      return 1
+      ;;
+  esac
+  cap="${FM_MAX_CREWS:-8}"
+  minfree="${FM_MIN_FREE_MB:-6000}"
+  fm_guard_whole_number FM_MAX_CREWS "$cap" || return 1
+  fm_guard_whole_number FM_MIN_FREE_MB "$minfree" || return 1
+  fm_guard_spawn_is_remote "$GUARD_TASK_ID" && return 0
+  # A relaunch REPLACES a crew rather than adding one, so a concurrency cap has
+  # no business refusing it. The ordering makes that destructive precisely when
+  # recovery matters most: bin/fm-control.sh's do_exit has already stopped the
+  # old worker by the time this runs, so a refusal here leaves the task with a
+  # recorded endpoint and no agent. The memory branch below still applies,
+  # because the replacement occupies the machine whatever it replaces.
+  if [ "$GUARD_RELAUNCH" -eq 0 ]; then
+    live=0
+    for meta in "$STATE"/*.meta; do
+      [ -f "$meta" ] || continue
+      # Persistent secondmates hold a meta from provisioning to retirement and
+      # are not the multi-GB crews this counts, so counting them would refuse a
+      # spawn in a home with no memory pressure at all.
+      [ "$(fm_meta_get "$meta" kind)" != secondmate ] || continue
+      live=$((live + 1))
+    done
+    if [ "${live:-0}" -ge "$cap" ]; then
+      printf 'refusing to spawn: %s crews already live (cap %s).
+' "$live" "$cap" >&2
+      printf '  Crews are multi-GB each; exceeding this has hard-locked the machine.
+' >&2
+      printf '  Let some finish, raise FM_MAX_CREWS deliberately, or set FM_SPAWN_FORCE=1.
+' >&2
+      return 1
+    fi
+  fi
+  avail=$(fm_guard_available_mb)
+  case "$avail" in
+    ''|*[!0-9]*)
+      echo "notice: free memory cannot be read on this platform, so the FM_MIN_FREE_MB refusal is not enforced for this spawn" >&2
+      return 0
+      ;;
+  esac
+  if [ "$avail" -lt "$minfree" ]; then
     printf 'refusing to spawn: only %s MiB available (need %s).
 ' "$avail" "$minfree" >&2
     printf '  Wait for memory to free, or set FM_SPAWN_FORCE=1 deliberately.
@@ -307,6 +410,7 @@ fm_memory_guard() {
   fi
   return 0
 }
+fm_guard_scan_args "$@"
 fm_memory_guard || exit 1
 KIND=ship
 KIND_SET=0
