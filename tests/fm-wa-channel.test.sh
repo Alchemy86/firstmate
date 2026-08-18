@@ -1233,6 +1233,73 @@ test_echo_digest_guard() {
   pass "an outbound reply coming back is dropped once, and only once"
 }
 
+# The echo firstmate's own reply produces arrives on mudslide's device, which
+# the default sender-device filter rejects. If that rejection came first the
+# digest marker would never be consumed by the echo it was written for, and it
+# would sit out its whole ten-minute life waiting to swallow the captain typing
+# those same words himself.
+test_the_real_echo_consumes_its_own_marker() {
+  command -v node >/dev/null 2>&1 || { pass "echo consumption skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/echoconsume"
+  new_home "$home"
+  printf 'Captain, the PR is up.\n' > "$TMP_ROOT/echoconsume-reply.txt"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_DRY_RUN=1 \
+    "$SEND" --text-file "$TMP_ROOT/echoconsume-reply.txt" >/dev/null 2>&1 \
+    || fail "recording the outbound reply failed"
+
+  # Device 2 is mudslide: firstmate's own words coming back.
+  out=$(fixture "$home" "$(msg REALECHO 2 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, the PR is up."}')")
+  assert_contains "$out" 'REJECTED' "firstmate's own reply came back as a new instruction"
+  [ -z "$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null)" ] \
+    || fail "the echo was dropped without consuming the digest it was written for"
+
+  # So the captain saying the same thing straight afterwards is still heard.
+  out=$(fixture "$home" "$(msg CAPSAME 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, the PR is up."}')")
+  assert_contains "$out" 'ACCEPTED' \
+    "the captain's own words were swallowed by a digest his echo should have cleared"
+
+  pass "firstmate's echo clears its own digest instead of leaving it as a trap"
+}
+
+# A stalled listener is reported AND repaired in the same cycle, so the poll
+# carries on to the restart budget after speaking. Two fault lines in one cycle
+# would break the one-line check contract and, because both write the same
+# record, leave a record matching neither: every later cycle would then report
+# both again and re-wake firstmate for a fault it was already told about.
+test_two_faults_in_one_cycle_still_speak_once() {
+  local home out lines first second
+  home="$TMP_ROOT/doublefault"
+  new_home "$home"
+  fake_listener "$home"
+  # Alive, but a connection that never came up: no beat, and a pid record old
+  # enough to count as stalled.
+  touch -t 200001010000 "$home/state/wa-listener.pid"
+  # And a restart budget already spent, which is the next thing the cycle finds.
+  printf '3\n' > "$home/state/wa-listener.restarts"
+
+  out=$(poll "$home")
+  lines=$(printf '%s' "$out" | grep -c . || true)
+  [ "$lines" = 1 ] || fail "the cycle printed $lines lines instead of one: $out"
+  first=$out
+  assert_contains "$first" 'wa-channel-error' "the stalled listener was not reported"
+  [ "$(cat "$home/state/wa-listener.error" 2>/dev/null)" = "${first#wa-channel-error }" ] \
+    || fail "the recorded fault does not match the one that was reported"
+
+  # The fault that lost the race is not lost: it is what the next cycle finds.
+  second=$(poll "$home")
+  lines=$(printf '%s' "$second" | grep -c . || true)
+  [ "$lines" = 1 ] || fail "the following cycle printed $lines lines instead of one: $second"
+  assert_contains "$second" 'will not stay healthy after restart' \
+    "the spent restart budget was never reported"
+
+  # And having been recorded truthfully, it is said once rather than every cycle.
+  [ -z "$(poll "$home")" ] \
+    || fail "the same fault was reported again instead of being deduped"
+
+  pass "a cycle that finds two faults reports one, records it, and reports the other next"
+}
+
 # The digest is computed once in the shell and once in the listener, so the two
 # normalizations have to agree on exactly which characters count as whitespace.
 # A reply carrying a non-breaking space used to hash differently on each side,
@@ -1355,6 +1422,8 @@ test_listener_filters
 test_listener_is_idempotent
 test_listener_captures_quoted_context
 test_echo_digest_guard
+test_the_real_echo_consumes_its_own_marker
+test_two_faults_in_one_cycle_still_speak_once
 test_echo_digest_normalization_matches
 test_stale_echo_marker_does_not_swallow_the_captain
 test_failed_send_leaves_no_echo_trap

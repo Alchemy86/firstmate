@@ -36,7 +36,7 @@ It exports `FM_CHECK_INTERVAL=30`, so a message is picked up within seconds inst
 It is the same value Relay uses, so a home running both cannot end up with two cadences that disagree.
 
 Source it before launching a watcher process.
-The emitted session-start supervision block names the file when it exists, and the hook-owned arm paths (`bin/fm-claude-stop-autoarm.sh`, `bin/fm-turnend-guard-cursor.sh`) source it themselves.
+The emitted session-start supervision block names the file when it exists, and the arm paths that own their own launch (`bin/fm-claude-stop-autoarm.sh`, `bin/fm-turnend-guard-cursor.sh`, `.opencode/plugins/fm-primary-watch-arm.js`, `.pi/extensions/fm-primary-pi-watch.ts`) source it themselves.
 `bin/fm-wa-setup.sh disarm` removes it again, and the home reverts to the default cadence on the next supervision cycle.
 
 ### Deliberately not reported at session start
@@ -71,6 +71,7 @@ That does mean everything on this chat is `fromMe`, including firstmate's own re
 
 1. **Sender device.** WhatsApp numbers devices: the captain's phone is device `0`, mudslide is a linked device, and the listener is another. Only device `0` is accepted by default. baileys drops the device from the message key, so the listener reads it from the raw stanza and correlates by message id.
 2. **Outbound digest.** `bin/fm-wa-send.sh` records a digest of every message it sends under `state/wa-sent/`. If matching text arrives back, the listener consumes the marker and drops it.
+   The digest is checked before the sender-device filter, so firstmate's own reply consumes its own marker on the way in rather than being rejected as mudslide's device first and leaving the marker behind.
    An echo returns within seconds, so a digest older than ten minutes is swept instead of matched.
    Otherwise the first time the captain himself typed something firstmate once said, his instruction would be swallowed as an echo.
    A send that fails drops its own digest for the same reason: nothing went out, so nothing can come back.

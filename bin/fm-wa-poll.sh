@@ -113,8 +113,18 @@ EMITTED=
 # One diagnostic per distinct problem, not one per cycle. Listener faults and
 # poll faults keep separate markers so clearing one never re-fires the other.
 # Returns 0 when it printed, 1 when the same fault was already reported.
+#
+# A cycle speaks at most once, whatever it finds. Repair paths deliberately
+# report and then continue - a stalled listener is stopped and the restart
+# budget is consulted in the same cycle - so without this guard two faults
+# could print together AND share one marker, the second overwriting the first,
+# which would defeat the hour-long dedupe and re-wake firstmate on every
+# subsequent cycle. The fault that loses the race is not lost: its condition is
+# still there next cycle, and the marker it did not write means it is reported
+# in full then.
 emit_error_once() {
   local marker=$1 base=$2 msg=$3
+  [ -z "$EMITTED" ] || return 1
   if [ "$(cat "$marker" 2>/dev/null)" = "$msg" ] \
     && [ "$(fm_wa_age_of "$marker")" -lt 3600 ]; then
     return 1

@@ -252,11 +252,12 @@ function pruneStaleEchoes() {
   }
 }
 
-// Second line of defence behind the device filter. bin/fm-wa-send.sh records a
-// digest of everything firstmate sends; if an inbound message matches an
-// unconsumed digest that is still within the TTL it is firstmate's own words
-// coming back and is dropped. Consuming the marker keeps the captain free to
-// repeat the same words later.
+// Second line of defence alongside the device filter, and checked before it.
+// bin/fm-wa-send.sh records a digest of everything firstmate sends; if an
+// inbound message matches an unconsumed digest that is still within the TTL it
+// is firstmate's own words coming back and is dropped. The echo consuming its
+// own marker is what keeps the captain free to repeat those same words
+// seconds later rather than for the rest of the TTL.
 async function consumeOwnEcho(text) {
   const normalized = normalizeText(text)
   if (normalized === '') return false
@@ -526,12 +527,6 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
   if (CAPTAIN !== '' && jidUser(remoteJid) !== CAPTAIN) return reject('chat is not the captain', remoteJid)
   if (key.fromMe !== true) return reject('not from the captain account', remoteJid)
 
-  const device = deviceById.get(id) ?? null
-  if (!deviceAllowed(device)) {
-    // Device 2 is mudslide, i.e. firstmate's own outbound echoing back.
-    return reject(`device ${device ?? 'unknown'} is not an accepted captain device`, id)
-  }
-
   const body = unwrap(msg.message)
   if (!body) return reject('no readable message body', id)
   const ctx = contextInfoOf(body)
@@ -549,7 +544,19 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
     return reject('no text to act on', id)
   }
 
+  // Ahead of the sender-device filter on purpose. With the default filter the
+  // real echo arrives on mudslide's device, so a device check first would
+  // reject it before it ever consumed its own marker, and that marker would
+  // then sit out the whole TTL as a trap for the captain typing those same
+  // words himself. Letting the echo consume its marker here bounds that window
+  // to the seconds the round trip actually takes.
   if (await consumeOwnEcho(text)) return reject('matches firstmate outbound', id)
+
+  const device = deviceById.get(id) ?? null
+  if (!deviceAllowed(device)) {
+    // Device 2 is mudslide, i.e. firstmate's own outbound echoing back.
+    return reject(`device ${device ?? 'unknown'} is not an accepted captain device`, id)
+  }
 
   // The durable marker outlives the inbox file, so a message firstmate has
   // already drained is never re-offered even after the inbox entry is removed.
