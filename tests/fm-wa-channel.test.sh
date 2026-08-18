@@ -646,6 +646,31 @@ test_a_listener_binding_survives_a_timezone_change() {
   [ "$bound" = "$listener_pid" ] \
     || fail "a live listener stopped being its own recorded identity under another timezone"
 
+  # On a host without a readable /proc - macOS, which this channel supports -
+  # the identity falls back to ps lstart, which is the form that renders the
+  # date in the caller's own zone. Everything above passes on Linux without
+  # ever reaching it, so the fallback is pinned here in its own right.
+  local no_proc
+  no_proc="$home/no-proc"
+  mkdir -p "$no_proc"
+  rm -f "$home/state/wa-listener.pid-identity"
+  ( # shellcheck source=bin/fm-wa-lib.sh
+    . "$LIB"
+    export FM_PROC_ROOT_OVERRIDE="$no_proc"
+    TZ=UTC FM_WA_STATE="$home/state" fm_wa_record_listener_identity "$listener_pid" ) >/dev/null 2>&1 \
+    || fail "a host without /proc recorded no identity for a running process"
+  grep -q 'starttime=' "$home/state/wa-listener.pid-identity" \
+    && fail "the no-/proc case never exercised the ps fallback it exists to pin"
+
+  bound=$( # shellcheck source=bin/fm-wa-lib.sh
+    . "$LIB"
+    export FM_PROC_ROOT_OVERRIDE="$no_proc"
+    FM_HOME="$home"
+    fm_wa_paths
+    TZ=America/New_York fm_wa_listener_pid ) || bound=
+  [ "$bound" = "$listener_pid" ] \
+    || fail "without /proc, a live listener stopped being its own identity under another timezone"
+
   pass "a listener stays bound to its own identity across a timezone change"
 }
 

@@ -214,20 +214,34 @@ fm_wa_process_is_listener() {
 # this for the watcher and prefers /proc's starttime over ps lstart, because a
 # timezone change or a boot-time correction re-renders that date and would
 # evict a live process, so its helper is reused here rather than restated in a
-# weaker form. Its globals are declared local so borrowing that one helper
-# leaves nothing behind in the scripts that source this library. Empty output
-# means this host will not say, never that the process is a different one.
+# weaker form.
+#
+# Borrowing it is not free: sourcing that library defines its whole function set
+# into the caller, assigns its own FM_ROOT, FM_HOME, STATE, wake-queue and
+# FM_WAKE_*/FM_WATCHER_* globals, and creates STATE. A subshell, not a list of
+# local declarations, is what keeps all of that out of the scripts that source
+# this library, so the source and the one call it exists for happen inside one.
+# STATE is pinned to this channel's own directory so that creation cannot land
+# anywhere else, and TZ is pinned because the ps fallback taken on a host
+# without /proc renders lstart in the caller's zone: an identity recorded by a
+# start under one zone and read back by the poll under another would otherwise
+# mismatch, and the poll would answer that by starting a second listener onto
+# the single credential folder WhatsApp allows.
+#
+# Empty output means this host will not say, never that the process is a
+# different one.
 fm_wa_process_identity() {
   local pid=$1
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  local FM_WAKE_LIB_DIR FM_WAKE_DEFAULT_ROOT FM_ROOT FM_HOME STATE
-  local FM_WAKE_QUEUE FM_WAKE_QUEUE_LOCK FM_LOCK_STALE_AFTER _FM_UNAME
-  STATE="$FM_WA_STATE"
-  # shellcheck source=bin/fm-wake-lib.sh
-  . "$FM_WA_LIB_DIR/fm-wake-lib.sh" || return 1
-  fm_pid_identity "$pid"
+  (
+    export TZ=UTC
+    STATE="$FM_WA_STATE"
+    # shellcheck source=bin/fm-wake-lib.sh
+    . "$FM_WA_LIB_DIR/fm-wake-lib.sh" || exit 1
+    fm_pid_identity "$pid"
+  )
 }
 
 # Bind the pid file that was just written to the process it names, so anything
