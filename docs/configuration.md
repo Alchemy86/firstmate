@@ -444,6 +444,29 @@ The session-start digest separately prints an "Public commitments awaiting deliv
 `FM_PF_RETRY_BACKOFF_SECS` (default 900) sets the next-attempt time recorded with a retryable delivery error.
 See [verification/public-followup.md](verification/public-followup.md) for the current maintainer evidence behind the restart end-to-end and the relay-disabled zero-overhead guarantee.
 
+## Inbound WhatsApp channel (config/whatsapp.env / config/wa-mode.env)
+
+The captain's inbound WhatsApp channel is off unless the firstmate home's gitignored `config/whatsapp.env` holds a non-empty `FM_WA_CAPTAIN`.
+That single value is the whole switch, exactly as `FMX_PAIRING_TOKEN` is for Relay: with it absent every WhatsApp entry point is a hard no-op that polls nothing, writes nothing, and changes no behavior.
+The file is parsed key by key as data and never sourced.
+It is captain-private and is **not** inherited by secondmate homes.
+
+| key | default | meaning |
+| --- | --- | --- |
+| `FM_WA_CAPTAIN` | *(none)* | captain's number, digits only; empty or absent means the channel is off |
+| `FM_WA_ALLOW_DEVICES` | `0` | comma-separated accepted sender-device numbers, or `*` for any |
+| `FM_WA_DRY_RUN` | *(off)* | `1` records replies to `state/wa-outbox/` and transmits nothing |
+| `FM_WA_HISTORY_HORIZON` | `0` | seconds of backlog accepted on first run |
+| `FM_WA_REANNOUNCE` | `1800` | seconds before an undrained inbox is announced again |
+| `FM_WA_BAILEYS_DIR` | *(auto)* | baileys package directory, when auto-discovery misses it |
+
+`bin/fm-wa-setup.sh arm` turns that configuration into generated local state: `state/wa-watch.check.sh`, an identity shim for `bin/fm-wa-poll.sh` bound through `bin/fm-check-register.sh`, and `config/wa-mode.env`, which exports `FM_CHECK_INTERVAL=30` for watcher processes in that home.
+The cadence contract is the Relay one above, and the value is deliberately identical so a home running both channels cannot end up with two cadences that disagree.
+An armed `state/wa-watch.check.sh` counts as a reason to supervise the home in `bin/fm-supervision-lib.sh`, the same way `state/x-watch.check.sh` does, because the captain messages precisely when nothing else is running.
+`bin/fm-wa-setup.sh disarm` removes those artifacts, and the first poll cycle after `config/whatsapp.env` disappears retires them itself and stops the listener this home started, so the channel self-cleans however it is switched off.
+
+[whatsapp-channel.md](whatsapp-channel.md) owns everything else about this channel: the one-connection-per-credential-folder constraint and the second-linked-device decision it forced, pairing and re-pairing, the two captain identities the listener accepts, the accepted-device and echo-suppression guards, the dry-run switch, the listener health and restart contract, and the full turn-off procedure.
+
 ## Process-to-event sources (state/procevent)
 
 A long-polling external process is registered as a *source* through its adapter, whose header and `--help` own the commands and flags.

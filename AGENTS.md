@@ -76,7 +76,7 @@ config/trace-context  optional presence flag enabling default-off native W3C tra
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/x-mode.env    generated Relay watcher cadence; LOCAL, gitignored; source before arming watcher when present
-config/whatsapp.env  optional inbound WhatsApp channel; LOCAL, gitignored; a non-empty FM_WA_CAPTAIN is the whole switch and its absence keeps every WhatsApp entry point a hard no-op; not inherited by secondmate homes; see docs/whatsapp-channel.md
+config/whatsapp.env  optional inbound WhatsApp channel; LOCAL, gitignored; a non-empty FM_WA_CAPTAIN is the whole switch and its absence keeps every WhatsApp entry point a hard no-op; not inherited by secondmate homes; schema in docs/configuration.md, channel behavior in docs/whatsapp-channel.md
 config/wa-mode.env   generated inbound WhatsApp watcher cadence, written by arming that channel; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history

@@ -2,8 +2,11 @@
 # One bounded poll of the inbound WhatsApp inbox for this home.
 #
 # Inert by default: a HARD no-op (exit 0, no output) unless the channel is
-# configured via a non-empty FM_WA_CAPTAIN in config/whatsapp.env. The watcher
-# runs it through the ordinary registered-custom-check path
+# configured via a non-empty FM_WA_CAPTAIN in config/whatsapp.env.
+# The one cycle that finds a previously armed channel switched off retires its
+# own artifacts and stops the listener this home started, and speaks only when
+# that listener cannot be stopped.
+# The watcher runs it through the ordinary registered-custom-check path
 # (state/wa-watch.check.sh, bound by bin/fm-check-register.sh), so nothing in
 # the supervision loop itself changes: its contract is "output => wake
 # firstmate, silence => keep sleeping", and the no-op keeps a home that never
@@ -64,7 +67,28 @@ self_disarm() {
   rm -f -- "$state/wa-watch.check.sh" "$state/wa-watch.check-trust" "$config/wa-mode.env" 2>/dev/null || true
 }
 
+# Retiring the shim is only half of switching the channel off. The listener is a
+# live linked device on the captain's own personal account, and once the shim is
+# gone nothing polls this home again, so a listener left behind would hold that
+# device forever with nothing watching it. This cycle is therefore the one that
+# stops it, which is what makes the channel self-clean however it is switched
+# off - config removed first, the commands run first, or neither.
+#
+# Only a listener this home owns is ever signalled: fm_wa_stop_listener proves
+# the pid against the identity binding recorded at start, and a live process it
+# cannot claim is reported rather than killed on a guess. The report has to go
+# out on this cycle, because it is the last one there will be.
+retire_listener() {
+  local rc=0
+  fm_wa_stop_listener 3 || rc=$?
+  case "$rc" in
+    1) printf 'wa-channel-error %s\n' "the WhatsApp channel was switched off, but the recorded listener pid is a live process this home cannot prove is its own listener; check it by hand" ;;
+    2) printf 'wa-channel-error %s\n' "the WhatsApp channel was switched off, but its listener would not stop; check state/wa-listener.pid by hand" ;;
+  esac
+}
+
 if ! fm_wa_load_config; then
+  retire_listener
   self_disarm
   exit 0
 fi
@@ -391,8 +415,17 @@ COUNT=$(printf '%s\n' "$PENDING" | wc -l | tr -d ' ')
 FIRST=$(printf '%s\n' "$PENDING" | head -n 1)
 FIRST=${FIRST%.json}
 
-SIG=$(printf '%s\n' "$PENDING" | fm_wa_sha256) || exit 0
-[ -n "$SIG" ] || exit 0
+# Without a digest the announcement marker cannot be written, so the cycle can
+# neither announce nor dedupe. Exiting quietly there would leave the captain's
+# messages piling up with firstmate never woken and never told why, which is the
+# total silence this channel exists to prevent, so it is reported like every
+# other fault on this path instead. fm_wa_sha256 fails only on a host with
+# neither sha256sum nor shasum, and bin/fm-wa-send.sh already names that cause.
+SIG=$(printf '%s\n' "$PENDING" | fm_wa_sha256) || SIG=
+if [ -z "$SIG" ]; then
+  emit_poll_error "cannot announce the WhatsApp inbox: this host has neither sha256sum nor shasum to digest it"
+  exit 0
+fi
 
 # Same pending set as the last announcement, and not yet stale enough to repeat.
 if [ "$(cat "$FM_WA_OFFERED" 2>/dev/null)" = "$SIG" ] \

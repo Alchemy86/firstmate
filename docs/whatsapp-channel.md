@@ -79,6 +79,23 @@ That does mean everything on this chat is `fromMe`, including firstmate's own re
 
 If the captain also wants to command firstmate from WhatsApp Web or Desktop, add those device numbers to `FM_WA_ALLOW_DEVICES`. Do **not** add the device mudslide uses; that is firstmate's own outbound and would loop.
 
+### His two identities
+
+One account, two identifiers, and WhatsApp uses both. The same self-chat arrives addressed to his phone number (`<digits>@s.whatsapp.net`) on some deliveries and to his **LID** (`<digits>@lid`) on others.
+That is not a corner case: it was found live, when every real message he sent arrived under his LID, was refused as somebody else's chat, and left `state/wa-inbox/` empty while he believed he was messaging firstmate.
+
+So **both identities are accepted, and only his**:
+
+- A `@s.whatsapp.net` chat must match the number in `FM_WA_CAPTAIN`.
+- A `@lid` chat must match the LID the listener reads from **its own pairing credentials** (`state/wa-auth/creds.json`), never a configured value and never a string pattern. The pairing itself is what proves which LID is his.
+- With no LID established from those credentials, a `@lid` chat is refused rather than assumed. Nothing else changes: groups, broadcasts, status and newsletters carry their own server suffixes and can never match either form.
+
+The stashed message records which identity the chat used in its `chat_identity` field, and always records the captain's number as the sender, so a reply goes back to one place whichever form it arrived on.
+
+`FM_WA_SELF_LID` overrides the LID the listener treats as the captain's, which is how `tests/fm-wa-channel.test.sh` drives this path with an invented LID rather than committing a real identity.
+It is an environment variable rather than a `config/whatsapp.env` key on purpose: it is a test input, not a supported way to configure the channel.
+Because it decides an access-control question, do not set it in an operator's environment - a wrong value there both admits the wrong LID and refuses the captain's own.
+
 ## Media, and what is not read yet
 
 A photo, voice note, sticker, video or document sent with no caption is stashed like any other message, with empty `text` and its kind in `attachment`.
@@ -109,6 +126,13 @@ That single non-empty value is the switch. Everything else is optional:
 | `FM_WA_HISTORY_HORIZON` | `0` | seconds of backlog to accept on first run |
 | `FM_WA_REANNOUNCE` | `1800` | seconds before an undrained inbox is announced again |
 | `FM_WA_BAILEYS_DIR` | *(auto)* | baileys package directory, when auto-discovery misses it |
+
+Two further inputs are read from the environment and are deliberately **not** configuration keys:
+
+| variable | meaning |
+| --- | --- |
+| `FM_WA_DRY_RUN` | also accepted as a key above; in the environment it applies to one command |
+| `FM_WA_SELF_LID` | overrides which LID counts as the captain's, for the tests only. It decides an access-control question, so it does not belong in an operator's environment. See [His two identities](#his-two-identities) |
 
 ### 2. Pair the listener's device
 
@@ -222,35 +246,38 @@ Inbound WhatsApp text is untrusted input arriving over a network into a shell en
 
 - Message text is **never** interpolated into a command. `bin/fm-wa-send.sh` takes it from a file and hands it to mudslide as one argument-vector element; nothing goes through `eval` or `sh -c`.
   That element is passed after a `--`, which ends mudslide's own option parsing, so a reply that opens with a dash - a bulleted line, say - is sent as text rather than read as an unknown option and never delivered.
-- Message ids are validated against `[A-Za-z0-9._-]{1,128}` before any path is built from them.
-- The listener accepts only a direct chat with the configured captain number, only `fromMe`, and only from an accepted device. Group chats, broadcasts, status, newsletters and forwarded messages are refused and logged.
+- Message ids are validated against `[A-Za-z0-9._-]{1,128}`, with a leading dot excluded, before any path is built from them. The listener and `bin/fm-wa-lib.sh` hold the identical rule, so the listener can never stash an entry the poll would have to skip.
+- The listener accepts only a direct chat with the captain, only `fromMe`, and only from an accepted device. He is admitted under either of the two identities described in [His two identities](#his-two-identities) - the configured number, or the LID taken from this listener's own pairing credentials - and under nothing else. Group chats, broadcasts, status, newsletters and forwarded messages are refused and logged.
 - `config/whatsapp.env` is read as data, key by key, never sourced, so a stray backtick in it cannot execute.
 - Credentials, the inbox, and the logs are `0600` files inside `0700` directories under the home's gitignored `state/`.
 - A WhatsApp message carries the captain's ordinary authority for normal reversible work. Destructive, irreversible and security-sensitive actions still need confirmation on the trusted session channel, matching the boundary Relay already draws. The `wa-respond` skill owns that rule.
 
 ## Turning it off
 
-Two levels, both clean:
-
-```sh
-rm config/whatsapp.env          # poll becomes a hard no-op immediately
-```
-
-Every entry point checks the config first and exits silently when it is gone: no polling, no wake, no behaviour change. This is the equivalent of removing Relay's pairing token.
-
-Removing the config is a complete opt-out, not a partial one.
-Because an armed check shim is itself a reason to keep a watcher running, a shim left behind would keep the home supervised and sweeping every 30 seconds for a poll that can no longer do anything.
-So the first poll cycle after the config disappears retires the shim, its registration, and the cadence file, the way Relay's bootstrap drops its own generated artifacts when the pairing token goes.
-It removes only those three generated files, never anything else under `state/` or `config/`, and it is idempotent: with them already gone it does nothing and says nothing.
-After that cycle the home is byte-identical to one that never armed the channel, which `tests/fm-wa-channel.test.sh` asserts directly.
-
-To remove the artifacts immediately rather than waiting for that cycle:
-
 ```sh
 bin/fm-wa-setup.sh disarm       # removes the check shim, its registration, and the cadence
 bin/fm-wa-listen.sh stop        # stops the listener (disarm first, or the check restarts it)
 bin/fm-wa-listen.sh unpair      # removes this device's credentials
+rm config/whatsapp.env          # every entry point becomes a hard no-op
 ```
+
+That is the ordered path, and it leaves nothing behind at any point.
+**Doing it out of order, or not at all, still ends up clean.** The channel self-cleans however it is switched off.
+
+Removing `config/whatsapp.env` on its own is a complete opt-out, not a partial one, and the two things a leftover would cost are both handled by the same cycle.
+
+The first is the check shim. An armed shim is itself a reason to keep a watcher running, so one left behind would keep the home supervised and sweeping every 30 seconds for a poll that can no longer do anything.
+The first poll cycle after the config disappears therefore retires the shim, its registration, and the cadence file, the way Relay's bootstrap drops its own generated artifacts when the pairing token goes.
+It removes only those three generated files, never anything else under `state/` or `config/`, and it is idempotent: with them already gone it does nothing and says nothing.
+After that cycle the home is byte-identical to one that never armed the channel, which `tests/fm-wa-channel.test.sh` asserts directly.
+
+The second is the listener, and it matters more, because it is a live linked device on the captain's own personal account.
+Once the shim is gone nothing polls this home again, so that same retiring cycle stops the listener it started.
+Only a listener this home owns is ever signalled: the pid is proved against the identity recorded when it was started, and a live process that cannot be claimed is reported on that cycle - the last one there will be - rather than killed on a guess.
+
+Because the listener outlives the config that started it, `stop`, `unpair`, `logs` and `status` all keep working after `config/whatsapp.env` is gone.
+`status` still prints the listener line with the channel off, so a listener left over from a partial teardown is visible rather than silent.
+Only `start` and `pair` refuse, because they act as the captain and the identity they need is what was removed.
 
 `mudslide send` keeps working through all of it.
 

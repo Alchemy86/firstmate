@@ -20,7 +20,11 @@
 # stays entirely on mudslide (bin/fm-wa-send.sh) and is never touched by this
 # script. docs/whatsapp-channel.md owns that decision in full.
 #
-# Every subcommand is a hard no-op with a clear message when the channel is off.
+# start and pair are a hard no-op with a clear message when the channel is off,
+# because they act as the captain and need the identity that is gone. stop,
+# unpair, logs and status deliberately keep working without it: a listener
+# outlives the config that started it, and a cleanup path that needs the thing
+# it is cleaning up is not a cleanup path.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,9 +37,10 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 LISTENER="$SCRIPT_DIR/fm-wa-listen.mjs"
 
 usage() {
-  sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
+# Starting and pairing act AS the captain, so they genuinely need his identity.
 require_config() {
   if ! fm_wa_load_config; then
     echo "WhatsApp channel is off: no FM_WA_CAPTAIN in ${FM_WA_CONFIG_FILE:-config/whatsapp.env}" >&2
@@ -43,6 +48,18 @@ require_config() {
   fi
   command -v node >/dev/null 2>&1 || { echo "error: node is required for the WhatsApp listener" >&2; return 1; }
   [ -f "$LISTENER" ] && [ ! -L "$LISTENER" ] || { echo "error: listener program is unavailable" >&2; return 1; }
+}
+
+# Stopping, unpairing, reading the log and reporting must NEVER require the
+# thing they are tearing down or inspecting: a cleanup path that only works
+# while the config is present is not a cleanup path. A listener outlives the
+# config that started it, so these load what configuration there is and carry on
+# without it. fm_wa_load_config sets this home's paths before it decides the
+# channel is off, so the pid file, the credentials and the log are all reachable
+# either way. Returns 0 when the channel is on and 1 when it is off, so the one
+# caller that words itself differently can tell; the rest ignore it.
+optional_config() {
+  fm_wa_load_config
 }
 
 listener_env() {
@@ -140,22 +157,25 @@ cmd_start() {
 }
 
 cmd_stop() {
-  require_config || return 1
-  local pid
-  if ! pid=$(fm_wa_listener_pid); then
-    rm -f -- "$FM_WA_PIDFILE" "$FM_WA_PIDFILE_IDENTITY"
+  local running='' rc=0
+  optional_config || true
+  fm_wa_listener_pid >/dev/null 2>&1 && running=1
+  fm_wa_stop_listener 10 || rc=$?
+  case "$rc" in
+    1)
+      echo "refusing to stop: the recorded listener pid names a live process this home cannot prove is its own listener" >&2
+      return 1
+      ;;
+    2)
+      echo "error: the listener did not exit; see state/wa-listener.pid" >&2
+      return 1
+      ;;
+  esac
+  if [ -n "$running" ]; then
+    echo "listener stopped"
+  else
     echo "listener is not running"
-    return 0
   fi
-  kill "$pid" 2>/dev/null || true
-  local waited=0
-  while [ "$waited" -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
-    sleep 1
-    waited=$(( waited + 1 ))
-  done
-  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-  rm -f -- "$FM_WA_PIDFILE" "$FM_WA_PIDFILE_IDENTITY"
-  echo "listener stopped"
   if [ -f "$FM_WA_STATE/wa-watch.check.sh" ]; then
     echo "note: the armed check restarts it within a couple of minutes;"
     echo "      run bin/fm-wa-setup.sh disarm first to keep it down"
@@ -163,23 +183,32 @@ cmd_stop() {
 }
 
 cmd_status() {
-  if ! fm_wa_load_config; then
-    echo "channel: off (no FM_WA_CAPTAIN in ${FM_WA_CONFIG_FILE:-config/whatsapp.env})"
-    return 0
-  fi
-  echo "channel: on (captain $FM_WA_CAPTAIN, accepted devices ${FM_WA_ALLOW_DEVICES})"
-  if [ -n "$FM_WA_DRY_RUN" ]; then
-    echo "dry-run: on"
+  local channel_on=''
+  optional_config && channel_on=1
+  if [ -n "$channel_on" ]; then
+    echo "channel: on (captain $FM_WA_CAPTAIN, accepted devices ${FM_WA_ALLOW_DEVICES})"
+    if [ -n "$FM_WA_DRY_RUN" ]; then
+      echo "dry-run: on"
+    else
+      echo "dry-run: off"
+    fi
   else
-    echo "dry-run: off"
+    # Off is not the end of the report. A listener started while the channel was
+    # on outlives the config, so the lines below still have to be printed or an
+    # operator cannot even see that one is still holding a linked device.
+    echo "channel: off (no FM_WA_CAPTAIN in ${FM_WA_CONFIG_FILE:-config/whatsapp.env})"
   fi
-  if fm_wa_paired; then
+  if ! fm_wa_paired; then
+    echo '{"paired": false}'
+  elif command -v node >/dev/null 2>&1 && [ -f "$LISTENER" ] && [ ! -L "$LISTENER" ]; then
     listener_env status
   else
-    echo '{"paired": false}'
+    echo '{"paired": true}'
   fi
   if fm_wa_listener_pid >/dev/null; then
     echo "listener: running (pid $(fm_wa_listener_pid))"
+  elif fm_wa_listener_pid_foreign; then
+    echo "listener: unknown - the recorded pid is a live process this home cannot prove is its own listener"
   else
     echo "listener: not running"
   fi
@@ -228,8 +257,15 @@ cmd_pair() {
 }
 
 cmd_unpair() {
-  require_config || return 1
-  cmd_stop >/dev/null 2>&1 || true
+  optional_config || true
+  # Credentials must never be pulled out from under a process that is still
+  # using them, and a stop this cannot prove it owns is a stop that did not
+  # happen, so an unprovable pid stops the unpair rather than being worked
+  # around.
+  if ! cmd_stop >/dev/null; then
+    echo "refusing to unpair while a listener may still be holding these credentials" >&2
+    return 1
+  fi
   clear_listener_health
   if [ -d "$FM_WA_AUTH_DIR" ] && [ ! -L "$FM_WA_AUTH_DIR" ]; then
     rm -rf -- "$FM_WA_AUTH_DIR"
@@ -240,7 +276,7 @@ cmd_unpair() {
 }
 
 cmd_logs() {
-  require_config || return 1
+  optional_config || true
   local n=${1:-40}
   case "$n" in
     ''|*[!0-9]*) n=40 ;;
@@ -251,7 +287,7 @@ cmd_logs() {
 case "${1:-}" in
   start) shift; cmd_start "$@" ;;
   stop) shift; cmd_stop "$@" ;;
-  restart) shift; cmd_stop >/dev/null 2>&1; cmd_start "$@" ;;
+  restart) shift; cmd_stop >/dev/null || exit 1; cmd_start "$@" ;;
   status) shift; cmd_status "$@" ;;
   pair) shift; cmd_pair "$@" ;;
   unpair) shift; cmd_unpair "$@" ;;

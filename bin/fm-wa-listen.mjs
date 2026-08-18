@@ -59,8 +59,12 @@ const LISTENER_STATUS = path.join(STATE, 'wa-listener.status')
 const LISTENER_BEAT = path.join(STATE, 'wa-listener.beat')
 
 // Message ids are attacker-influenceable in principle, so they are never used
-// as a path component until they match this slug.
-const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/
+// as a path component until they match this slug. It must stay the same rule
+// as fm_wa_id_safe in bin/fm-wa-lib.sh, leading dot included: an id this side
+// accepts and the poll refuses becomes a dotfile that `find` still lists and
+// the drain's own glob never does, so the captain's message would be dropped
+// behind a fault line that cannot even name it.
+const SAFE_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/
 
 function requiredEnv(name) {
   const value = process.env[name]

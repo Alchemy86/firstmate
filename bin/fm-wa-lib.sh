@@ -297,6 +297,54 @@ fm_wa_listener_pid() {
   printf '%s' "$pid"
 }
 
+# A pid file naming a process that is alive but that this home cannot claim as
+# its own listener. It is deliberately distinct from a stale pid file: a stale
+# one is cleaned up without a word, while a live stranger must never be
+# signalled and must be said out loud instead.
+fm_wa_listener_pid_foreign() {
+  local pid
+  [ -f "$FM_WA_PIDFILE" ] || return 1
+  pid=$(cat "$FM_WA_PIDFILE" 2>/dev/null) || return 1
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  fm_wa_listener_pid >/dev/null 2>&1 && return 1
+  return 0
+}
+
+# Stop the listener this home started, and only that one.
+#
+# Every path that takes the channel down comes through here - the operator's own
+# stop and unpair, and the cycle that finds the channel switched off - so
+# ownership is proved in one place rather than at each kill site, and the
+# channel cleans itself up however it is switched off. A listener left running
+# holds a linked device on the captain's own account with nothing watching it,
+# so this must not be reachable only by an operator who read the documentation
+# and did the steps in the right order.
+#
+# Outcomes, because callers word them differently: 0 nothing left running,
+# 1 alive but not provably ours so nothing was signalled, 2 still alive after
+# SIGKILL. The grace argument bounds the wait, because a poll cycle has far less
+# room than a command typed by hand.
+fm_wa_stop_listener() {
+  local grace=${1:-10} pid waited=0
+  if ! pid=$(fm_wa_listener_pid 2>/dev/null); then
+    fm_wa_listener_pid_foreign && return 1
+    rm -f -- "$FM_WA_PIDFILE" "$FM_WA_PIDFILE_IDENTITY" 2>/dev/null || true
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  while [ "$waited" -lt "$grace" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+  kill -0 "$pid" 2>/dev/null && return 2
+  rm -f -- "$FM_WA_PIDFILE" "$FM_WA_PIDFILE_IDENTITY" 2>/dev/null || true
+  return 0
+}
+
 # Credentials exist AND the device completed its link. A half-written folder
 # from an abandoned pairing attempt is not paired, and must not block a retry.
 fm_wa_paired() {

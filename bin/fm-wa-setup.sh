@@ -21,7 +21,10 @@
 # Opt-out has two levels, both clean:
 #   - delete config/whatsapp.env: the poll becomes a hard no-op immediately and
 #     retires the shim, its registration, and the cadence on its next cycle, so
-#     the home reverts to exactly its previous behaviour with nothing left over
+#     the home reverts to exactly its previous behaviour with nothing left over.
+#     That same cycle also stops the listener this home started, because nothing
+#     polls the home afterwards and a listener left behind would keep a linked
+#     device on the captain's own account with nothing watching it
 #   - run disarm: the check artifact, its registration, and the cadence file are
 #     removed too, and the home stops counting as needing supervision
 set -u

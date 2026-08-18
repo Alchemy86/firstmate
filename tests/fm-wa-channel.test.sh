@@ -1743,3 +1743,187 @@ test_failed_send_leaves_no_echo_trap
 test_a_dash_leading_reply_still_reaches_the_send
 test_a_failed_send_says_why
 test_failed_dry_run_leaves_no_echo_trap
+
+# --- switching the channel off cleans up after itself ------------------------
+
+# The home-is-byte-identical test above never starts a listener, so it proves
+# nothing about the thing that actually matters here: a listener left running is
+# a live linked device on the captain's own personal account with nothing
+# watching it. Every test below starts one first.
+
+test_stopping_works_after_the_config_is_gone() {
+  local home out pid
+  home="$TMP_ROOT/optoutstop"
+  new_home "$home"
+  fake_listener "$home"
+  pid=$(cat "$home/state/wa-listener.pid")
+
+  # The documented opt-out done in the worst order: config first, commands after.
+  rm -f "$home/config/whatsapp.env"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" stop 2>&1) \
+    || fail "stop refused once the config it is tearing down was gone: $out"
+  assert_contains "$out" 'listener stopped' "stop did not report stopping the listener"
+  if kill -0 "$pid" 2>/dev/null; then
+    fail "the listener survived a stop run after the config was removed"
+  fi
+  assert_absent "$home/state/wa-listener.pid" "stop left the pid file behind"
+
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" logs 5 >/dev/null 2>&1 \
+    || fail "logs refused to read a listener log with the config gone"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" unpair 2>&1) \
+    || fail "unpair refused once the config was gone: $out"
+  assert_absent "$home/state/wa-auth" "unpair left this listener's credentials behind"
+
+  pass "stop, logs and unpair still tear the channel down after the config is gone"
+}
+
+test_the_retiring_cycle_stops_the_listener() {
+  local home out pid
+  home="$TMP_ROOT/optoutpoll"
+  new_home "$home"
+  fake_listener "$home"
+  pid=$(cat "$home/state/wa-listener.pid")
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
+
+  # No command is run at all. The config simply goes, which is the whole switch.
+  rm -f "$home/config/whatsapp.env"
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "the retiring cycle spoke while cleaning up normally: $out"
+
+  if kill -0 "$pid" 2>/dev/null; then
+    fail "the retiring cycle left the listener holding a linked device"
+  fi
+  assert_absent "$home/state/wa-listener.pid" "the retiring cycle left the pid file behind"
+  assert_absent "$home/state/wa-watch.check.sh" "the retiring cycle left the check shim armed"
+
+  pass "removing the config alone stops the listener as well as retiring the shim"
+}
+
+test_status_reports_a_stranded_listener() {
+  local home out
+  home="$TMP_ROOT/optoutstatus"
+  new_home "$home"
+  fake_listener "$home"
+
+  rm -f "$home/config/whatsapp.env"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" status 2>&1)
+  assert_contains "$out" 'channel: off' "status did not say the channel is off"
+  assert_contains "$out" 'listener: running' \
+    "status hid a listener that is still running, so a stranded one is invisible"
+
+  pass "status still reports a running listener once the channel is off"
+}
+
+test_a_listener_this_home_does_not_own_is_never_signalled() {
+  local home out pid
+  home="$TMP_ROOT/optoutforeign"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  # An unrelated process holding the number a dead listener left behind, with an
+  # identity that cannot be its own.
+  sleep 300 &
+  pid=$!
+  FAKE_PIDS="$FAKE_PIDS $pid"
+  printf '%s\n' "$pid" > "$home/state/wa-listener.pid"
+  printf 'Sat Jan  1 00:00:00 2000\n' > "$home/state/wa-listener.pid-identity"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
+
+  rm -f "$home/config/whatsapp.env"
+  out=$(poll "$home")
+  kill -0 "$pid" 2>/dev/null \
+    || fail "the retiring cycle killed a process it never proved was its own listener"
+  assert_contains "$out" 'wa-channel-error' \
+    "the retiring cycle left an unclaimable listener record without saying so"
+  assert_contains "$out" 'cannot prove' "the report did not name why nothing was signalled"
+  assert_present "$home/state/wa-listener.pid" \
+    "the retiring cycle discarded the record of a process it refused to signal"
+  assert_absent "$home/state/wa-watch.check.sh" "the retiring cycle left the check shim armed"
+
+  # The command path refuses for the same reason rather than guessing.
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" stop >/dev/null 2>&1 \
+    && fail "stop signalled a process it could not prove was this home's listener"
+  kill -0 "$pid" 2>/dev/null \
+    || fail "stop killed a process it could not prove was this home's listener"
+
+  pass "a live process this home cannot claim is reported, never signalled"
+}
+
+# The listener and the shell library both decide whether a message id may become
+# a path, and they have to decide it identically. When the listener was the more
+# permissive of the two, a dot-leading id was stashed as a dotfile that `find`
+# still lists and the drain's own glob never does, so the captain's message was
+# dropped behind a fault line that could not even name it.
+test_a_dot_leading_id_is_never_stashed() {
+  command -v node >/dev/null 2>&1 || { pass "id rule agreement skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/dotid"
+  new_home "$home"
+
+  bash -c '. "$1"; fm_wa_id_safe ".HIDDEN"' _ "$LIB" \
+    && fail "the shell library accepted a dot-leading id, so this test proves nothing"
+
+  out=$(fixture "$home" "$(msg .HIDDEN 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"hidden"}')")
+  assert_refused "$out" 'unsafe or missing message id' \
+    "the listener stashed an id the poll would then refuse to use"
+  assert_absent "$home/state/wa-inbox/.HIDDEN.json" \
+    "a message record the drain's own glob can never see was created"
+
+  pass "the listener and the shell library agree on which message ids are usable"
+}
+
+# A PATH holding every command this host has EXCEPT the two the digest helper
+# knows about, so the poll runs for real on a host that cannot hash. Building it
+# from the real PATH rather than a hand-picked list is what keeps the assertion
+# honest: the poll has to get all the way to the digest to say anything at all.
+path_without_sha256() {
+  local dir=$1 entry name part
+  mkdir -p "$dir"
+  # shellcheck disable=SC2086 # PATH is a colon-separated list and is split on purpose.
+  ( IFS=:; printf '%s\n' $PATH ) | while IFS= read -r part; do
+    [ -n "$part" ] && [ -d "$part" ] || continue
+    for entry in "$part"/*; do
+      [ -f "$entry" ] && [ -x "$entry" ] || continue
+      name=${entry##*/}
+      case "$name" in
+        sha256sum|shasum) continue ;;
+      esac
+      [ -e "$dir/$name" ] || ln -s "$entry" "$dir/$name" 2>/dev/null || true
+    done
+  done
+}
+
+# Total silence with the captain's messages sitting in the inbox is the one
+# outcome this channel exists to prevent, so a host that cannot digest the
+# pending set has to say why instead of exiting quietly forever.
+test_a_host_that_cannot_hash_says_so() {
+  local home out bin
+  home="$TMP_ROOT/nosha"
+  new_home "$home"
+  fake_listener "$home"
+  stash_message "$home" MSGNOSHA
+  bin="$TMP_ROOT/nosha-bin"
+  path_without_sha256 "$bin"
+  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
+    || { pass "digest failure skipped: this host has no digest tool to remove"; return 0; }
+
+  out=$(PATH="$bin" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$POLL" 2>/dev/null)
+  assert_contains "$out" 'wa-channel-error' \
+    "a host that cannot digest the inbox went silent with a message pending"
+  assert_contains "$out" 'sha256sum' "the report did not name what is missing"
+
+  # ...and it is still deduped, so it is said once rather than every cycle.
+  out=$(PATH="$bin" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$POLL" 2>/dev/null)
+  [ -z "$out" ] || fail "the same digest fault was reported again instead of being deduped"
+
+  pass "a host with no digest tool reports why instead of losing the inbox silently"
+}
+
+test_stopping_works_after_the_config_is_gone
+test_the_retiring_cycle_stops_the_listener
+test_status_reports_a_stranded_listener
+test_a_listener_this_home_does_not_own_is_never_signalled
+test_a_dot_leading_id_is_never_stashed
+test_a_host_that_cannot_hash_says_so
