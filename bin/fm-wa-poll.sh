@@ -3,9 +3,11 @@
 #
 # Inert by default: a HARD no-op (exit 0, no output) unless the channel is
 # configured via a non-empty FM_WA_CAPTAIN in config/whatsapp.env.
-# The one cycle that finds a previously armed channel switched off retires its
-# own artifacts and stops the listener this home started, and speaks only when
-# that listener cannot be stopped.
+# The one cycle that finds the configuration definitively gone retires its own
+# artifacts, stops the listener this home started, clears the captain's stashed
+# messages with them, and speaks only when that listener cannot be stopped. A
+# configuration this cycle merely could not READ is not an opt-out: nothing is
+# torn down, and the unreadable configuration is reported instead.
 # The watcher runs it through the ordinary registered-custom-check path
 # (state/wa-watch.check.sh, bound by bin/fm-check-register.sh), so nothing in
 # the supervision loop itself changes: its contract is "output => wake
@@ -83,6 +85,9 @@ self_disarm() {
 # the pid against the identity binding recorded at start, and a live process it
 # cannot claim is reported rather than killed on a guess. The report has to go
 # out on this cycle, because it is the last one there will be.
+#
+# Returns 0 only when nothing is left running, so the caller can tell whether it
+# is safe to clear the records a still-live listener would keep writing to.
 retire_listener() {
   local rc=0
   fm_wa_stop_listener 3 || rc=$?
@@ -90,13 +95,15 @@ retire_listener() {
     1) printf 'wa-channel-error %s\n' "the WhatsApp channel was switched off, but the recorded listener pid is a live process this home cannot prove is its own listener; check it by hand" ;;
     2) printf 'wa-channel-error %s\n' "the WhatsApp channel was switched off, but its listener would not stop; check state/wa-listener.pid by hand" ;;
   esac
+  [ "$rc" -eq 0 ]
 }
 
-if ! fm_wa_load_config; then
-  retire_listener
-  self_disarm
-  exit 0
-fi
+# Read here, acted on further down. The channel-off paths can only speak through
+# emit_error_once, which is declared below with the markers it dedupes against,
+# and everything between here and there needs the paths this load sets whether
+# it succeeded or not.
+CONFIG_OK=1
+fm_wa_load_config || CONFIG_OK=
 
 RESTART_MARKER="$FM_WA_STATE/wa-listener.restart"
 RESTART_INTERVAL=120
@@ -174,6 +181,36 @@ emit_error_once() {
 # the listener program can no longer attach.
 emit_listener_error() { emit_error_once "$LISTENER_ERROR.$1" "wa-listener.error.$1" "$2"; }
 emit_poll_error() { emit_error_once "$FM_WA_ERROR" wa-poll.error "$1"; }
+
+# The channel is off, and which KIND of off decides everything that follows.
+#
+# A configuration that is definitively gone is the documented opt-out, and this
+# cycle is the last one there will ever be: it stops the listener, clears the
+# captain's stashed messages and the records of them, and retires the artifacts
+# that keep this home supervised. The clearing waits on the stop, because a
+# listener still running would only write the inbox straight back.
+#
+# A configuration that merely could not be READ is not an opt-out and must never
+# be treated as one. A permission failure, or the instant an editor has
+# truncated the file to rewrite it, would otherwise take the whole channel down
+# for a non-reason - and nothing would ever bring it back on its own within this
+# cycle, so the captain would be left messaging a home that cannot answer and
+# cannot say why. Everything is therefore left exactly as it is and reported
+# through the ordinary deduped fault path, so a transient blip costs one line an
+# hour rather than a wake every cycle. It is reported only when this home has
+# something armed or running to lose: a home that never opted in stays the hard
+# no-op it has always been.
+if [ -z "$CONFIG_OK" ]; then
+  if fm_wa_config_confirmed_absent; then
+    if retire_listener; then
+      fm_wa_purge_channel_state
+    fi
+    self_disarm
+  elif [ -f "$FM_WA_STATE/wa-watch.check.sh" ] || fm_wa_listener_pid >/dev/null 2>&1; then
+    emit_poll_error "the WhatsApp channel configuration cannot be read, so the channel is left armed and running untouched; check ${FM_WA_CONFIG_FILE:-config/whatsapp.env}"
+  fi
+  exit 0
+fi
 
 # The listener's own last reported connection state, or empty when it never
 # wrote one. Read as data: the file is JSON this home wrote itself.

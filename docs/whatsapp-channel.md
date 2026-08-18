@@ -225,6 +225,7 @@ bin/fm-wa-listen.sh start
 ```
 
 `unpair` never touches `~/.local/share/mudslide`. Nothing in this channel ever reads or writes that folder.
+With the channel still on it also leaves `state/wa-inbox/` alone, so a re-pair never destroys a message the captain has sent and firstmate has not read yet; clearing that is [switching the channel off](#turning-it-off), not re-pairing it.
 
 ## Dry-run
 
@@ -256,20 +257,20 @@ Inbound WhatsApp text is untrusted input arriving over a network into a shell en
 
 ```sh
 bin/fm-wa-setup.sh disarm       # removes the check shim, its registration, and the cadence, and stops the listener
-bin/fm-wa-listen.sh unpair      # removes this device's credentials
 rm config/whatsapp.env          # every entry point becomes a hard no-op
+bin/fm-wa-listen.sh unpair      # removes this device's credentials, and with the channel already off, the stashed messages too
 ```
 
-That is the ordered path, and it leaves nothing behind at any point.
-**Order does not matter, and neither does using the commands at all.** Whichever way the channel is switched off, whatever runs next is what cleans it up: `disarm` stops the listener itself, and so does the poll cycle that finds the config gone.
-The one case nothing can cover is a home that removes the config and then never runs anything again - no watcher cycle, no command - because the cleanup is something that runs, not something that is written down. There, stopping the listener is on the operator.
+That is the ordered path, and it ends with nothing of this channel left in the home.
+**Order does not matter, and neither does using the commands at all.** Whichever way the channel is switched off, whatever runs next is what cleans it up: `disarm` stops the listener itself, and so does the poll cycle that finds the config confirmed gone - and that cycle clears the captain's stashed messages with it.
+The one case nothing can cover is a home that removes the config and then never runs anything again - no watcher cycle, no command - because the cleanup is something that runs, not something that is written down. There, stopping the listener and clearing the messages are on the operator.
 
-Removing `config/whatsapp.env` on its own is a complete opt-out, not a partial one, and the two things a leftover would cost are both handled by the same cycle.
+Removing `config/whatsapp.env` on its own is a complete opt-out, not a partial one, and the three things a leftover would cost are all handled by the same cycle.
 
 The first is the check shim. An armed shim is itself a reason to keep a watcher running, so one left behind would keep the home supervised and sweeping every 30 seconds for a poll that can no longer do anything.
 The first poll cycle after the config disappears therefore retires the shim, its registration, and the cadence file, the way Relay's bootstrap drops its own generated artifacts when the pairing token goes.
-It removes only those three generated files, never anything else under `state/` or `config/`, and it is idempotent: with them already gone it does nothing and says nothing.
-After that cycle the home is byte-identical to one that never armed the channel, which `tests/fm-wa-channel.test.sh` asserts directly.
+That is all `self_disarm` itself removes - those three generated files, never anything else under `state/` or `config/` - and it is idempotent: with them already gone it does nothing and says nothing.
+A home that armed the channel and never received a message is byte-identical afterwards to one that never armed it, which `tests/fm-wa-channel.test.sh` asserts directly.
 
 The second is the listener, and it matters more, because it is a live linked device on the captain's own personal account.
 Once the shim is gone nothing polls this home again, so that same retiring cycle stops the listener it started.
@@ -278,11 +279,33 @@ The two are complementary, not alternatives - between them the listener is stopp
 Only a listener this home owns is ever signalled by either: the pid is proved against the identity recorded when it was started, and a live process that cannot be claimed is reported - on the retiring cycle, that is the last report there will be - rather than killed on a guess.
 A stop is not judged by whether the pid is still visible in the instant after the signal, because a process that is terminating or waiting to be reaped still is; it is judged by waiting, briefly and with a bound, for the pid to actually go.
 
+The third is the captain's own words.
+His messages sit in `state/wa-inbox/` as plain JSON, and the records beside them say what he sent and when, so an opt-out that left them there would be claiming more than it did.
+Once the listener is stopped, that same retiring cycle clears `state/wa-inbox/`, `state/wa-seen/`, `state/wa-sent/`, `state/wa-outbox/`, `state/wa-watermark`, `state/wa-poll.offered`, `state/wa-poll.error`, `state/wa-listener.log`, and the listener's health and restart records.
+It clears them by explicit name, never by sweeping a directory, and never touches anything else under `state/` or `config/`.
+If it had to report a listener it could not stop, it leaves those records alone and says so, because a listener still running would write the inbox straight back.
+
+`bin/fm-wa-listen.sh unpair` clears exactly the same set, but only when the channel is already off.
+That is the difference between the last step of a teardown and the middle step of a [re-pair](#re-pairing): clearing the inbox during a re-pair would destroy messages the captain has sent and firstmate has not read yet, and drop the watermark that stops WhatsApp's own redelivery from replaying old messages as new instructions.
+The linked-device credentials in `state/wa-auth/` are the one thing only `unpair` removes, because getting them back costs a trip to the captain's phone.
+
 Because the listener outlives the config that started it, `stop`, `unpair`, `logs` and `status` all keep working after `config/whatsapp.env` is gone.
 `status` still prints the listener line with the channel off, so a listener left over from a partial teardown is visible rather than silent.
 Only `start` and `pair` refuse, because they act as the captain and the identity they need is what was removed.
 
 `mudslide send` keeps working through all of it.
+
+### A configuration that cannot be read is not an opt-out
+
+Only a configuration that is definitively *gone* switches the channel off.
+A permission failure, an unreadable file, or the instant an editor has truncated `config/whatsapp.env` to rewrite it all leave the channel exactly as it is: the listener keeps running, the shim stays armed, and nothing is cleared.
+The poll reports the unreadable configuration through its ordinary deduped fault line instead, so a transient blip costs one report rather than the channel.
+Conflating the two would mean a single unlucky read could stop the listener and delete the poll, after which nothing would ever poll this home again, and the captain would be messaging a home that could not answer and could not say why.
+
+The arming artifacts converge back for the same reason.
+While `config/whatsapp.env` names a captain, every session start re-arms the check shim and the cadence if either has gone missing, exactly as `bin/fm-bootstrap.sh` re-arms Relay's while a pairing token is present.
+That is one-directional: session start only ever arms, never disarms.
+The practical consequence is that `disarm` keeps the channel down only until the next session start unless the config goes too - which is why `rm config/whatsapp.env` is the switch, and `disarm` is how you stop it right now.
 
 ## Files
 

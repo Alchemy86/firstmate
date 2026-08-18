@@ -1908,12 +1908,14 @@ test_a_dot_leading_id_is_never_stashed() {
   pass "the listener and the shell library agree on which message ids are usable"
 }
 
-# A PATH holding every command this host has EXCEPT the two the digest helper
-# knows about, so the poll runs for real on a host that cannot hash. Building it
-# from the real PATH rather than a hand-picked list is what keeps the assertion
-# honest: the poll has to get all the way to the digest to say anything at all.
-path_without_sha256() {
-  local dir=$1 entry name part
+# A PATH holding every command this host has EXCEPT the named ones, so a script
+# runs for real on a host that is missing exactly one tool. Building it from the
+# real PATH rather than a hand-picked list is what keeps the assertion honest:
+# the script has to get all the way to the missing tool to say anything at all.
+path_excluding() {
+  local dir=$1
+  shift
+  local excluded=" $* " entry name part
   mkdir -p "$dir"
   # shellcheck disable=SC2086 # PATH is a colon-separated list and is split on purpose.
   ( IFS=:; printf '%s\n' $PATH ) | while IFS= read -r part; do
@@ -1921,12 +1923,16 @@ path_without_sha256() {
     for entry in "$part"/*; do
       [ -f "$entry" ] && [ -x "$entry" ] || continue
       name=${entry##*/}
-      case "$name" in
-        sha256sum|shasum) continue ;;
+      case "$excluded" in
+        *" $name "*) continue ;;
       esac
       [ -e "$dir/$name" ] || ln -s "$entry" "$dir/$name" 2>/dev/null || true
     done
   done
+}
+
+path_without_sha256() {
+  path_excluding "$1" sha256sum shasum
 }
 
 # Total silence with the captain's messages sitting in the inbox is the one
@@ -2119,3 +2125,240 @@ test_disarm_is_quiet_with_nothing_to_stop
 test_disarm_never_signals_a_listener_this_home_cannot_claim
 test_a_dot_leading_id_is_never_stashed
 test_a_host_that_cannot_hash_says_so
+
+# --- the channel goes down only for a reason, and comes back on its own ------
+
+# Every reason config/whatsapp.env cannot be read looks the same from outside,
+# and only one of them is the captain switching the channel off. Answering all
+# of them by stopping the listener and deleting the poll means a single unlucky
+# cycle takes the channel down for good, after which he messages a home that
+# will never answer and cannot tell that apart from being ignored.
+test_an_unreadable_config_is_never_an_opt_out() {
+  local variant home out pid
+  for variant in empty truncated unreadable; do
+    if [ "$variant" = unreadable ] && [ "$(id -u)" = 0 ]; then
+      continue
+    fi
+    home="$TMP_ROOT/indeterminate-$variant"
+    new_home "$home"
+    fake_listener "$home"
+    pid=$(cat "$home/state/wa-listener.pid")
+    stash_message "$home" "MSGKEEP"
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 \
+      || fail "arm failed for the $variant config"
+
+    case "$variant" in
+      empty) : > "$home/config/whatsapp.env" ;;
+      truncated) printf 'FM_WA_CAP' > "$home/config/whatsapp.env" ;;
+      unreadable) chmod 000 "$home/config/whatsapp.env" ;;
+    esac
+
+    out=$(poll "$home")
+    assert_contains "$out" 'wa-channel-error' \
+      "a $variant config was treated as an opt-out instead of being reported"
+    assert_contains "$out" 'cannot be read' \
+      "the report did not say the configuration is unreadable rather than gone"
+
+    kill -0 "$pid" 2>/dev/null \
+      || fail "a $variant config stopped the listener"
+    assert_present "$home/state/wa-watch.check.sh" \
+      "a $variant config retired the check shim"
+    assert_present "$home/state/wa-watch.check-trust" \
+      "a $variant config retired the check registration"
+    assert_present "$home/config/wa-mode.env" \
+      "a $variant config removed the watcher cadence"
+    assert_present "$home/state/wa-inbox/MSGKEEP.json" \
+      "a $variant config destroyed a message the captain had already sent"
+
+    # ...and it is said once, not once a cycle, so a blip is not a wake storm.
+    out=$(poll "$home")
+    [ -z "$out" ] || fail "the $variant config was reported again on the next cycle: $out"
+
+    chmod 600 "$home/config/whatsapp.env" 2>/dev/null || true
+  done
+
+  pass "a configuration that cannot be read leaves the channel armed and running"
+}
+
+# A home that never opted in has nothing armed and nothing running, so the poll
+# must stay the hard no-op it has always been rather than reporting on a
+# configuration it was never given.
+test_an_unconfigured_home_is_still_silent() {
+  local home out
+  home="$TMP_ROOT/neveropted"
+  mkdir -p "$home/state" "$home/config"
+  chmod 700 "$home/state"
+  : > "$home/config/whatsapp.env"
+
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "a home that never armed the channel spoke: $out"
+
+  pass "an unconfigured home stays a hard no-op even with an unusable config file"
+}
+
+# Nothing put the arming artifacts back once they were gone, so a home could sit
+# there configured, listening to nothing, while the captain went on messaging
+# it. Relay self-heals from exactly this because bootstrap re-runs its setup at
+# every session start; this is the same shape.
+test_a_configured_home_rearms_itself_at_session_start() {
+  local home out
+  home="$TMP_ROOT/rearm"
+  new_home "$home"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
+  # However they went - a disarm, a restored backup, a half-finished arm - the
+  # configuration still names the captain, so this home must not stay deaf.
+  rm -f "$home/state/wa-watch.check.sh" "$home/state/wa-watch.check-trust" \
+    "$home/config/wa-mode.env"
+
+  out=$(FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null \
+    | grep '^WA:' || true)
+  assert_contains "$out" 're-armed' \
+    "session start left a configured home unable to hear the captain"
+  assert_present "$home/state/wa-watch.check.sh" "session start did not restore the check shim"
+  assert_present "$home/state/wa-watch.check-trust" "session start did not restore the registration"
+  assert_present "$home/config/wa-mode.env" "session start did not restore the watcher cadence"
+
+  # Idempotent and silent: with the channel already armed it changes nothing.
+  out=$(FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null \
+    | grep '^WA:' || true)
+  [ -z "$out" ] || fail "an already-armed home was reported again: $out"
+
+  # And a home that never opted in is untouched, exactly as before.
+  home="$TMP_ROOT/rearm-none"
+  mkdir -p "$home/state" "$home/config"
+  chmod 700 "$home/state"
+  out=$(FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null \
+    | grep '^WA:' || true)
+  [ -z "$out" ] || fail "a home that never opted in was armed by session start: $out"
+  assert_absent "$home/state/wa-watch.check.sh" "session start armed an unconfigured home"
+
+  pass "a configured home whose arming artifacts went missing arms itself again"
+}
+
+# --- opting out takes the captain's words with it ---------------------------
+
+SECRET_TEXT='meet me at the harbour at dawn'
+
+# Everything an opted-out home must not still be holding, written by hand so the
+# assertion is about content rather than about which cycle happened to create
+# what.
+seed_message_state() {
+  local home=$1
+  mkdir -p "$home/state/wa-inbox" "$home/state/wa-seen" "$home/state/wa-sent" \
+    "$home/state/wa-outbox"
+  printf '{"schema":"fm-wa-inbox-v1","id":"MSGSECRET","text":"%s"}\n' "$SECRET_TEXT" \
+    > "$home/state/wa-inbox/MSGSECRET.json"
+  printf '%s\n' "$SECRET_TEXT" > "$home/state/wa-seen/MSGSECRET.seen"
+  : > "$home/state/wa-sent/abc123.sent"
+  printf '{"text":"%s"}\n' "$SECRET_TEXT" > "$home/state/wa-outbox/1-1.json"
+  printf '1700000000\n' > "$home/state/wa-watermark"
+  printf 'deadbeef\n' > "$home/state/wa-poll.offered"
+  printf 'some earlier fault\n' > "$home/state/wa-poll.error"
+  printf 'stashed %s\n' "$SECRET_TEXT" > "$home/state/wa-listener.log"
+  printf '{"state":"connected"}\n' > "$home/state/wa-listener.status"
+  printf '1\n' > "$home/state/wa-listener.beat"
+}
+
+assert_no_trace_of_the_captain() {
+  local home=$1 what=$2 hit
+  hit=$(grep -rl -- "$SECRET_TEXT" "$home" 2>/dev/null | head -n 1)
+  [ -z "$hit" ] || fail "$what left the captain's own words behind in $hit"
+  assert_absent "$home/state/wa-inbox" "$what left the stashed messages behind"
+  assert_absent "$home/state/wa-seen" "$what left the per-message markers behind"
+  assert_absent "$home/state/wa-sent" "$what left the outbound digests behind"
+  assert_absent "$home/state/wa-outbox" "$what left the dry-run records behind"
+  assert_absent "$home/state/wa-watermark" "$what left the watermark behind"
+  assert_absent "$home/state/wa-poll.offered" "$what left the announcement marker behind"
+  assert_absent "$home/state/wa-poll.error" "$what left the poll's fault record behind"
+  assert_absent "$home/state/wa-listener.log" "$what left the listener log behind"
+}
+
+test_the_retiring_cycle_clears_the_captains_messages() {
+  local home out pid
+  home="$TMP_ROOT/optoutwipe"
+  new_home "$home"
+  fake_listener "$home"
+  pid=$(cat "$home/state/wa-listener.pid")
+  seed_message_state "$home"
+  printf 'unrelated\n' > "$home/state/keepme"
+  printf 'export FM_CHECK_INTERVAL=30\n' > "$home/config/x-mode.env"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
+
+  rm -f "$home/config/whatsapp.env"
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "the retiring cycle spoke while cleaning up normally: $out"
+
+  if kill -0 "$pid" 2>/dev/null; then
+    fail "the retiring cycle cleared the records while the listener was still running"
+  fi
+  assert_no_trace_of_the_captain "$home" "the retiring cycle"
+  assert_present "$home/state/keepme" "the retiring cycle removed an unrelated state file"
+  assert_present "$home/config/x-mode.env" "the retiring cycle removed Relay's cadence file"
+
+  # Idempotent with nothing left to clear.
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "a second retiring cycle spoke: $out"
+
+  pass "switching the channel off clears the captain's stashed messages, not just the shim"
+}
+
+test_unpair_clears_the_messages_only_once_the_channel_is_off() {
+  local home out
+  # A re-pair, with the channel still on: the credentials go, the captain's
+  # undrained messages and the watermark that protects them do not.
+  home="$TMP_ROOT/repairkeeps"
+  new_home "$home"
+  seed_message_state "$home"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" unpair 2>&1) \
+    || fail "unpair failed during a re-pair: $out"
+  assert_present "$home/state/wa-inbox/MSGSECRET.json" \
+    "re-pairing destroyed a message the captain had sent and firstmate had not read"
+  assert_present "$home/state/wa-watermark" \
+    "re-pairing dropped the watermark, so old messages can replay as new instructions"
+
+  # The last step of switching the channel off: everything goes.
+  home="$TMP_ROOT/unpairwipe"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  seed_message_state "$home"
+  rm -f "$home/config/whatsapp.env"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" unpair 2>&1) \
+    || fail "unpair refused with the channel already off: $out"
+  assert_contains "$out" 'cleared' "unpair did not report clearing the stashed messages"
+  assert_absent "$home/state/wa-auth" "unpair left this listener's credentials behind"
+  assert_no_trace_of_the_captain "$home" "unpair with the channel off"
+
+  pass "unpair clears the stashed messages when it is a teardown, and never on a re-pair"
+}
+
+# The echo marker outlives the send by the listener's whole echo window, so a
+# reply that was never even attempted must not leave one: the captain saying
+# those same words back would be dropped as firstmate's own echo, from his side
+# silently.
+test_a_send_without_mudslide_leaves_no_echo_trap() {
+  local home out bin
+  home="$TMP_ROOT/nomudslide"
+  new_home "$home"
+  printf 'on it\n' > "$TMP_ROOT/nomudslide-reply.txt"
+  bin="$TMP_ROOT/nomudslide-bin"
+  path_excluding "$bin" mudslide
+
+  out=$(PATH="$bin" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/nomudslide-reply.txt" 2>&1) \
+    && fail "the send reported success with no mudslide installed: $out"
+  assert_contains "$out" 'mudslide is not installed' "the failed send did not say why"
+
+  [ -z "$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null)" ] \
+    || fail "a send that could never happen left an echo marker behind"
+
+  pass "a send with no mudslide installed leaves no digest to swallow the captain"
+}
+
+test_an_unreadable_config_is_never_an_opt_out
+test_an_unconfigured_home_is_still_silent
+test_a_configured_home_rearms_itself_at_session_start
+test_the_retiring_cycle_clears_the_captains_messages
+test_unpair_clears_the_messages_only_once_the_channel_is_off
+test_a_send_without_mudslide_leaves_no_echo_trap

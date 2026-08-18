@@ -100,6 +100,68 @@ fm_wa_load_config() {
   esac
 }
 
+# Whether this home's channel configuration is CONFIRMED gone, as distinct from
+# merely unreadable.
+#
+# fm_wa_load_config above answers one question - is the channel usable right now
+# - and every reason it can answer no looks identical from the outside: the file
+# deliberately removed, a permission failure, the instant an editor has
+# truncated it to rewrite it. Acting destructively on all three means one
+# unlucky read stops the listener and retires the poll, after which nothing
+# polls this home again and the captain messages a home that will never answer
+# without being able to tell that apart from being ignored.
+#
+# So the destructive answer gets its own question. Returns 0 only when the file
+# is definitively not there AND this process could have seen it if it were.
+# Present, a directory that cannot be listed, or an override in force are all 1,
+# which every caller reads as "change nothing".
+fm_wa_config_confirmed_absent() {
+  local file dir
+  fm_wa_paths
+  [ -z "${FM_WA_CAPTAIN_OVERRIDE:-}" ] || return 1
+  file="${FM_WA_ENV_FILE:-$FM_WA_CONFIG_DIR/whatsapp.env}"
+  if [ -e "$file" ] || [ -L "$file" ]; then
+    return 1
+  fi
+  dir=${file%/*}
+  [ "$dir" != "$file" ] || dir=.
+  [ -d "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ]
+}
+
+# Everything this home generated for the channel that holds the captain's own
+# words, or points at them: the stashed messages themselves, the per-message
+# markers, the outbound digests and dry-run records, the watermark, the poll's
+# own markers, and the listener log and health records.
+#
+# Switching the channel off is meant to mean gone rather than mostly gone. His
+# message text sits in state/wa-inbox/ as plain JSON, and everything beside it
+# is a record of what he said and when, so a teardown that left it there would
+# be claiming more than it did.
+#
+# Only this home's own generated WhatsApp state is ever removed, and only by
+# explicit name - never a sweep, never anything else under state/ or config/.
+# The linked-device credentials are deliberately NOT here: they are what
+# bin/fm-wa-listen.sh unpair owns, and removing them costs a trip to the
+# captain's phone. Idempotent and silent with nothing to remove.
+fm_wa_purge_channel_state() {
+  rm -rf -- \
+    "$FM_WA_INBOX" \
+    "$FM_WA_SEEN" \
+    "$FM_WA_SENT" \
+    "$FM_WA_OUTBOX" 2>/dev/null || true
+  rm -f -- \
+    "$FM_WA_STATE/wa-watermark" \
+    "$FM_WA_OFFERED" \
+    "$FM_WA_ERROR" \
+    "$FM_WA_LOG" \
+    "$FM_WA_STATE/wa-listener.status" \
+    "$FM_WA_STATE/wa-listener.beat" \
+    "$FM_WA_STATE/wa-listener.error" \
+    "$FM_WA_STATE"/wa-listener.error.* \
+    "$FM_WA_STATE/wa-listener.restart" \
+    "$FM_WA_STATE/wa-listener.restarts" 2>/dev/null || true
+}
+
 # A private directory owned by this user, no symlink, no group or other access.
 fm_wa_private_dir() {
   local dir=$1

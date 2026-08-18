@@ -11,7 +11,10 @@
 #                                captain types into WhatsApp on his phone; each
 #                                code lives a couple of minutes, so --rounds
 #                                keeps issuing a fresh one when the last expires
-#   fm-wa-listen.sh unpair       delete this listener's credentials only
+#   fm-wa-listen.sh unpair       delete this listener's credentials; with the
+#                                channel already off it is the last step of
+#                                switching it off, so it clears the captain's
+#                                stashed messages and channel records too
 #   fm-wa-listen.sh logs [n]     tail the listener log
 #
 # The listener holds its OWN linked-device credentials in state/wa-auth, which
@@ -24,7 +27,8 @@
 # because they act as the captain and need the identity that is gone. stop,
 # unpair, logs and status deliberately keep working without it: a listener
 # outlives the config that started it, and a cleanup path that needs the thing
-# it is cleaning up is not a cleanup path.
+# it is cleaning up is not a cleanup path. Whether the channel is off is also
+# what tells a re-pair from a teardown, which is why only unpair reads it.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,7 +41,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 LISTENER="$SCRIPT_DIR/fm-wa-listen.mjs"
 
 usage() {
-  sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # Starting and pairing act AS the captain, so they genuinely need his identity.
@@ -257,7 +261,8 @@ cmd_pair() {
 }
 
 cmd_unpair() {
-  optional_config || true
+  local channel_on=''
+  optional_config && channel_on=1
   # Credentials must never be pulled out from under a process that is still
   # using them, and a stop this cannot prove it owns is a stop that did not
   # happen, so an unprovable pid stops the unpair rather than being worked
@@ -272,6 +277,17 @@ cmd_unpair() {
     echo "removed this listener's credentials; mudslide's session is untouched"
   else
     echo "no listener credentials to remove"
+  fi
+  # Unpair is two commands wearing one name: the middle step of a re-pair, and
+  # the last step of switching the channel off. Only the second may take the
+  # captain's stashed messages with it. Clearing them during a re-pair would
+  # destroy instructions he has sent and firstmate has not read yet, and drop
+  # the watermark that stops WhatsApp's own redelivery from replaying old
+  # messages as new ones. The channel being off is what tells the two apart, so
+  # this is a teardown only once the configuration is gone.
+  if [ -z "$channel_on" ]; then
+    fm_wa_purge_channel_state
+    echo "cleared this home's stashed WhatsApp messages and channel records"
   fi
 }
 

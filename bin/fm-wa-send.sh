@@ -71,6 +71,17 @@ TO=${TO:-$FM_WA_CAPTAIN}
 TO=$(printf '%s' "$TO" | tr -cd '0-9')
 [ -n "$TO" ] || { echo "error: recipient must be a number in international form" >&2; exit 1; }
 
+# Proved present BEFORE the echo marker below is written, not after it. The
+# marker outlives this command by the listener's whole echo window, and a marker
+# left behind by a reply that never went out is exactly what swallows the
+# captain saying those same words himself. Both failure paths further down drop
+# the marker for that reason; this one refuses before there is one to drop. A
+# dry run sends nothing, so it needs no mudslide and is not held to this.
+if [ -z "$FM_WA_DRY_RUN" ] && ! command -v mudslide >/dev/null 2>&1; then
+  echo "error: mudslide is not installed" >&2
+  exit 1
+fi
+
 # Normalized digest, matching what the listener computes on inbound text.
 # The marker is short-lived by contract: the listener ignores and prunes any
 # digest older than its echo window, so a reply the captain never echoes back
@@ -103,8 +114,6 @@ if [ -n "$FM_WA_DRY_RUN" ]; then
   echo "error: cannot record the dry-run reply" >&2
   exit 1
 fi
-
-command -v mudslide >/dev/null 2>&1 || { echo "error: mudslide is not installed" >&2; exit 1; }
 
 # Single argv element: the shell never re-parses the captain's words. `--` ends
 # mudslide's own option parsing before the positionals, so a reply that opens
