@@ -198,10 +198,13 @@
 #   The memory guard below refuses a spawn that would overcommit the machine:
 #   FM_MAX_CREWS      hard cap on concurrent crews (default 8)
 #   FM_MIN_FREE_MB    refuse to spawn below this much available memory (default 6000)
-#   FM_SPAWN_FORCE=1  override both, deliberately
+#   FM_SPAWN_FORCE=1  override both, deliberately; empty, 0, no, off or false
+#                     leaves the guard on, and any other value is refused
 #   The cap counts this home's live crews and ignores persistent secondmates. It
-#   does not apply to --relaunch, which replaces a crew rather than adding one,
-#   and neither refusal applies to a remote secondmate, whose agent runs on
+#   does not apply to a spawn that REPLACES an already-registered agent rather
+#   than adding one - a --relaunch, or a --secondmate respawn whose task record
+#   already exists - while new secondmate provisioning is capped like any other
+#   new crew. Neither refusal applies to a remote secondmate, whose agent runs on
 #   another host and consumes none of this machine's memory.
 set -eu
 
@@ -292,6 +295,7 @@ fm_refuse_if_gate_agent
 fm_guard_scan_args() {
   local a want_value=
   GUARD_RELAUNCH=0
+  GUARD_SECONDMATE=0
   GUARD_TASK_ID=
   for a in "$@"; do
     if [ -n "$want_value" ]; then
@@ -300,6 +304,7 @@ fm_guard_scan_args() {
     fi
     case "$a" in
       --relaunch) GUARD_RELAUNCH=1 ;;
+      --secondmate) GUARD_SECONDMATE=1 ;;
       --harness|--model|--effort|--backend|--mode|--yolo|--traceparent) want_value=1 ;;
       --*) ;;
       *) [ -n "$GUARD_TASK_ID" ] || GUARD_TASK_ID=$a ;;
@@ -350,16 +355,36 @@ fm_guard_available_mb() {
   ' || true
 }
 
+# The cap counts NEW crews. A spawn that REPLACES an already-registered agent
+# adds nothing to the machine, so a cap meant for new work has no business
+# refusing it. For a --relaunch the ordering makes that destructive precisely
+# when recovery matters most: bin/fm-control.sh's do_exit has already stopped
+# the old worker by the time this runs, so a refusal here would leave the task
+# with a recorded endpoint and no agent. A --secondmate spawn whose task record
+# already exists is the same shape - bin/fm-bootstrap.sh's liveness sweep
+# respawns a secondmate whose agent is already gone - while new secondmate
+# provisioning, which has no record yet, stays capped like any other new crew.
+# The memory branch still applies to every one of these, because the replacement
+# occupies the machine whatever it replaces.
+fm_guard_cap_exempt() {
+  [ "$GUARD_RELAUNCH" -eq 0 ] || return 0
+  [ "$GUARD_SECONDMATE" -eq 1 ] || return 1
+  [ -n "$GUARD_TASK_ID" ] || return 1
+  [ -f "$STATE/$GUARD_TASK_ID.meta" ]
+}
+
 fm_memory_guard() {
   local cap minfree live avail meta
   # Only the documented override disables the guard. Treating any non-empty
   # value as force turned FM_SPAWN_FORCE=0 - the natural way to write "off"
-  # after exporting it once - into a full override.
+  # after exporting it once - into a full override, and accepting spellings the
+  # header and the refusal below both call invalid let one of them silently
+  # bypass the whole guard.
   case "${FM_SPAWN_FORCE:-}" in
     ''|0|no|off|false) ;;
-    1|yes|on|true) return 0 ;;
+    1) return 0 ;;
     *)
-      echo "error: FM_SPAWN_FORCE must be 1 to override the spawn guard, or empty to leave it on, not '$FM_SPAWN_FORCE'" >&2
+      echo "error: FM_SPAWN_FORCE must be 1 to override the spawn guard, or empty, 0, no, off or false to leave it on, not '$FM_SPAWN_FORCE'" >&2
       return 1
       ;;
   esac
@@ -368,13 +393,7 @@ fm_memory_guard() {
   fm_guard_whole_number FM_MAX_CREWS "$cap" || return 1
   fm_guard_whole_number FM_MIN_FREE_MB "$minfree" || return 1
   fm_guard_spawn_is_remote "$GUARD_TASK_ID" && return 0
-  # A relaunch REPLACES a crew rather than adding one, so a concurrency cap has
-  # no business refusing it. The ordering makes that destructive precisely when
-  # recovery matters most: bin/fm-control.sh's do_exit has already stopped the
-  # old worker by the time this runs, so a refusal here leaves the task with a
-  # recorded endpoint and no agent. The memory branch below still applies,
-  # because the replacement occupies the machine whatever it replaces.
-  if [ "$GUARD_RELAUNCH" -eq 0 ]; then
+  if ! fm_guard_cap_exempt; then
     live=0
     for meta in "$STATE"/*.meta; do
       [ -f "$meta" ] || continue
@@ -384,7 +403,7 @@ fm_memory_guard() {
       [ "$(fm_meta_get "$meta" kind)" != secondmate ] || continue
       live=$((live + 1))
     done
-    if [ "${live:-0}" -ge "$cap" ]; then
+    if [ "$live" -ge "$cap" ]; then
       printf 'refusing to spawn: %s crews already live (cap %s).
 ' "$live" "$cap" >&2
       printf '  Crews are multi-GB each; exceeding this has hard-locked the machine.

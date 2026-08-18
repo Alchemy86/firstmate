@@ -34,6 +34,14 @@ FM_TEST_LIB_SOURCED=1
 # strips this to verify real refusal.
 export FM_GATE_REFUSE_BYPASS=1
 
+# Exempt firstmate's own test suite from the spawn memory guard for the same
+# reason. Dozens of suites drive the real fm-spawn, and the guard refuses below
+# FM_MIN_FREE_MB of available memory, so without this the whole suite silently
+# depends on how much memory the host happens to have free - and fails hardest on
+# a loaded machine, which is exactly where firstmate's own validation runs.
+# tests/fm-spawn-memory-guard.test.sh strips this to verify real refusal.
+export FM_SPAWN_FORCE=1
+
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.
 # shellcheck disable=SC2034

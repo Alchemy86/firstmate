@@ -219,8 +219,45 @@ test_remote_secondmate_skips_the_guard() {
     > "$home/data/secondmates.md"
   out=$(FM_MIN_FREE_MB=99999999 FM_SSH_BIN=/bin/false run_spawn_args "$home" rsm --secondmate)
   assert_not_contains "$out" "$REFUSAL" 'a remote secondmate must not be refused by local resources'
-  assert_contains "$out" 'rsm' 'a remote secondmate spawn must reach its own route handling'
+  assert_contains "$out" 'is not ready for a remote second mate' \
+    'a remote secondmate spawn must reach its own remote route handling'
   pass 'a remote secondmate skips the guard'
+}
+
+# The liveness sweep respawns a dead LOCAL secondmate with --secondmate, not
+# --relaunch. Its record already exists, so the spawn replaces an agent that is
+# already gone rather than adding one, and refusing it at cap would leave the
+# secondmate down until an operator intervened.
+test_local_secondmate_respawn_is_not_refused_by_the_cap() {
+  local home out
+  home=$(make_home secondmate-respawn 8)
+  printf 'kind=secondmate\n' > "$home/state/sm.meta"
+  out=$(FM_MIN_FREE_MB=1 run_spawn_args "$home" sm --secondmate)
+  assert_not_contains "$out" "$REFUSAL" 'the cap must not refuse a respawn of a registered secondmate'
+  assert_contains "$out" 'no firstmate home supplied or registered for sm' \
+    'a secondmate respawn must reach ordinary secondmate handling'
+  pass 'a local secondmate respawn is not refused by the cap'
+}
+
+# Provisioning a NEW secondmate has no record yet, so it adds a crew and stays
+# capped like any other new work.
+test_new_secondmate_provisioning_is_still_capped() {
+  local home out rc
+  home=$(make_home secondmate-new 8)
+  out=$(FM_MIN_FREE_MB=1 run_spawn_args "$home" sm --secondmate); rc=$?
+  expect_code 1 "$rc" 'new secondmate provisioning must be refused at cap'
+  assert_contains "$out" '8 crews already live (cap 8)' 'the cap must still apply to new provisioning'
+  pass 'new secondmate provisioning is still capped'
+}
+
+test_local_secondmate_respawn_still_honours_the_memory_refusal() {
+  local home out rc
+  home=$(make_home secondmate-respawn-mem 0)
+  printf 'kind=secondmate\n' > "$home/state/sm.meta"
+  out=$(FM_MAX_CREWS=99 FM_MIN_FREE_MB=99999999 run_spawn_args "$home" sm --secondmate); rc=$?
+  expect_code 1 "$rc" 'a secondmate respawn below the memory threshold must refuse'
+  assert_contains "$out" "$REFUSAL" 'a secondmate respawn must still be refused when memory is short'
+  pass 'a local secondmate respawn still honours the memory refusal'
 }
 
 # A non-numeric knob used to make the comparison exit 2, which inside an `if` is
@@ -261,6 +298,18 @@ test_unrecognised_force_value_is_refused() {
   pass 'an unrecognised FM_SPAWN_FORCE value is refused'
 }
 
+# Only the documented value overrides. A spelling the header and the refusal
+# both call invalid must not silently bypass the whole guard.
+test_undocumented_force_spelling_is_refused() {
+  local home out rc
+  home=$(make_home force-true 9)
+  out=$(FM_MIN_FREE_MB=1 FM_SPAWN_FORCE=true run_spawn "$home"); rc=$?
+  expect_code 1 "$rc" 'an undocumented FM_SPAWN_FORCE spelling must refuse'
+  assert_contains "$out" 'FM_SPAWN_FORCE must be 1' 'the refusal must name the documented value'
+  assert_not_contains "$out" "$PASSED_GUARD" 'an undocumented spelling must not bypass the guard'
+  pass 'an undocumented FM_SPAWN_FORCE spelling is refused'
+}
+
 test_cap_refuses_when_live_crews_reach_the_cap
 test_cap_refuses_above_the_cap
 test_cap_allows_below_the_cap
@@ -277,9 +326,13 @@ test_secondmate_metas_are_not_counted_as_live_crews
 test_relaunch_is_not_refused_by_the_cap
 test_relaunch_still_honours_the_memory_refusal
 test_remote_secondmate_skips_the_guard
+test_local_secondmate_respawn_is_not_refused_by_the_cap
+test_new_secondmate_provisioning_is_still_capped
+test_local_secondmate_respawn_still_honours_the_memory_refusal
 test_non_numeric_cap_is_refused_by_name
 test_non_numeric_min_free_is_refused_by_name
 test_force_off_does_not_override_the_guard
 test_unrecognised_force_value_is_refused
+test_undocumented_force_spelling_is_refused
 
 echo "# all fm-spawn-memory-guard tests passed"
