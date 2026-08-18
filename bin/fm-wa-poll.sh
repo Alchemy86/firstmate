@@ -21,7 +21,8 @@
 #   an inbox that stayed pending past FM_WA_REANNOUNCE seconds
 #                                    -> re-announce once, so a message firstmate
 #                                       failed to drain is not lost silently
-#   listener down but paired         -> restart it in the background, rate-limited
+#   listener down, or alive with a
+#   connection that is not working   -> restart it in the background, rate-limited
 #   a configuration or listener fault -> one rate-limited "wa-channel-error ..."
 #
 # It is also the channel's janitor, silently: the listener log is capped, and
@@ -204,23 +205,46 @@ listener_down_age() {
   fi
 }
 
+# A wedged listener holds its pid forever, so reporting it is not enough: only
+# a replacement process can bring the channel back. The stale beat goes with it,
+# because it belongs to the process that stopped writing it and would otherwise
+# make the fresh listener look wedged from its first cycle.
+stop_wedged_listener() {
+  local pid=$1 waited=0
+  kill "$pid" 2>/dev/null || true
+  while [ "$waited" -lt 3 ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  kill -0 "$pid" 2>/dev/null && return 1
+  rm -f -- "$FM_WA_PIDFILE" "$LISTENER_BEAT" 2>/dev/null || true
+  return 0
+}
+
 # Keep the one long-lived connection up without ever blocking this check: the
 # start is a detached background spawn and its outcome is reported next cycle.
 # A pid alone is not health, so a live listener is still judged by the state it
 # reports and by its beat.
 ensure_listener() {
-  local state fails
+  local state fails pid
   state=$(listener_state)
-  if fm_wa_listener_pid >/dev/null 2>&1; then
+  if pid=$(fm_wa_listener_pid 2>/dev/null); then
     if [ "$(listener_down_age)" -ge "$STALL_INTERVAL" ]; then
+      # Reported AND repaired: the restart below runs on the same budget that
+      # bounds a crash loop, so a channel that cannot recover still latches
+      # instead of respawning forever.
       if [ -f "$LISTENER_BEAT" ]; then
-        emit_listener_error "WhatsApp listener is running but its connection is down; see state/wa-listener.log"
+        emit_listener_error "WhatsApp listener is running but its connection is down; restarting it, see state/wa-listener.log"
       else
-        emit_listener_error "WhatsApp listener is running but its connection has never come up; see state/wa-listener.log"
+        emit_listener_error "WhatsApp listener is running but its connection has never come up; restarting it, see state/wa-listener.log"
       fi
-      return 1
+      stop_wedged_listener "$pid" || return 1
+    else
+      return 0
     fi
-    return 0
   fi
   if [ "$state" = "logged-out" ]; then
     emit_listener_error "WhatsApp listener was logged out; re-pair with bin/fm-wa-listen.sh unpair then pair"
@@ -233,7 +257,7 @@ ensure_listener() {
   fails=$(restart_failures)
   if [ "$fails" -ge "$RESTART_FAIL_LIMIT" ] \
     && [ "$(fm_wa_age_of "$RESTART_FAILS")" -lt "$LATCH_RETRY_INTERVAL" ]; then
-    emit_listener_error "WhatsApp listener keeps exiting after restart; see state/wa-listener.log, then run bin/fm-wa-listen.sh start"
+    emit_listener_error "WhatsApp listener will not stay healthy after restart; see state/wa-listener.log, then run bin/fm-wa-listen.sh restart"
     return 1
   fi
   if [ "$(fm_wa_age_of "$RESTART_MARKER")" -lt "$RESTART_INTERVAL" ]; then
@@ -273,8 +297,10 @@ FOUND=$(find "$FM_WA_INBOX" -maxdepth 1 -name '*.json' -type f 2>/dev/null \
 
 # An entry whose stem cannot be used as an id is dropped from the set rather
 # than aborting the announcement: total silence is the one outcome this channel
-# exists to prevent, and the messages behind it are real. The listener's own id
-# check keeps this unreachable through the normal path.
+# exists to prevent, and the messages behind it are real. It is still reported,
+# on the first cycle that has no announcement to make, so it cannot outlive
+# every drain unseen. The listener's own id check keeps this unreachable through
+# the normal path.
 PENDING=
 UNUSABLE=
 while IFS= read -r entry; do
@@ -308,6 +334,11 @@ SIG=$(printf '%s\n' "$PENDING" | fm_wa_sha256) || exit 0
 # Same pending set as the last announcement, and not yet stale enough to repeat.
 if [ "$(cat "$FM_WA_OFFERED" 2>/dev/null)" = "$SIG" ] \
   && [ "$(fm_wa_age_of "$FM_WA_OFFERED")" -lt "$FM_WA_REANNOUNCE" ]; then
+  # An announcement always wins the cycle it is made on, so a skipped entry is
+  # reported here instead: an otherwise quiet cycle is the only place a second
+  # line can go without burying the messages, and the fault is deduped for an
+  # hour so it is said once rather than every cycle.
+  [ -z "$UNUSABLE" ] || emit_poll_error "inbox holds an unusable message id"
   exit 0
 fi
 

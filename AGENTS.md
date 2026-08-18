@@ -77,6 +77,7 @@ config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitig
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/x-mode.env    generated Relay watcher cadence; LOCAL, gitignored; source before arming watcher when present
 config/whatsapp.env  optional inbound WhatsApp channel; LOCAL, gitignored; a non-empty FM_WA_CAPTAIN is the whole switch and its absence keeps every WhatsApp entry point a hard no-op; not inherited by secondmate homes; see docs/whatsapp-channel.md
+config/wa-mode.env   generated inbound WhatsApp watcher cadence, written by arming that channel; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
   captain.md         this home's domain-local captain preferences and working style; LOCAL, gitignored, canonical even if harness memory mirrors it, and updated with inspect-then-update
@@ -113,6 +114,7 @@ state/               runtime records and signals; gitignored
   x-inbox/           generated Relay pending mention payloads; fmx-respond drains it (section 14)
   x-context/         generated Relay durable per-request reply context and one-wake offer markers, keyed by request_id; survives inbox cleanup and expires within seven days (section 14; bin/fm-x-lib.sh)
   x-outbox/          generated Relay dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
+  wa-watch.check.sh  generated inbound WhatsApp poll shim; present only when that channel is armed, and its presence alone keeps supervision required exactly as a Relay poll does
   wa-inbox/          generated inbound WhatsApp messages from the captain, one JSON file per message; wa-respond drains it (docs/whatsapp-channel.md)
   wa-auth/ wa-seen/ wa-sent/ wa-outbox/  generated WhatsApp listener credentials for its own linked device, durable per-message markers, outbound echo digests, and FM_WA_DRY_RUN previews; never mudslide's own session folder
   public-followup/   generated private transport for promised public replies: commitment registrations, typed terminal-result inbox, accepted/rejected ledgers (section 14; bin/fm-public-followup.sh)

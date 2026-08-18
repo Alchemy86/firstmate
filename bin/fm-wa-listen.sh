@@ -79,6 +79,10 @@ cmd_start() {
   fi
   fm_wa_private_dir "$FM_WA_STATE" || { echo "error: state directory is unavailable" >&2; return 1; }
   fm_wa_private_dir "$FM_WA_AUTH_DIR" || { echo "error: credential directory is unavailable" >&2; return 1; }
+  # The beat belongs to the process that wrote it. Left behind, the previous
+  # listener's last beat makes this one look wedged from its very first cycle,
+  # and the poll would stop it again before it ever connected.
+  rm -f -- "$FM_WA_STATE/wa-listener.beat" 2>/dev/null || true
   ( umask 077
     FM_WA_STATE="$FM_WA_STATE" \
     FM_WA_AUTH_DIR="$FM_WA_AUTH_DIR" \
@@ -126,6 +130,10 @@ cmd_stop() {
   kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
   rm -f -- "$FM_WA_PIDFILE"
   echo "listener stopped"
+  if [ -f "$FM_WA_STATE/wa-watch.check.sh" ]; then
+    echo "note: the armed check restarts it within a couple of minutes;"
+    echo "      run bin/fm-wa-setup.sh disarm first to keep it down"
+  fi
 }
 
 cmd_status() {

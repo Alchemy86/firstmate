@@ -20,6 +20,25 @@ It is the same shape Relay uses for public mentions, for the same reasons:
 Nothing in `bin/fm-watch.sh`, `bin/fm-watch-arm.sh`, `bin/fm-wake-lib.sh` or the away-mode daemon changes.
 The check runs through the ordinary registered-custom-check path that firstmate already uses for a task's merge poll: `bin/fm-wa-setup.sh arm` writes the shim and binds it with `bin/fm-check-register.sh`, and the watcher hashes it against that binding before running it.
 
+### An armed channel keeps a watcher running
+
+An armed `state/wa-watch.check.sh` counts as a reason to supervise the home, exactly as Relay's `state/x-watch.check.sh` does.
+Without that, an idle home with no work in flight arms no watcher at all, so the poll would never run and the captain's messages would pile up in `state/wa-inbox/` with nothing to announce them.
+That is the normal case rather than the edge case: the captain messages from his phone precisely when nothing is running, to start something.
+
+The predicate lives in `bin/fm-supervision-lib.sh` and is what the turn-end guards and the watcher-liveness warning already read.
+A home that has not armed the channel has no such file and is unaffected.
+
+### Cadence
+
+Arming also writes `config/wa-mode.env`, the generated watcher cadence, the same way `bin/fm-bootstrap.sh` writes `config/x-mode.env` for Relay.
+It exports `FM_CHECK_INTERVAL=30`, so a message is picked up within seconds instead of waiting up to the default five minutes for the next sweep.
+It is the same value Relay uses, so a home running both cannot end up with two cadences that disagree.
+
+Source it before launching a watcher process.
+The emitted session-start supervision block names the file when it exists, and the hook-owned arm paths (`bin/fm-claude-stop-autoarm.sh`, `bin/fm-turnend-guard-cursor.sh`) source it themselves.
+`bin/fm-wa-setup.sh disarm` removes it again, and the home reverts to the default cadence on the next supervision cycle.
+
 ### Deliberately not reported at session start
 
 Relay lists a pending public commitment in the session-start digest; this channel deliberately does not list a pending inbox there.
@@ -128,7 +147,12 @@ Restart history is only cleared once no restart has been needed for an hour, so 
 
 Spent restarts stop the automatic ones, but never permanently.
 The poll tries again an hour after the last attempt, so a channel held down by something transient - no network at boot, a host that was asleep - comes back on its own.
-`bin/fm-wa-listen.sh start` run by hand releases the block immediately, and the reported fault line names that command.
+`bin/fm-wa-listen.sh restart` run by hand releases the block immediately, and the reported fault line names that command.
+`start` is not the same repair: it reports a listener that is already running and changes nothing, which is why the fault line and the `wa-respond` skill both name `restart`.
+
+An alive listener whose connection is down is stopped and replaced rather than only reported.
+The replacement is spawned on the same restart budget that bounds a crash loop, so a channel that cannot recover still latches and reports instead of respawning forever.
+Starting a listener drops the previous process's beat, because a beat belongs to the process that wrote it and a stale one would make the new listener look wedged from its first cycle.
 
 The poll is also the channel's janitor.
 `state/wa-listener.log` is capped at 256KB by rewriting it in place, which leaves the running listener's append handle intact.
@@ -140,6 +164,7 @@ Exactly one line comes out of a cycle.
 A cycle that reports a fault does not also announce the inbox, because the two mean different things to `wa-respond` and the watcher would fold them into a single wake.
 The fault is deduped, so pending messages are announced on the next cycle rather than being buried behind it.
 For the same reason an inbox entry whose name cannot be used as a message id is skipped rather than aborting the announcement: the real messages beside it are still announced, and only an inbox with nothing usable left in it reports the fault instead.
+The skipped entry is still reported, on the first cycle that has no announcement to make, so it cannot sit in the inbox outliving every drain unseen.
 
 ### 4. Confirm
 
@@ -199,8 +224,8 @@ Every entry point checks the config first and exits silently when it is gone: no
 To remove the artifacts too:
 
 ```sh
-bin/fm-wa-setup.sh disarm       # removes the check shim and its registration
-bin/fm-wa-listen.sh stop        # stops the listener
+bin/fm-wa-setup.sh disarm       # removes the check shim, its registration, and the cadence
+bin/fm-wa-listen.sh stop        # stops the listener (disarm first, or the check restarts it)
 bin/fm-wa-listen.sh unpair      # removes this device's credentials
 ```
 
@@ -215,7 +240,8 @@ bin/fm-wa-listen.sh unpair      # removes this device's credentials
 | `bin/fm-wa-listen.sh` | start, stop, status, pair, unpair, logs |
 | `bin/fm-wa-poll.sh` | the bounded check: inbox read plus listener nudge |
 | `bin/fm-wa-send.sh` | outbound via mudslide, with dry-run and echo marker |
-| `bin/fm-wa-setup.sh` | arm and disarm the check shim |
+| `bin/fm-wa-setup.sh` | arm and disarm the check shim and the watcher cadence |
+| `config/wa-mode.env` | generated 30s watcher cadence; present only while armed |
 | `.agents/skills/wa-respond/SKILL.md` | what to do with a message once it lands |
 | `state/wa-inbox/` | pending messages, one JSON file each |
 | `state/wa-seen/` | durable per-message markers, outlive the inbox file |

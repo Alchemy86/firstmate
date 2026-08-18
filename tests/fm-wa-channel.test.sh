@@ -40,13 +40,27 @@ poll() {
 }
 
 # A paired, running listener, so a test about the inbox is not answered by the
-# liveness nudge instead.
+# liveness nudge instead. The pid is a disposable process rather than this test
+# runner, because the poll repairs a wedged listener by stopping it.
+FAKE_PIDS=
 fake_listener() {
-  local home=$1
+  local home=$1 pid
   mkdir -p "$home/state/wa-auth"
   printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
-  printf '%s\n' $$ > "$home/state/wa-listener.pid"
+  sleep 300 &
+  pid=$!
+  FAKE_PIDS="$FAKE_PIDS $pid"
+  printf '%s\n' "$pid" > "$home/state/wa-listener.pid"
 }
+
+reap_fake_listeners() {
+  local pid
+  for pid in $FAKE_PIDS; do
+    kill "$pid" 2>/dev/null || true
+  done
+  FAKE_PIDS=
+}
+trap 'reap_fake_listeners; fm_test_cleanup' EXIT
 
 # --- the channel is inert until a home opts in ------------------------------
 
@@ -218,7 +232,7 @@ test_repeated_listener_exits_are_reported() {
 
   out=$(poll "$home")
   assert_contains "$out" 'wa-channel-error' "a listener that keeps exiting was never surfaced"
-  assert_contains "$out" 'keeps exiting' "the report did not name the repeated exits"
+  assert_contains "$out" 'will not stay healthy' "the report did not name the repeated exits"
 
   pass "a listener that dies on every restart is reported rather than respawned forever"
 }
@@ -336,8 +350,8 @@ test_a_spent_restart_block_releases_itself_after_a_while() {
 
   # A block that was spent moments ago still reports rather than respawning...
   out=$(poll "$home")
-  assert_contains "$out" 'keeps exiting' "a listener that keeps exiting was not reported"
-  assert_contains "$out" 'bin/fm-wa-listen.sh start' \
+  assert_contains "$out" 'will not stay healthy' "a listener that keeps exiting was not reported"
+  assert_contains "$out" 'bin/fm-wa-listen.sh restart' \
     "the report did not name the command that releases the block"
 
   # ...but an hour later the channel gets another chance on its own, so a
@@ -345,7 +359,7 @@ test_a_spent_restart_block_releases_itself_after_a_while() {
   touch -t 200001010000 "$home/state/wa-listener.restarts"
   rm -f "$home/state/wa-listener.error"
   out=$(FM_WA_FORCE_SPAWN_FALLBACK=1 poll "$home")
-  assert_not_contains "$out" 'keeps exiting' \
+  assert_not_contains "$out" 'will not stay healthy' \
     "the restart block never released, so the channel stayed off for good"
   assert_present "$home/state/wa-listener.restart" \
     "the released block did not actually retry the listener"
@@ -382,10 +396,26 @@ SH
     "$LISTEN_SH" start >/dev/null 2>&1 || fail "the hand-run listener never started"
   assert_absent "$home/state/wa-listener.restarts" \
     "a start run by hand left the restart block in place"
+
+  # `restart` is what the fault line and the skill actually name, because it is
+  # the one that repairs a listener still holding a pid. `start` would only
+  # report that one already runs and change nothing.
+  printf '3\n' > "$home/state/wa-listener.restarts"
+  : > "$home/state/wa-listener.error"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$LISTEN_SH" start >/dev/null 2>&1
+  assert_grep '3' "$home/state/wa-listener.restarts" \
+    "start repaired a running listener instead of reporting it, so the named remedy is untested"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$LISTEN_SH" restart >/dev/null 2>&1 || fail "restart failed"
+  assert_absent "$home/state/wa-listener.restarts" \
+    "the remedy the fault line names left the restart block in place"
+  assert_absent "$home/state/wa-listener.error" \
+    "the remedy the fault line names left the reported fault in place"
   pid=$(cat "$home/state/wa-listener.pid" 2>/dev/null) || pid=
   [ -n "$pid" ] && kill "$pid" 2>/dev/null
 
-  pass "a hand-run start clears the restart block while an automatic one does not"
+  pass "the remedy the fault line names releases the block, and start alone does not"
 }
 
 # The watcher signals the whole process group of a check once it returns, so a
@@ -452,10 +482,11 @@ test_a_restarted_listener_survives_the_check_being_reaped() {
 }
 
 test_stalled_listener_is_reported() {
-  local home out
+  local home out pid
   home="$TMP_ROOT/stalled"
   new_home "$home"
   fake_listener "$home"
+  pid=$(cat "$home/state/wa-listener.pid")
   # An alive process whose connection went away long ago.
   printf '1\n' > "$home/state/wa-listener.beat"
   touch -t 200001010000 "$home/state/wa-listener.beat"
@@ -465,6 +496,54 @@ test_stalled_listener_is_reported() {
   assert_contains "$out" 'connection is down' "the report did not name the dead connection"
 
   pass "a running listener whose connection is down is reported, not trusted"
+}
+
+test_stalled_listener_is_replaced_not_only_reported() {
+  local home out pid
+  home="$TMP_ROOT/stallheal"
+  new_home "$home"
+  fake_listener "$home"
+  pid=$(cat "$home/state/wa-listener.pid")
+  printf '1\n' > "$home/state/wa-listener.beat"
+  touch -t 200001010000 "$home/state/wa-listener.beat"
+
+  out=$(poll "$home")
+  assert_contains "$out" 'restarting it' \
+    "a wedged listener was reported without saying it is being replaced"
+  if kill -0 "$pid" 2>/dev/null; then
+    fail "the wedged listener was left running, so nothing could bring the channel back"
+  fi
+  assert_absent "$home/state/wa-listener.pid" "the wedged listener's pid record outlived it"
+  # The beat belongs to the process that wrote it: left behind, it would make
+  # the replacement look wedged on its very first cycle and kill it again.
+  assert_absent "$home/state/wa-listener.beat" "the wedged listener's beat outlived it"
+
+  pass "a listener whose connection is down is replaced, not reported forever"
+}
+
+test_a_skipped_entry_is_reported_on_a_quiet_cycle() {
+  local home out
+  home="$TMP_ROOT/badnamesaid"
+  new_home "$home"
+  fake_listener "$home"
+  printf '1\n' > "$home/state/wa-listener.beat"
+  stash_message "$home" MSGSAID
+  : > "$home/state/wa-inbox/not a usable id.json"
+  chmod 600 "$home/state/wa-inbox/not a usable id.json"
+
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-message 1 pending, including MSGSAID' \
+    "the announcement did not win its own cycle"
+
+  # The set is unchanged, so this cycle has nothing to announce and is where the
+  # skipped entry gets said - once, not on every cycle after it.
+  out=$(poll "$home")
+  assert_contains "$out" 'unusable message id' \
+    "a skipped inbox entry was never reported at all"
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "the skipped entry was reported again on the next cycle: $out"
+
+  pass "an entry the poll had to skip is reported once, without burying the messages"
 }
 
 test_listener_that_never_connects_is_reported() {
@@ -513,7 +592,7 @@ test_repairing_the_link_clears_stale_listener_health() {
   out=$(poll "$home")
   assert_contains "$out" 'not paired' "the poll did not name the missing pairing after unpair"
   assert_not_contains "$out" 'logged out' "the poll still reported the removed link as logged out"
-  assert_not_contains "$out" 'keeps exiting' "the poll still reported the removed link's restart count"
+  assert_not_contains "$out" 'will not stay healthy' "the poll still reported the removed link's restart count"
 
   pass "unpairing clears the old link's health, so the poll names the real next step"
 }
@@ -580,6 +659,101 @@ test_shim_arm_register_disarm() {
   assert_absent "$home/state/wa-watch.check-trust" "disarm left the registration behind"
 
   pass "the check shim arms through the ordinary registration and disarms cleanly"
+}
+
+test_arming_makes_an_idle_home_need_supervision() {
+  local home
+  home="$TMP_ROOT/supneed"
+  new_home "$home"
+
+  # An idle home with the channel off arms no watcher, and must keep behaving
+  # exactly that way.
+  ( . "$ROOT/bin/fm-supervision-lib.sh"
+    fm_supervision_needed "$home/state" 300 ) \
+    && fail "a home with the channel off was counted as needing supervision"
+
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 \
+    || fail "arm failed"
+
+  # The captain messages precisely when nothing is running, so an armed channel
+  # alone has to keep a watcher up or the poll never runs at all.
+  ( . "$ROOT/bin/fm-supervision-lib.sh"
+    fm_supervision_needed "$home/state" 300 ) \
+    || fail "an armed inbound channel did not keep an idle home supervised"
+
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" disarm >/dev/null 2>&1 \
+    || fail "disarm failed"
+  ( . "$ROOT/bin/fm-supervision-lib.sh"
+    fm_supervision_needed "$home/state" 300 ) \
+    && fail "a disarmed home was still counted as needing supervision"
+
+  pass "an armed channel keeps an idle home supervised, and only while it is armed"
+}
+
+test_arming_writes_the_watcher_cadence() {
+  local home out
+  home="$TMP_ROOT/cadence"
+  new_home "$home"
+  assert_absent "$home/config/wa-mode.env" "a home that never armed already had a cadence file"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm 2>&1) || fail "arm failed: $out"
+  assert_present "$home/config/wa-mode.env" "arm did not write the watcher cadence"
+  assert_contains "$(cat "$home/config/wa-mode.env")" 'FM_CHECK_INTERVAL=30' \
+    "the cadence file does not speed the watcher up"
+  # Sourced, never executed, and private to this home.
+  local mode
+  mode=$(stat -c %a "$home/config/wa-mode.env" 2>/dev/null \
+    || stat -f %Lp "$home/config/wa-mode.env" 2>/dev/null)
+  [ "$mode" = 600 ] || fail "the cadence file is not private: $mode"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" status 2>&1)
+  assert_contains "$out" 'cadence: present' "status did not report the armed cadence"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" disarm 2>&1) || fail "disarm failed: $out"
+  assert_absent "$home/config/wa-mode.env" "disarm left the cadence file behind"
+
+  pass "arming writes the 30s watcher cadence and disarming removes it"
+}
+
+test_the_cadence_reaches_the_supervision_block() {
+  local home out
+  home="$TMP_ROOT/cadenceblock"
+  new_home "$home"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_CONFIG_OVERRIDE="$home/config" \
+    "$ROOT/bin/fm-supervision-instructions.sh" --harness codex 2>&1)
+  assert_not_contains "$out" "$home/config/wa-mode.env" \
+    "an unarmed home was told to source a cadence file it does not have"
+
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_CONFIG_OVERRIDE="$home/config" \
+    "$ROOT/bin/fm-supervision-instructions.sh" --harness codex 2>&1)
+  assert_contains "$out" "$home/config/wa-mode.env" \
+    "the emitted supervision block never names the generated cadence"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_CONFIG_OVERRIDE="$home/config" \
+    "$ROOT/bin/fm-supervision-instructions.sh" --harness codex --repair-line 2>&1)
+  assert_contains "$out" "source '$home/config/wa-mode.env' first" \
+    "the repair line does not carry the cadence into a re-armed watcher"
+
+  pass "the generated cadence is sourced the same way Relay's is"
+}
+
+test_stop_says_the_armed_check_restarts_it() {
+  local home out
+  home="$TMP_ROOT/stopnote"
+  new_home "$home"
+  fake_listener "$home"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" stop 2>&1)
+  assert_not_contains "$out" 'disarm' "an unarmed home was told to disarm something"
+
+  fake_listener "$home"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" stop 2>&1)
+  assert_contains "$out" 'disarm' \
+    "stop did not say the armed check brings the listener straight back"
+
+  pass "stopping the listener says plainly that an armed check restarts it"
 }
 
 test_shim_runs_the_poll_the_way_the_watcher_does() {
@@ -902,6 +1076,25 @@ SH
   pass "a failed send leaves no digest to suppress the captain saying the same thing"
 }
 
+test_failed_dry_run_leaves_no_echo_trap() {
+  local home out
+  home="$TMP_ROOT/faileddry"
+  new_home "$home"
+  printf 'this was never even going to be sent\n' > "$TMP_ROOT/faileddry-reply.txt"
+  # An outbox that cannot be written to: nothing is recorded, so nothing can
+  # echo back, and the marker must not survive to swallow those exact words.
+  : > "$home/state/wa-outbox"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_DRY_RUN=1 \
+    "$SEND" --text-file "$TMP_ROOT/faileddry-reply.txt" 2>&1) \
+    && fail "a dry run that recorded nothing reported success: $out"
+
+  [ -z "$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null)" ] \
+    || fail "a dry run that recorded nothing left an echo marker behind"
+
+  pass "a dry run that could not record leaves no digest to swallow the captain"
+}
+
 test_echo_digest_guard() {
   command -v node >/dev/null 2>&1 || { pass "echo guard skipped: node is unavailable"; return 0; }
   local home out
@@ -935,6 +1128,8 @@ test_channel_fault_and_inbox_never_share_a_cycle
 test_logged_out_listener_is_reported
 test_repeated_listener_exits_are_reported
 test_stalled_listener_is_reported
+test_stalled_listener_is_replaced_not_only_reported
+test_a_skipped_entry_is_reported_on_a_quiet_cycle
 test_slow_flap_still_reaches_the_restart_limit
 test_outbound_digests_are_pruned
 test_dry_run_records_are_pruned
@@ -946,6 +1141,10 @@ test_listener_that_never_connects_is_reported
 test_repairing_the_link_clears_stale_listener_health
 test_listener_state_growth_is_bounded
 test_shim_arm_register_disarm
+test_arming_makes_an_idle_home_need_supervision
+test_arming_writes_the_watcher_cadence
+test_the_cadence_reaches_the_supervision_block
+test_stop_says_the_armed_check_restarts_it
 test_shim_runs_the_poll_the_way_the_watcher_does
 test_dry_run_records_and_sends_nothing
 test_json_encoder_round_trips_hostile_text
@@ -958,3 +1157,4 @@ test_listener_captures_quoted_context
 test_echo_digest_guard
 test_stale_echo_marker_does_not_swallow_the_captain
 test_failed_send_leaves_no_echo_trap
+test_failed_dry_run_leaves_no_echo_trap

@@ -158,10 +158,14 @@ write_epoch() {  # <outcome>
 
 write_epoch arming
 
-# X mode cadence: source the generated config so an X instance polls at its
-# 30s cadence (fm-bootstrap.sh x_mode_setup contract).
+# Generated watcher cadence: source it so an X instance polls at its 30s cadence
+# (fm-bootstrap.sh x_mode_setup contract), and so does a home with an armed
+# inbound message channel (bin/fm-wa-setup.sh). Both export the same interval,
+# and a home with neither file keeps the default cadence.
 # shellcheck source=/dev/null
 [ -f "$CONFIG/x-mode.env" ] && . "$CONFIG/x-mode.env"
+# shellcheck source=/dev/null
+[ -f "$CONFIG/wa-mode.env" ] && . "$CONFIG/wa-mode.env"
 
 # --- foreground the real arm wrapper ------------------------------------------
 # NO shell &: this hook process tree is the harness-owned lifecycle. The arm

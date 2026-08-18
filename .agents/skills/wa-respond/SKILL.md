@@ -28,7 +28,8 @@ Report the concrete blocker to the captain in plain language and stop:
 
 - not paired: the WhatsApp link needs setting up again, and the captain has to enter a code on his phone.
 - logged out: the captain removed or expired the linked device, so it has to be linked again from his phone.
-- listener will not stay up, or its connection is down: run `bin/fm-wa-listen.sh logs` and report what it says, then run `bin/fm-wa-listen.sh start`, which both restarts the listener and releases the block that stopped the automatic restarts.
+- listener will not stay up, or its connection is down: run `bin/fm-wa-listen.sh logs` and report what it says, then run `bin/fm-wa-listen.sh restart`, which replaces the listener whether or not it still holds a process and releases the block that stopped the automatic restarts.
+  `start` is not the repair here: it reports a listener that is already running and changes nothing.
 - anything else: relay the concrete missing requirement.
 
 A fault wake never carries pending messages with it, so nothing here is being skipped.

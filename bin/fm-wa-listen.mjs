@@ -395,6 +395,23 @@ async function runListen() {
     try { sock.end(undefined) } catch { /* already gone */ }
   }
 
+  // The timer is the ONLY thing keeping the retry chain alive, so a connect
+  // that throws (an unreadable credential folder, a transient permission
+  // problem) must arm the next attempt rather than ending the chain silently
+  // and leaving a process that is alive with no socket and no way back.
+  const scheduleReconnect = () => {
+    if (closing) return
+    const delay = backoff
+    backoff = Math.min(backoff * 2, 60000)
+    setTimeout(() => {
+      connect().catch((err) => {
+        logLine(`reconnect failed: ${err.message}; retrying in ${backoff}ms`)
+        writeListenerStatus({ state: 'reconnecting', error: err.message, at: Date.now() })
+        scheduleReconnect()
+      })
+    }, delay)
+  }
+
   const shutdown = () => {
     closing = true
     clearInterval(beatTimer)
@@ -439,8 +456,7 @@ async function runListen() {
         endSocket(sock)
         writeListenerStatus({ state: 'reconnecting', code: code ?? null, at: Date.now() })
         logLine(`connection closed (${code ?? 'unknown'}); reconnecting in ${backoff}ms`)
-        setTimeout(() => { connect().catch((err) => logLine(`reconnect failed: ${err.message}`)) }, backoff)
-        backoff = Math.min(backoff * 2, 60000)
+        scheduleReconnect()
       }
     })
 

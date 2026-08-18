@@ -93,6 +93,9 @@ if [ -n "$FM_WA_DRY_RUN" ]; then
     echo "dry-run: recorded state/wa-outbox/$BASE (nothing sent)"
     exit 0
   fi
+  # Nothing was ever going to be sent, so the echo marker has nothing to guard
+  # against and must not sit there swallowing those words from the captain.
+  [ -z "$MARKER" ] || rm -f -- "$MARKER" 2>/dev/null || true
   echo "error: cannot record the dry-run reply" >&2
   exit 1
 fi
