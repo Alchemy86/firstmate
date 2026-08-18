@@ -283,8 +283,12 @@ ensure_listener() {
       fi
       stop_wedged_listener "$pid" || return 1
     elif [ "$(listener_device_hook)" = unavailable ]; then
-      emit_listener_error "WhatsApp listener cannot read message sender devices, so every message from the captain would be rejected; see state/wa-listener.log"
-      return 1
+      # The hook is attached once per connection, so only a replacement process
+      # can pick it up: a listener holding a healthy socket would otherwise
+      # reject every message the captain sends for as long as that socket
+      # lasts. Reported AND repaired, on the same budget as a stalled one.
+      emit_listener_error "WhatsApp listener cannot read message sender devices, so every message from the captain would be rejected; restarting it, see state/wa-listener.log"
+      stop_wedged_listener "$pid" || return 1
     else
       return 0
     fi

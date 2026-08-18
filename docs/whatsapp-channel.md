@@ -136,13 +136,16 @@ bin/fm-wa-setup.sh arm
 `bin/fm-wa-poll.sh` restarts the listener by itself if it dies, at most once every two minutes, so a crash heals without anyone watching.
 
 A restart is not a substitute for reporting, because some faults never heal.
-The poll reports one `wa-channel-error` line instead of respawning when the device was logged out, when three restarts have been spent without the listener settling, or when a listener is alive but its connection has been down for fifteen minutes.
-That last one is why the listener touches `state/wa-listener.beat` only while it is actually connected: a live process is not a live channel.
+The poll reports one `wa-channel-error` line instead of respawning when the device was logged out, or when three restarts have been spent without the listener settling.
+A listener that is alive but whose connection has been down for fifteen minutes is reported and replaced, because only a new process can bring that channel back.
+That case is why the listener touches `state/wa-listener.beat` only while it is actually connected: a live process is not a live channel.
 A listener that never connects at all writes no beat, so the poll measures that fifteen minutes from when the listener was started, and a channel that has never come up is reported exactly like one that stopped working.
 
 A connected listener is not a working one either.
 The accepted-sender-device filter is fed by a raw stanza hook, and a listener that cannot attach that hook rejects every message the captain sends while still reporting a healthy connection and touching its beat.
-The listener records that fault alongside its connection state, so the poll reports it as a `wa-channel-error` naming the sender devices it cannot read, and clears it by itself once a reconnect attaches the hook again.
+The listener records that fault alongside its connection state, so the poll reports it as a `wa-channel-error` naming the sender devices it cannot read.
+The hook is attached once per connection and a healthy socket never drops on its own, so that fault is repaired the same way a stalled connection is: the listener is stopped and replaced on the same restart budget, and the report clears once the replacement attaches the hook.
+A starting listener claims the status file before its first connect attempt, so a replacement is never judged by the status its predecessor left behind.
 
 Re-pairing clears the previous link's health records, so a freshly linked device is never judged by the old one's logged-out status or restart count.
 

@@ -525,11 +525,14 @@ test_stalled_listener_is_replaced_not_only_reported() {
 # of the inbox, and it is fed by a raw stanza hook. A listener that cannot
 # attach that hook still connects and still beats, so nothing else in the poll
 # would notice that every message from the captain is being thrown away.
+# Reporting alone would leave it that way for as long as the socket holds,
+# because the hook is only ever attached by a new connection.
 test_a_listener_that_cannot_read_sender_devices_is_reported() {
-  local home out
+  local home out pid
   home="$TMP_ROOT/nodevicehook"
   new_home "$home"
   fake_listener "$home"
+  pid=$(cat "$home/state/wa-listener.pid")
   date +%s > "$home/state/wa-listener.beat"
   stash_message "$home" MSGHOOK
 
@@ -545,17 +548,26 @@ test_a_listener_that_cannot_read_sender_devices_is_reported() {
     "a listener that rejects every message looked perfectly healthy"
   assert_contains "$out" 'sender devices' \
     "the report did not name what the listener cannot read"
+  assert_contains "$out" 'restarting it' \
+    "the fault was reported without saying the listener is being replaced"
   assert_present "$home/state/wa-listener.error" \
     "the fault was announced without being recorded"
+  if kill -0 "$pid" 2>/dev/null; then
+    fail "the deaf listener was left running, so the hook could never be reattached"
+  fi
+  assert_absent "$home/state/wa-listener.pid" \
+    "the deaf listener's pid record outlived it"
 
-  # It clears itself the moment a reconnect attaches the hook again, so the
+  # It clears itself the moment a replacement attaches the hook again, so the
   # captain is not left with a fault that outlives the problem.
+  fake_listener "$home"
+  date +%s > "$home/state/wa-listener.beat"
   printf '{"state":"connected","me":"x","at":3}\n' > "$home/state/wa-listener.status"
   poll "$home" >/dev/null
   assert_absent "$home/state/wa-listener.error" \
     "the fault outlived the listener recovering its sender-device hook"
 
-  pass "a listener that cannot read sender devices is reported, not trusted"
+  pass "a listener that cannot read sender devices is reported and replaced"
 }
 
 test_a_skipped_entry_is_reported_on_a_quiet_cycle() {

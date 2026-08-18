@@ -364,6 +364,12 @@ async function runListen() {
   ensurePrivateDir(SEEN)
   ensurePrivateDir(SENT)
 
+  // The status file is how bin/fm-wa-poll.sh judges the LIVE listener, and it
+  // stops one that reports it cannot read sender devices. A predecessor's last
+  // status left in place would be read as this process's own and get a healthy
+  // replacement killed, so claim the file before the first connect attempt.
+  writeListenerStatus({ state: 'starting', at: Date.now() })
+
   // A first run must not ingest the account's backlog. The watermark is the
   // durable "everything at or before this second is already accounted for"
   // line, so a restart still picks up what arrived while we were down.
