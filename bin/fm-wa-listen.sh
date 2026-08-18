@@ -112,7 +112,11 @@ cmd_status() {
     return 0
   fi
   echo "channel: on (captain $FM_WA_CAPTAIN, accepted devices ${FM_WA_ALLOW_DEVICES})"
-  echo "dry-run: ${FM_WA_DRY_RUN:+on}${FM_WA_DRY_RUN:-off}"
+  if [ -n "$FM_WA_DRY_RUN" ]; then
+    echo "dry-run: on"
+  else
+    echo "dry-run: off"
+  fi
   if fm_wa_paired; then
     listener_env status
   else
@@ -131,6 +135,9 @@ cmd_status() {
   if [ -f "$FM_WA_STATE/wa-listener.status" ]; then
     printf 'last connection event: '
     cat "$FM_WA_STATE/wa-listener.status"
+  fi
+  if [ -f "$FM_WA_STATE/wa-listener.beat" ]; then
+    echo "last connected beat: $(fm_wa_age_of "$FM_WA_STATE/wa-listener.beat")s ago"
   fi
 }
 

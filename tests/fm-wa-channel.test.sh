@@ -37,6 +37,15 @@ poll() {
   FM_HOME="$1" FM_ROOT_OVERRIDE="$ROOT" "$POLL" 2>/dev/null
 }
 
+# A paired, running listener, so a test about the inbox is not answered by the
+# liveness nudge instead.
+fake_listener() {
+  local home=$1
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  printf '%s\n' $$ > "$home/state/wa-listener.pid"
+}
+
 # --- the channel is inert until a home opts in ------------------------------
 
 test_off_by_default() {
@@ -60,6 +69,7 @@ test_removing_config_reverts_to_silence() {
   local home out
   home="$TMP_ROOT/optout"
   new_home "$home"
+  fake_listener "$home"
   stash_message "$home" MSGOPTOUT
   out=$(poll "$home")
   assert_contains "$out" 'wa-message 1 pending' "armed home did not announce a pending message"
@@ -81,10 +91,7 @@ test_check_contract() {
   chmod 700 "$home/state/wa-inbox"
   # A paired listener is faked so the liveness nudge stays quiet and only the
   # inbox contract is under test.
-  printf '{"registered": true}\n' > "$home/state/.fake-creds"
-  mkdir -p "$home/state/wa-auth"
-  cp "$home/state/.fake-creds" "$home/state/wa-auth/creds.json"
-  printf '%s\n' $$ > "$home/state/wa-listener.pid"
+  fake_listener "$home"
 
   out=$(poll "$home")
   [ -z "$out" ] || fail "empty inbox produced output: $out"
@@ -112,9 +119,7 @@ test_undrained_inbox_is_reannounced() {
   home="$TMP_ROOT/reannounce"
   new_home "$home"
   printf 'FM_WA_CAPTAIN=%s\nFM_WA_REANNOUNCE=0\n' "$CAPTAIN" > "$home/config/whatsapp.env"
-  mkdir -p "$home/state/wa-auth"
-  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
-  printf '%s\n' $$ > "$home/state/wa-listener.pid"
+  fake_listener "$home"
   stash_message "$home" MSGSTUCK
 
   out=$(poll "$home")
@@ -138,6 +143,73 @@ test_unpaired_listener_reports_once() {
   [ -z "$out" ] || fail "the same listener fault was reported twice: $out"
 
   pass "a listener fault is reported once, not on every cycle"
+}
+
+test_channel_fault_and_inbox_never_share_a_cycle() {
+  local home out
+  home="$TMP_ROOT/onefault"
+  new_home "$home"
+  stash_message "$home" MSGFAULT
+
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-channel-error' "the listener fault was not reported"
+  assert_not_contains "$out" 'wa-message' "a fault cycle also announced the inbox"
+
+  # The fault is deduped, so the pending message is not starved behind it.
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-message 1 pending, including MSGFAULT' \
+    "pending messages stayed buried behind a reported fault"
+  assert_not_contains "$out" 'wa-channel-error' "the same fault was reported twice"
+
+  pass "a cycle reports either a channel fault or the inbox, never both"
+}
+
+test_logged_out_listener_is_reported() {
+  local home out
+  home="$TMP_ROOT/loggedout"
+  new_home "$home"
+  # Credentials survive a logout, so pairing alone cannot tell the difference.
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  printf '{"state":"logged-out","at":1}\n' > "$home/state/wa-listener.status"
+
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-channel-error' "a logged-out listener was never surfaced"
+  assert_contains "$out" 'logged out' "the report did not name the logout"
+  assert_absent "$home/state/wa-listener.restart" "a logged-out listener was respawned anyway"
+
+  pass "a logged-out device is reported instead of being restarted forever"
+}
+
+test_repeated_listener_exits_are_reported() {
+  local home out
+  home="$TMP_ROOT/flapping"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  printf '3\n' > "$home/state/wa-listener.restarts"
+
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-channel-error' "a listener that keeps exiting was never surfaced"
+  assert_contains "$out" 'keeps exiting' "the report did not name the repeated exits"
+
+  pass "a listener that dies on every restart is reported rather than respawned forever"
+}
+
+test_stalled_listener_is_reported() {
+  local home out
+  home="$TMP_ROOT/stalled"
+  new_home "$home"
+  fake_listener "$home"
+  # An alive process whose connection went away long ago.
+  printf '1\n' > "$home/state/wa-listener.beat"
+  touch -t 200001010000 "$home/state/wa-listener.beat"
+
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-channel-error' "a live listener with a dead connection looked healthy"
+  assert_contains "$out" 'connection is down' "the report did not name the dead connection"
+
+  pass "a running listener whose connection is down is reported, not trusted"
 }
 
 # --- the check shim ---------------------------------------------------------
@@ -179,9 +251,7 @@ test_shim_runs_the_poll_the_way_the_watcher_does() {
   local home out
   home="$TMP_ROOT/shimrun"
   new_home "$home"
-  mkdir -p "$home/state/wa-auth"
-  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
-  printf '%s\n' $$ > "$home/state/wa-listener.pid"
+  fake_listener "$home"
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 \
     || fail "arm failed"
   stash_message "$home" MSGSHIM
@@ -270,10 +340,34 @@ fixture() {
     node "$LISTENER" handle-fixture 2>/dev/null
 }
 
+# Every fixture gets its own later timestamp. A shared one would let the history
+# watermark short-circuit each case before the rule it names is ever reached, so
+# the assertions below would pass for the wrong reason.
+# The counter lives in a file because msg() is called inside a command
+# substitution, and a shell variable bumped there would never reach the caller.
+FIXTURE_TS_FILE="$TMP_ROOT/fixture-ts"
+printf '2000000000\n' > "$FIXTURE_TS_FILE"
+next_ts() {
+  local n
+  n=$(cat "$FIXTURE_TS_FILE" 2>/dev/null) || n=2000000000
+  n=$(( n + 1 ))
+  printf '%s\n' "$n" > "$FIXTURE_TS_FILE"
+  printf '%s' "$n"
+}
+
 msg() {
-  # msg <id> <device> <chat-jid> <from-me> <inner-json>
-  printf '{"stanza_from":"%s:%s@s.whatsapp.net","message":{"key":{"id":"%s","remoteJid":"%s","fromMe":%s},"messageTimestamp":2000000000,"message":%s}}' \
-    "$CAPTAIN" "$2" "$1" "$3" "$4" "$5"
+  # msg <id> <device> <chat-jid> <from-me> <inner-json> [<timestamp>]
+  printf '{"stanza_from":"%s:%s@s.whatsapp.net","message":{"key":{"id":"%s","remoteJid":"%s","fromMe":%s},"messageTimestamp":%s,"message":%s}}' \
+    "$CAPTAIN" "$2" "$1" "$3" "$4" "${6:-$(next_ts)}" "$5"
+}
+
+# The listener logs its reason on the same stream as the verdict, so a refusal
+# can be pinned to the rule that produced it rather than to REJECTED alone.
+assert_refused() {
+  local out=$1 reason=$2 what=$3
+  assert_contains "$out" 'REJECTED' "$what"
+  assert_contains "$out" "ignored ($reason)" \
+    "$what: refused for the wrong reason, output was: $out"
 }
 
 test_listener_filters() {
@@ -290,20 +384,34 @@ test_listener_filters() {
     "the stashed record lost the message text"
 
   out=$(fixture "$home" "$(msg ECHOMSG 2 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, the PR is up"}')")
-  assert_contains "$out" 'REJECTED' "firstmate's own outbound echo was ingested as an instruction"
+  assert_refused "$out" 'device 2 is not an accepted captain device' \
+    "firstmate's own outbound echo was ingested as an instruction"
 
   out=$(fixture "$home" "$(msg GRPMSG 0 '99-88@g.us' true '{"conversation":"in a group"}')")
-  assert_contains "$out" 'REJECTED' "a group message was ingested"
+  assert_refused "$out" 'non-direct chat' "a group message was ingested"
 
   out=$(fixture "$home" "$(msg FWDMSG 0 "$CAPTAIN@s.whatsapp.net" true \
     '{"extendedTextMessage":{"text":"do this","contextInfo":{"isForwarded":true,"forwardingScore":3}}}')")
-  assert_contains "$out" 'REJECTED' "a forwarded message was ingested"
+  assert_refused "$out" 'forwarded message' "a forwarded message was ingested"
 
-  out=$(fixture "$home" '{"stanza_from":"447111111111:0@s.whatsapp.net","message":{"key":{"id":"OTHERMSG","remoteJid":"447111111111@s.whatsapp.net","fromMe":false},"messageTimestamp":2000000000,"message":{"conversation":"hi"}}}')
-  assert_contains "$out" 'REJECTED' "a message from someone other than the captain was ingested"
+  out=$(fixture "$home" "$(printf '{"stanza_from":"447111111111:0@s.whatsapp.net","message":{"key":{"id":"OTHERMSG","remoteJid":"447111111111@s.whatsapp.net","fromMe":false},"messageTimestamp":%s,"message":{"conversation":"hi"}}}' "$(next_ts)")")
+  assert_refused "$out" 'chat is not the captain' \
+    "a message from someone other than the captain was ingested"
 
   out=$(fixture "$home" "$(msg EMPTYMSG 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"   "}')")
-  assert_contains "$out" 'REJECTED' "an empty message was stashed"
+  assert_refused "$out" 'no text to act on' "an empty message was stashed"
+
+  # Only history is older than the watermark; a second message in the same
+  # second as an accepted one is a new instruction, not a redelivery.
+  local same_second
+  same_second=$(next_ts)
+  out=$(fixture "$home" "$(msg SAMESEC1 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"first"}' "$same_second")")
+  assert_contains "$out" 'ACCEPTED' "a fresh message was refused"
+  out=$(fixture "$home" "$(msg SAMESEC2 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"and also this"}' "$same_second")")
+  assert_contains "$out" 'ACCEPTED' "a second message in the same second was silently dropped"
+
+  out=$(fixture "$home" "$(msg OLDMSG 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"ancient"}' 1000000000)")
+  assert_refused "$out" 'older than the history watermark' "backlog older than the watermark was ingested"
 
   pass "the listener accepts only the captain's own device on his own direct chat"
 }
@@ -314,13 +422,16 @@ test_listener_is_idempotent() {
   home="$TMP_ROOT/idempotent"
   new_home "$home"
 
-  out=$(fixture "$home" "$(msg REPEATMSG 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"once"}')")
+  local repeat_ts
+  repeat_ts=$(next_ts)
+  out=$(fixture "$home" "$(msg REPEATMSG 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"once"}' "$repeat_ts")")
   assert_contains "$out" 'ACCEPTED' "the first delivery was refused"
 
-  # Firstmate drains it, then WhatsApp redelivers the same message.
+  # Firstmate drains it, then WhatsApp redelivers the same message. The refusal
+  # must come from the durable marker, not from the history watermark.
   rm -f "$home/state/wa-inbox/REPEATMSG.json"
-  out=$(fixture "$home" "$(msg REPEATMSG 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"once"}')")
-  assert_contains "$out" 'REJECTED' "a drained message was offered a second time"
+  out=$(fixture "$home" "$(msg REPEATMSG 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"once"}' "$repeat_ts")")
+  assert_refused "$out" 'already handled' "a drained message was offered a second time"
   assert_absent "$home/state/wa-inbox/REPEATMSG.json" "a drained message was rebuilt in the inbox"
 
   pass "a handled message is never re-offered, even after the inbox entry is cleared"
@@ -342,6 +453,50 @@ test_listener_captures_quoted_context() {
   pass "a reply carries the message it replied to"
 }
 
+test_stale_echo_marker_does_not_swallow_the_captain() {
+  command -v node >/dev/null 2>&1 || { pass "stale echo guard skipped: node is unavailable"; return 0; }
+  local home out marker
+  home="$TMP_ROOT/staleecho"
+  new_home "$home"
+  printf 'on it\n' > "$TMP_ROOT/stale-reply.txt"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_DRY_RUN=1 \
+    "$SEND" --text-file "$TMP_ROOT/stale-reply.txt" >/dev/null 2>&1 \
+    || fail "recording the outbound reply failed"
+  marker=$(find "$home/state/wa-sent" -name '*.sent' -type f | head -n 1)
+  [ -n "$marker" ] || fail "no echo marker was recorded"
+
+  # An echo comes back in seconds. This one never did, so it is not an echo and
+  # must not swallow the captain typing those same words much later.
+  touch -t 200001010000 "$marker"
+  out=$(fixture "$home" "$(msg STALEECHO 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"on it"}')")
+  assert_contains "$out" 'ACCEPTED' "a stale outbound digest swallowed the captain's own words"
+  assert_absent "$marker" "the stale digest was left behind to trap those words again"
+
+  pass "an outbound digest the captain never echoed expires instead of trapping his words"
+}
+
+test_failed_send_leaves_no_echo_trap() {
+  local home out
+  home="$TMP_ROOT/failedsend"
+  new_home "$home"
+  printf 'this never left the building\n' > "$TMP_ROOT/failed-reply.txt"
+  local fakebin
+  fakebin=$(fm_fakebin "$TMP_ROOT/failedsend-bin")
+  cat > "$fakebin/mudslide" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/mudslide"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/failed-reply.txt" 2>&1) \
+    && fail "a failing mudslide reported success: $out"
+
+  [ -z "$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null)" ] \
+    || fail "a send that never went out left an echo marker behind"
+
+  pass "a failed send leaves no digest to suppress the captain saying the same thing"
+}
+
 test_echo_digest_guard() {
   command -v node >/dev/null 2>&1 || { pass "echo guard skipped: node is unavailable"; return 0; }
   local home out
@@ -355,7 +510,8 @@ test_echo_digest_guard() {
   # Same text arriving back on an otherwise-accepted device must still be
   # recognised as firstmate's own words.
   out=$(fixture "$home" "$(msg ECHODIGEST 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, that is done."}')")
-  assert_contains "$out" 'REJECTED' "firstmate's own reply came back as a new instruction"
+  assert_refused "$out" 'matches firstmate outbound' \
+    "firstmate's own reply came back as a new instruction"
 
   # The marker is consumed, so the captain may genuinely say the same words next.
   out=$(fixture "$home" "$(msg ECHOAGAIN 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, that is done."}')")
@@ -369,6 +525,10 @@ test_removing_config_reverts_to_silence
 test_check_contract
 test_undrained_inbox_is_reannounced
 test_unpaired_listener_reports_once
+test_channel_fault_and_inbox_never_share_a_cycle
+test_logged_out_listener_is_reported
+test_repeated_listener_exits_are_reported
+test_stalled_listener_is_reported
 test_shim_arm_register_disarm
 test_shim_runs_the_poll_the_way_the_watcher_does
 test_dry_run_records_and_sends_nothing
@@ -378,3 +538,5 @@ test_listener_filters
 test_listener_is_idempotent
 test_listener_captures_quoted_context
 test_echo_digest_guard
+test_stale_echo_marker_does_not_swallow_the_captain
+test_failed_send_leaves_no_echo_trap

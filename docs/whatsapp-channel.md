@@ -46,6 +46,9 @@ That does mean everything on this chat is `fromMe`, including firstmate's own re
 
 1. **Sender device.** WhatsApp numbers devices: the captain's phone is device `0`, mudslide is a linked device, and the listener is another. Only device `0` is accepted by default. baileys drops the device from the message key, so the listener reads it from the raw stanza and correlates by message id.
 2. **Outbound digest.** `bin/fm-wa-send.sh` records a digest of every message it sends under `state/wa-sent/`. If matching text arrives back, the listener consumes the marker and drops it.
+   An echo returns within seconds, so a digest older than ten minutes is swept instead of matched.
+   Otherwise the first time the captain himself typed something firstmate once said, his instruction would be swallowed as an echo.
+   A send that fails drops its own digest for the same reason: nothing went out, so nothing can come back.
 
 If the captain also wants to command firstmate from WhatsApp Web or Desktop, add those device numbers to `FM_WA_ALLOW_DEVICES`. Do **not** add the device mudslide uses; that is firstmate's own outbound and would loop.
 
@@ -82,6 +85,9 @@ It prints `PAIRING_CODE XXXX-XXXX`. On the captain's phone:
 
 A code lives about two minutes. `--rounds N` issues a fresh one automatically each time one lapses, up to `N` windows, so the captain does not have to be standing by when pairing starts. Every round prints its own `PAIRING_CODE` line.
 
+Once the code is accepted, WhatsApp asks for a reconnect to finish the link and the pairer prints `PAIRING_ACCEPTED`.
+That reconnect keeps the credentials the link just earned and asks for no new code; only a lapsed code starts a genuinely fresh round and clears the folder.
+
 Success prints `PAIRED <jid>`.
 
 ### 3. Start the listener and arm the check
@@ -92,6 +98,14 @@ bin/fm-wa-setup.sh arm
 ```
 
 `bin/fm-wa-poll.sh` restarts the listener by itself if it dies, at most once every two minutes, so a crash heals without anyone watching.
+
+A restart is not a substitute for reporting, because some faults never heal.
+The poll reports one `wa-channel-error` line instead of respawning when the device was logged out, when the listener has died on three restarts in a row, or when a listener is alive but its connection has been down for fifteen minutes.
+That last one is why the listener touches `state/wa-listener.beat` only while it is actually connected: a live process is not a live channel.
+
+Exactly one line comes out of a cycle.
+A cycle that reports a fault does not also announce the inbox, because the two mean different things to `wa-respond` and the watcher would fold them into a single wake.
+The fault is deduped, so pending messages are announced on the next cycle rather than being buried behind it.
 
 ### 4. Confirm
 
@@ -173,3 +187,4 @@ bin/fm-wa-listen.sh unpair      # removes this device's credentials
 | `state/wa-outbox/` | dry-run records |
 | `state/wa-auth/` | this listener's linked-device credentials |
 | `state/wa-listener.log` | listener log, including every refusal and why |
+| `state/wa-listener.beat` | touched only while the connection is open; the poll's liveness signal |

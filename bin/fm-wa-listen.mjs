@@ -46,12 +46,17 @@ const AUTH_DIR = requiredEnv('FM_WA_AUTH_DIR')
 const CAPTAIN = (process.env.FM_WA_CAPTAIN || '').replace(/[^0-9]/g, '')
 const ALLOW_DEVICES = parseDevices(process.env.FM_WA_ALLOW_DEVICES ?? '0')
 const HISTORY_HORIZON = Number.parseInt(process.env.FM_WA_HISTORY_HORIZON ?? '0', 10) || 0
+// How long an unconsumed outbound digest can still suppress an inbound message.
+// An echo returns within seconds; anything older is text the captain never sent
+// back, so it must stop counting as one.
+const ECHO_TTL_SECONDS = 600
 
 const INBOX = path.join(STATE, 'wa-inbox')
 const SEEN = path.join(STATE, 'wa-seen')
 const SENT = path.join(STATE, 'wa-sent')
 const WATERMARK = path.join(STATE, 'wa-watermark')
 const LISTENER_STATUS = path.join(STATE, 'wa-listener.status')
+const LISTENER_BEAT = path.join(STATE, 'wa-listener.beat')
 
 // Message ids are attacker-influenceable in principle, so they are never used
 // as a path component until they match this slug.
@@ -213,13 +218,33 @@ function normalizeText(text) {
   return String(text).replace(/\s+/g, ' ').trim()
 }
 
+// An echo comes back within seconds, so a digest older than the TTL belongs to
+// text the captain never repeated. Keeping it forever would make those exact
+// words a permanent trap: the first time the captain himself typed them, his
+// instruction would be swallowed as an echo. Sweeping bounds both that risk and
+// the growth of the directory.
+function pruneStaleEchoes() {
+  const cutoff = Date.now() - ECHO_TTL_SECONDS * 1000
+  let entries = []
+  try { entries = fs.readdirSync(SENT) } catch { return }
+  for (const entry of entries) {
+    if (!entry.endsWith('.sent')) continue
+    const marker = path.join(SENT, entry)
+    try {
+      if (fs.statSync(marker).mtimeMs < cutoff) fs.rmSync(marker, { force: true })
+    } catch { /* raced with another sweep */ }
+  }
+}
+
 // Second line of defence behind the device filter. bin/fm-wa-send.sh records a
 // digest of everything firstmate sends; if an inbound message matches an
-// unconsumed digest it is firstmate's own words coming back and is dropped.
-// Consuming the marker keeps the captain free to repeat the same words later.
+// unconsumed digest that is still within the TTL it is firstmate's own words
+// coming back and is dropped. Consuming the marker keeps the captain free to
+// repeat the same words later.
 async function consumeOwnEcho(text) {
   const normalized = normalizeText(text)
   if (normalized === '') return false
+  pruneStaleEchoes()
   const { createHash } = await import('node:crypto')
   const digest = createHash('sha256').update(normalized, 'utf8').digest('hex')
   const marker = path.join(SENT, `${digest}.sent`)
@@ -350,9 +375,39 @@ async function runListen() {
 
   let backoff = 1000
   let closing = false
+  let current = null
+  let connected = false
+
+  // The pid alone says nothing about the channel: a listener can sit alive with
+  // a socket that never comes back. The beat is touched only while the
+  // connection is actually open, so bin/fm-wa-poll.sh can tell a working
+  // listener from a wedged one.
+  const touchBeat = () => {
+    try {
+      fs.writeFileSync(LISTENER_BEAT, `${Math.floor(Date.now() / 1000)}\n`, { mode: 0o600 })
+    } catch { /* best effort */ }
+  }
+  const beatTimer = setInterval(() => { if (connected) touchBeat() }, 60000)
+  if (beatTimer.unref) beatTimer.unref()
+
+  const endSocket = (sock) => {
+    if (!sock) return
+    try { sock.end(undefined) } catch { /* already gone */ }
+  }
+
+  const shutdown = () => {
+    closing = true
+    clearInterval(beatTimer)
+    writeListenerStatus({ state: 'stopped', at: Date.now() })
+    endSocket(current)
+    process.exit(0)
+  }
+  process.once('SIGTERM', shutdown)
+  process.once('SIGINT', shutdown)
 
   const connect = async () => {
     const sock = await makeSocket(mod, logger)
+    current = sock
     if (sock.ws?.on) sock.ws.on('CB:message', rememberDevice)
 
     sock.ev.on('connection.update', (update) => {
@@ -363,18 +418,25 @@ async function runListen() {
       }
       if (connection === 'open') {
         backoff = 1000
+        connected = true
         const me = sock.user?.id ?? null
+        touchBeat()
         logLine(`connected as ${me}`)
         writeListenerStatus({ state: 'connected', me, at: Date.now() })
       }
       if (connection === 'close') {
+        connected = false
         const code = lastDisconnect?.error?.output?.statusCode
         if (code === DisconnectReason?.loggedOut) {
           logLine('logged out on WhatsApp; re-pair with bin/fm-wa-listen.sh pair')
           writeListenerStatus({ state: 'logged-out', at: Date.now() })
+          endSocket(sock)
           process.exit(4)
         }
         if (closing) return
+        // Release the dead socket before opening its replacement, so one
+        // credential folder never carries two live connections.
+        endSocket(sock)
         writeListenerStatus({ state: 'reconnecting', code: code ?? null, at: Date.now() })
         logLine(`connection closed (${code ?? 'unknown'}); reconnecting in ${backoff}ms`)
         setTimeout(() => { connect().catch((err) => logLine(`reconnect failed: ${err.message}`)) }, backoff)
@@ -392,15 +454,6 @@ async function runListen() {
         }
       }
     })
-
-    const shutdown = () => {
-      closing = true
-      writeListenerStatus({ state: 'stopped', at: Date.now() })
-      try { sock.end(undefined) } catch { /* already gone */ }
-      process.exit(0)
-    }
-    process.once('SIGTERM', shutdown)
-    process.once('SIGINT', shutdown)
   }
 
   await connect()
@@ -414,8 +467,13 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
 
   if (!id || !SAFE_ID.test(id)) return reject('unsafe or missing message id', id)
 
-  // Everything before the watermark is history, not a new instruction.
-  if (timestamp !== 0 && timestamp <= getWatermark()) return
+  // Everything strictly before the watermark is history, not a new instruction.
+  // The comparison must stay strict: WhatsApp timestamps are whole seconds, so
+  // two messages typed in quick succession routinely share one, and the durable
+  // wa-seen marker is what makes a redelivery idempotent.
+  if (timestamp !== 0 && timestamp < getWatermark()) {
+    return reject('older than the history watermark', id)
+  }
 
   // Groups, broadcasts, status and newsletters are never a captain instruction.
   if (!remoteJid.endsWith('@s.whatsapp.net')) return reject('non-direct chat', remoteJid)
@@ -433,20 +491,20 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
   }
 
   const body = unwrap(msg.message)
-  if (!body) return
+  if (!body) return reject('no readable message body', id)
   const ctx = contextInfoOf(body)
   if (ctx?.isForwarded === true || (ctx?.forwardingScore ?? 0) > 0) {
     return reject('forwarded message', id)
   }
 
   const text = extractText(body)
-  if (normalizeText(text) === '') return
+  if (normalizeText(text) === '') return reject('no text to act on', id)
 
   if (await consumeOwnEcho(text)) return reject('matches firstmate outbound', id)
 
   // The durable marker outlives the inbox file, so a message firstmate has
   // already drained is never re-offered even after the inbox entry is removed.
-  if (!publishOnce(SEEN, `${id}.seen`, `${timestamp}\n`)) return
+  if (fs.existsSync(path.join(SEEN, `${id}.seen`))) return reject('already handled', id)
 
   const record = {
     schema: 'fm-wa-inbox-v1',
@@ -462,7 +520,13 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
     attachment: attachmentKind(body),
     quoted: quotedContext(ctx),
   }
-  publishOnce(INBOX, `${id}.json`, `${JSON.stringify(record, null, 2)}\n`)
+  // The inbox record is published first and its create-exclusive write is the
+  // real claim on this id. Marking the message seen before it is safely stashed
+  // would turn a failed inbox write into a permanently lost instruction.
+  if (!publishOnce(INBOX, `${id}.json`, `${JSON.stringify(record, null, 2)}\n`)) {
+    return reject('already stashed', id)
+  }
+  publishOnce(SEEN, `${id}.seen`, `${timestamp}\n`)
   if (timestamp > getWatermark()) {
     setWatermark(timestamp)
     writeWatermark(timestamp)
@@ -533,10 +597,20 @@ async function runPair(number, rounds) {
   // round with a new code rather than ending the attempt. Every round prints
   // its own PAIRING_CODE line, so whoever is relaying codes always has the
   // current one.
-  const attempt = async () => {
+  //
+  // Once WhatsApp accepts the code it asks for a reconnect (restartRequired),
+  // and baileys has already saved the credentials that reconnect must use. That
+  // reconnect therefore keeps the credential folder and requests no new code;
+  // only a genuinely fresh round clears the folder.
+  let linked = false
+  let relinks = 0
+  const MAX_RELINKS = 5
+
+  const attempt = async ({ fresh }) => {
     remaining -= 1
-    clearAuthDir()
-    let requested = false
+    if (fresh) clearAuthDir()
+    // A restart reconnect is finishing an accepted link, not starting one.
+    let requested = !fresh
     const sock = await makeSocket(mod, logger)
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect } = update
@@ -562,17 +636,27 @@ async function runPair(number, rounds) {
       }
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode
-        if (code === DisconnectReason?.restartRequired) {
+        try { sock.end(undefined) } catch { /* already gone */ }
+        if (code === DisconnectReason?.restartRequired || linked) {
           // The link completed and WhatsApp wants a reconnect to finish it.
+          // Reconnect on the credentials baileys just saved; clearing them here
+          // would throw away the link and ask for another code forever.
+          linked = true
+          relinks += 1
+          if (relinks > MAX_RELINKS) {
+            process.stderr.write('fm-wa-listen: the linked device never settled after pairing\n')
+            process.exit(6)
+          }
+          if (relinks === 1) process.stdout.write('PAIRING_ACCEPTED; reconnecting to finish the link\n')
           remaining += 1
-          await attempt()
+          await delay(2000)
+          await attempt({ fresh: false })
           return
         }
         if (remaining > 0) {
           process.stdout.write(`PAIRING_EXPIRED ${code ?? 'unknown'}; requesting a fresh code\n`)
-          try { sock.end(undefined) } catch { /* already gone */ }
           await delay(2000)
-          await attempt()
+          await attempt({ fresh: true })
           return
         }
         process.stderr.write(`fm-wa-listen: pairing connection closed (${code ?? 'unknown'})\n`)
@@ -580,7 +664,7 @@ async function runPair(number, rounds) {
       }
     })
   }
-  await attempt()
+  await attempt({ fresh: true })
 }
 
 // ------------------------------------------------------------------ status ---

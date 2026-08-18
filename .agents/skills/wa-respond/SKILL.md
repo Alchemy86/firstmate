@@ -29,8 +29,12 @@ The channel cannot deliver. Do not attempt to read or answer messages.
 Report the concrete blocker to the captain in plain language and stop:
 
 - not paired: the WhatsApp link needs setting up again, and the captain has to enter a code on his phone.
-- listener will not stay up: run `bin/fm-wa-listen.sh logs` and report what it says.
+- logged out: the captain removed or expired the linked device, so it has to be linked again from his phone.
+- listener will not stay up, or its connection is down: run `bin/fm-wa-listen.sh logs` and report what it says.
 - anything else: relay the concrete missing requirement.
+
+A fault wake never carries pending messages with it, so nothing here is being skipped.
+Messages already in the inbox are announced on a later cycle once the fault has been reported.
 
 The captain's session chat is the reliable channel while WhatsApp is down; use it.
 

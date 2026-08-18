@@ -24,6 +24,11 @@
 #   listener down but paired         -> restart it in the background, rate-limited
 #   a configuration or listener fault -> one rate-limited "wa-channel-error ..."
 #
+# Exactly one line is ever printed. A cycle that reports a channel fault stops
+# there rather than also announcing the inbox, because the two lines mean
+# different things to the wa-respond skill and the watcher folds them into one
+# wake. The fault is deduped, so the next cycle announces any pending messages.
+#
 # The announcement marker is a digest of the pending id set, not a per-message
 # claim: one wake covers everything waiting, and draining the inbox is what
 # clears it. A check that printed on every cycle would wake firstmate constantly.
@@ -42,50 +47,120 @@ fm_wa_load_config || exit 0
 RESTART_MARKER="$FM_WA_STATE/wa-listener.restart"
 RESTART_INTERVAL=120
 LISTENER_ERROR="$FM_WA_STATE/wa-listener.error"
+LISTENER_STATUS="$FM_WA_STATE/wa-listener.status"
+LISTENER_BEAT="$FM_WA_STATE/wa-listener.beat"
+RESTART_FAILS="$FM_WA_STATE/wa-listener.restarts"
+# A listener that dies this many times in a row is not going to heal itself.
+RESTART_FAIL_LIMIT=3
+# The listener touches its beat only while the connection is actually open, so a
+# beat this stale means an alive process with a channel that is not working.
+STALL_INTERVAL=900
+
+# Set when this cycle has already spoken, so the check keeps its one-line
+# contract.
+EMITTED=
 
 # One diagnostic per distinct problem, not one per cycle. Listener faults and
 # poll faults keep separate markers so clearing one never re-fires the other.
+# Returns 0 when it printed, 1 when the same fault was already reported.
 emit_error_once() {
   local marker=$1 base=$2 msg=$3
   if [ "$(cat "$marker" 2>/dev/null)" = "$msg" ] \
     && [ "$(fm_wa_age_of "$marker")" -lt 3600 ]; then
-    return 0
+    return 1
   fi
   printf '%s\n' "$msg" | fm_wa_publish_stdin "$FM_WA_STATE" "$base" 2>/dev/null || true
   printf 'wa-channel-error %s\n' "$msg"
+  EMITTED=1
+  return 0
 }
 
 emit_listener_error() { emit_error_once "$LISTENER_ERROR" wa-listener.error "$1"; }
 emit_poll_error() { emit_error_once "$FM_WA_ERROR" wa-poll.error "$1"; }
 
+# The listener's own last reported connection state, or empty when it never
+# wrote one. Read as data: the file is JSON this home wrote itself.
+listener_state() {
+  [ -f "$LISTENER_STATUS" ] || return 0
+  sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([A-Za-z-]*\)".*/\1/p' \
+    "$LISTENER_STATUS" 2>/dev/null | tail -n 1
+}
+
+restart_failures() {
+  local n
+  n=$(cat "$RESTART_FAILS" 2>/dev/null) || n=0
+  case "$n" in
+    ''|*[!0-9]*) n=0 ;;
+  esac
+  printf '%s' "$n"
+}
+
+# setsid detaches the listener from this check's process group so the watcher
+# reaping the check never takes the listener with it. macOS has no setsid, so
+# fall back to nohup rather than failing the restart silently.
+spawn_listener() {
+  if command -v setsid >/dev/null 2>&1; then
+    FM_HOME="$FM_HOME" setsid "$SCRIPT_DIR/fm-wa-listen.sh" start >/dev/null 2>&1 </dev/null &
+  else
+    FM_HOME="$FM_HOME" nohup "$SCRIPT_DIR/fm-wa-listen.sh" start >/dev/null 2>&1 </dev/null &
+  fi
+  disown 2>/dev/null || true
+}
+
 # Keep the one long-lived connection up without ever blocking this check: the
 # start is a detached background spawn and its outcome is reported next cycle.
+# A pid alone is not health, so a live listener is still judged by the state it
+# reports and by its beat.
 ensure_listener() {
+  local state fails
+  state=$(listener_state)
   if fm_wa_listener_pid >/dev/null 2>&1; then
+    if [ -f "$LISTENER_BEAT" ] \
+      && [ "$(fm_wa_age_of "$LISTENER_BEAT")" -ge "$STALL_INTERVAL" ]; then
+      emit_listener_error "WhatsApp listener is running but its connection is down; see state/wa-listener.log"
+      return 1
+    fi
     return 0
+  fi
+  if [ "$state" = "logged-out" ]; then
+    emit_listener_error "WhatsApp listener was logged out; re-pair with bin/fm-wa-listen.sh unpair then pair"
+    return 1
   fi
   if ! fm_wa_paired; then
     emit_listener_error "WhatsApp listener is not paired; run bin/fm-wa-listen.sh pair"
+    return 1
+  fi
+  fails=$(restart_failures)
+  if [ "$fails" -ge "$RESTART_FAIL_LIMIT" ]; then
+    emit_listener_error "WhatsApp listener keeps exiting after restart; see state/wa-listener.log"
     return 1
   fi
   if [ "$(fm_wa_age_of "$RESTART_MARKER")" -lt "$RESTART_INTERVAL" ]; then
     return 1
   fi
   : | fm_wa_publish_stdin "$FM_WA_STATE" "wa-listener.restart" 2>/dev/null || true
-  FM_HOME="$FM_HOME" setsid "$SCRIPT_DIR/fm-wa-listen.sh" start >/dev/null 2>&1 </dev/null &
+  printf '%s\n' "$(( fails + 1 ))" \
+    | fm_wa_publish_stdin "$FM_WA_STATE" "wa-listener.restarts" 2>/dev/null || true
+  spawn_listener
   return 1
 }
 
 if ensure_listener; then
-  rm -f -- "$LISTENER_ERROR" 2>/dev/null || true
+  rm -f -- "$LISTENER_ERROR" "$RESTART_FAILS" 2>/dev/null || true
 fi
+
+# A fault line and an inbox line mean different things to wa-respond, and the
+# watcher would fold both into one wake, so a cycle that reported a fault stops.
+[ -z "$EMITTED" ] || exit 0
 
 [ -d "$FM_WA_INBOX" ] || exit 0
 
 # Sorted so the digest depends on the pending set, not on readdir order. The
 # named id is just the first in that order - WhatsApp ids are not chronological,
 # so the wake line names one for traceability and the skill drains them all.
-PENDING=$(find "$FM_WA_INBOX" -maxdepth 1 -name '*.json' -type f -printf '%f\n' 2>/dev/null | LC_ALL=C sort) || exit 0
+# `find -printf` is a GNU extension, so the basename is taken with sed instead.
+PENDING=$(find "$FM_WA_INBOX" -maxdepth 1 -name '*.json' -type f 2>/dev/null \
+  | sed 's#.*/##' | LC_ALL=C sort) || exit 0
 [ -n "$PENDING" ] || { rm -f -- "$FM_WA_ERROR" "$FM_WA_OFFERED" 2>/dev/null; exit 0; }
 
 COUNT=$(printf '%s\n' "$PENDING" | wc -l | tr -d ' ')

@@ -68,10 +68,16 @@ TO=$(printf '%s' "$TO" | tr -cd '0-9')
 [ -n "$TO" ] || { echo "error: recipient must be a number in international form" >&2; exit 1; }
 
 # Normalized digest, matching what the listener computes on inbound text.
+# The marker is short-lived by contract: the listener ignores and prunes any
+# digest older than its echo window, so a reply the captain never echoes back
+# cannot sit there forever waiting to swallow those exact words from him.
 NORMALIZED=$(printf '%s' "$TEXT" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
 DIGEST=$(printf '%s' "$NORMALIZED" | fm_wa_sha256) || DIGEST=
+MARKER=
 if [ -n "$DIGEST" ] && fm_wa_id_safe "$DIGEST"; then
-  : | fm_wa_publish_stdin "$FM_WA_SENT" "$DIGEST.sent" 2>/dev/null || true
+  if : | fm_wa_publish_stdin "$FM_WA_SENT" "$DIGEST.sent" 2>/dev/null; then
+    MARKER="$FM_WA_SENT/$DIGEST.sent"
+  fi
 fi
 
 if [ -n "$FM_WA_DRY_RUN" ]; then
@@ -96,6 +102,9 @@ command -v mudslide >/dev/null 2>&1 || { echo "error: mudslide is not installed"
 if mudslide send "$TO" "$TEXT" >/dev/null 2>&1; then
   echo "sent to $TO"
 else
+  # Nothing went out, so nothing can echo back: drop the marker rather than
+  # leaving it to suppress the captain saying those same words himself.
+  [ -z "$MARKER" ] || rm -f -- "$MARKER" 2>/dev/null || true
   echo "error: mudslide could not send the reply" >&2
   exit 1
 fi
