@@ -86,13 +86,16 @@ That is not a corner case: it was found live, when every real message he sent ar
 
 So **both identities are accepted, and only his**:
 
-- A `@s.whatsapp.net` chat must match the number in `FM_WA_CAPTAIN`.
-- A `@lid` chat must match the LID the listener reads from **its own pairing credentials** (`state/wa-auth/creds.json`), never a configured value and never a string pattern. The pairing itself is what proves which LID is his.
-- With no LID established from those credentials, a `@lid` chat is refused rather than assumed. Nothing else changes: groups, broadcasts, status and newsletters carry their own server suffixes and can never match either form.
+- A `@s.whatsapp.net` chat is addressed by phone number, so the number is the evidence: it must be one of the numbers in `FM_WA_CAPTAIN`.
+- A `@lid` chat is addressed by an opaque identity that carries no number, so something else has to supply one. WhatsApp itself does: baileys lifts the stanza's `sender_pn` attribute onto the message key, and the channel resolves the LID to that number and then checks it against `FM_WA_CAPTAIN` exactly as the other branch does. **The LID is never trusted on its own.**
+- The listener's own LID, read from its pairing credentials (`state/wa-auth/creds.json`), still admits its own self-chat.
+- A `@lid` chat that resolves to no number at all is refused rather than assumed, and reported distinctly from an ordinary stranger, because that is the one refusal that can hide a real message from the captain. Nothing else changes: groups, broadcasts, status and newsletters carry their own server suffixes and can never match either form.
+
+`creds.me.lid` is **this account's own** LID, not the LID of whoever is in the chat. Comparing a chat's user against it therefore only ever matches a literal self-chat, which is why LID-addressed messages from the captain's own phone were being refused until the server-supplied number was used instead. If a home still pins `FM_WA_SELF_LID` to work around that, it is no longer needed and can be removed.
 
 The stashed message records which identity the chat used in its `chat_identity` field, and always records the captain's number as the sender, so a reply goes back to one place whichever form it arrived on.
 
-`FM_WA_SELF_LID` overrides the LID the listener treats as the captain's, which is how `tests/fm-wa-channel.test.sh` drives this path with an invented LID rather than committing a real identity.
+`FM_WA_SELF_LID` overrides the LID the listener treats as its own, which is how `tests/fm-wa-channel.test.sh` drives the self-chat path with an invented LID rather than committing a real identity.
 It is an environment variable rather than a `config/whatsapp.env` key on purpose: it is a test input, not a supported way to configure the channel.
 Because it decides an access-control question, do not set it in an operator's environment - a wrong value there both admits the wrong LID and refuses the captain's own.
 
@@ -116,11 +119,26 @@ Write the gitignored `config/whatsapp.env`:
 FM_WA_CAPTAIN=447700900123
 ```
 
+
+### More than one captain number
+
+The captain may carry more than one phone, so `FM_WA_CAPTAIN` takes a list. Either phone can reach firstmate, and replies go to all of them.
+
+```sh
+FM_WA_CAPTAIN=447700900123,447700900124
+```
+
+A comma always separates entries, and punctuation inside an entry is dropped, so `+44 7700 900123, 447700900124` is two numbers.
+Without a comma, whitespace separates only when every piece is already a plausible number on its own: `447700900123 447700900124` is two numbers, while `+44 7700 900123` stays one.
+That rule exists so a single number written the way people actually write one cannot quietly become several that match no phone, which would refuse the captain's messages while the file still looked configured.
+
+The security property is unchanged by the list. Only the configured numbers are accepted, on either identity form, and a number absent from the file is refused even when another number in the file is present.
+
 That single non-empty value is the switch. Everything else is optional:
 
 | key | default | meaning |
 | --- | --- | --- |
-| `FM_WA_CAPTAIN` | *(none)* | captain's number, digits only. The channel is on while the file names one; see [A configuration that names no captain is not an opt-out](#a-configuration-that-names-no-captain-is-not-an-opt-out) |
+| `FM_WA_CAPTAIN` | *(none)* | captain's number, or a list of them when he carries more than one phone. The channel is on while the file names one; see [More than one captain number](#more-than-one-captain-number) and [A configuration that names no captain is not an opt-out](#a-configuration-that-names-no-captain-is-not-an-opt-out) |
 | `FM_WA_ALLOW_DEVICES` | `0` | comma-separated device numbers to accept; `*` accepts any |
 | `FM_WA_DRY_RUN` | *(off)* | `1` records replies to `state/wa-outbox/` and sends nothing |
 | `FM_WA_HISTORY_HORIZON` | `0` | seconds of backlog to accept on first run |

@@ -453,7 +453,7 @@ It is captain-private and is **not** inherited by secondmate homes.
 
 | key | default | meaning |
 | --- | --- | --- |
-| `FM_WA_CAPTAIN` | *(none)* | captain's number, digits only; the channel is on while the file names one, and blanking or commenting the key does not switch it off |
+| `FM_WA_CAPTAIN` | *(none)* | captain's number, or a comma-separated list when he carries more than one phone; the channel is on while the file names one, and blanking or commenting the key does not switch it off. Parsing rules and the security property are in [docs/whatsapp-channel.md](whatsapp-channel.md) |
 | `FM_WA_ALLOW_DEVICES` | `0` | comma-separated accepted sender-device numbers, or `*` for any |
 | `FM_WA_DRY_RUN` | *(off)* | `1` records replies to `state/wa-outbox/` and transmits nothing |
 | `FM_WA_HISTORY_HORIZON` | `0` | seconds of backlog accepted on first run |

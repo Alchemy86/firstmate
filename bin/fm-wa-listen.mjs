@@ -29,7 +29,8 @@
 // Environment (all set by bin/fm-wa-listen.sh):
 //   FM_WA_STATE        state directory (required)
 //   FM_WA_AUTH_DIR     credential folder for THIS device (required)
-//   FM_WA_CAPTAIN      captain's number, digits only, e.g. 447700900123
+//   FM_WA_CAPTAIN      captain's number(s), digits only; comma or space
+//                      separated for more than one, e.g. 447700900123,447700900124
 //   FM_WA_ALLOW_DEVICES  comma-separated WhatsApp device numbers to accept
 //                        (default "0" - the captain's own phone)
 //   FM_WA_BAILEYS_DIR  baileys package directory (auto-discovered when unset)
@@ -43,7 +44,26 @@ import process from 'node:process'
 
 const STATE = requiredEnv('FM_WA_STATE')
 const AUTH_DIR = requiredEnv('FM_WA_AUTH_DIR')
-const CAPTAIN = (process.env.FM_WA_CAPTAIN || '').replace(/[^0-9]/g, '')
+// Same rule as fm_wa_parse_captains in bin/fm-wa-lib.sh, and it has to stay the
+// same: a comma always separates, while whitespace separates only when every
+// piece is already a plausible number, so `+44 7700 900123` stays one number
+// instead of becoming three that match no phone. The shell normalises before
+// launching the listener, but the listener is also run directly, so it cannot
+// rely on having been handed a tidy list.
+function parseCaptains(raw) {
+  const digits = (s) => s.replace(/[^0-9]/g, '')
+  const value = String(raw || '')
+  if (value.includes(',')) {
+    return value.split(',').map(digits).filter((n) => n !== '')
+  }
+  const parts = value.split(/\s+/).map(digits).filter((n) => n !== '')
+  if (parts.length > 1 && parts.every((n) => n.length >= 8)) return parts
+  const joined = digits(value)
+  return joined === '' ? [] : [joined]
+}
+
+const CAPTAINS = parseCaptains(process.env.FM_WA_CAPTAIN)
+const CAPTAIN = CAPTAINS[0] || ''
 const ALLOW_DEVICES = parseDevices(process.env.FM_WA_ALLOW_DEVICES ?? '0')
 const HISTORY_HORIZON = Number.parseInt(process.env.FM_WA_HISTORY_HORIZON ?? '0', 10) || 0
 // How long an unconsumed outbound digest can still suppress an inbound message.
@@ -360,21 +380,43 @@ function loadSelfIdentityFromCreds() {
   if (process.env.FM_WA_SELF_LID) SELF.lid = String(process.env.FM_WA_SELF_LID).replace(/[^0-9]/g, '') || SELF.lid
 }
 
-// The captain's direct chat, in either identity form, and nothing else.
+// A captain's direct chat, in either identity form, and nothing else.
 // Groups, broadcasts, status and newsletters can never match: they carry their
-// own server suffixes, and the user must equal one of our own two identities.
-function isCaptainDirectChat(remoteJid) {
+// own server suffixes.
+//
+// The two branches prove the same thing by different evidence.
+//
+// A `@s.whatsapp.net` chat is addressed by phone number, so the number is the
+// evidence and it must be one this home was configured with.
+//
+// A `@lid` chat is addressed by an opaque identity that carries no number, so
+// something else has to supply one. `creds.me.lid` cannot: that is OUR OWN
+// account's LID, and comparing a chat's user against it only ever matches a
+// literal self-chat, which is why every real LID-addressed chat was refused.
+// WhatsApp itself supplies the mapping - baileys 6.7.23 lifts the stanza's
+// `sender_pn` attribute onto the message key - so the LID is resolved to a
+// phone number by the server and then checked against the configured numbers
+// exactly as the other branch does. The LID is never trusted on its own.
+//
+// Fail closed when nothing supplies a number: an unresolvable LID is refused
+// rather than assumed, and the caller reports it so a refusal is visible
+// instead of silent.
+function captainChatVerdict(remoteJid, key) {
   const user = jidUser(remoteJid)
-  if (!user) return false
+  if (!user) return { ok: false }
   if (remoteJid.endsWith('@s.whatsapp.net')) {
-    return CAPTAIN === '' ? user === SELF.pn : user === CAPTAIN
+    if (CAPTAINS.length === 0) return { ok: user === SELF.pn }
+    return { ok: CAPTAINS.includes(user) }
   }
-  if (remoteJid.endsWith('@lid')) {
-    // Fail closed: with no LID established from our own credentials there is
-    // nothing to prove this chat is his, so it is refused rather than assumed.
-    return SELF.lid !== null && user === SELF.lid
-  }
-  return false
+  if (!remoteJid.endsWith('@lid')) return { ok: false }
+
+  // Our own self-chat, addressed by our own LID, needs no server mapping.
+  if (SELF.lid !== null && user === SELF.lid) return { ok: true }
+
+  const pn = jidUser(key?.senderPn ?? key?.participantPn ?? null)
+  if (!pn) return { ok: false, unresolved: true }
+  if (CAPTAINS.length === 0) return { ok: pn === SELF.pn }
+  return { ok: CAPTAINS.includes(pn) }
 }
 
 function jidUser(jid) {
@@ -581,7 +623,16 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
   // firstmate's linked device reads it. He reaches it under either of his two
   // identities, so both are accepted and everything else - groups, broadcasts,
   // status, newsletters, another user - is refused.
-  if (!isCaptainDirectChat(remoteJid)) return reject('not the captain\'s direct chat', remoteJid)
+  const verdict = captainChatVerdict(remoteJid, key)
+  if (!verdict.ok) {
+    // An unresolvable LID is reported apart from an ordinary stranger: it is the
+    // one refusal that can hide a real message from the captain, so it must be
+    // visible in the log rather than looking like routine traffic.
+    if (verdict.unresolved) {
+      return reject('LID chat carries no phone number to check against the configured captains', remoteJid)
+    }
+    return reject('not the captain\'s direct chat', remoteJid)
+  }
   if (key.fromMe !== true) return reject('not from the captain account', remoteJid)
 
   const body = unwrap(msg.message)

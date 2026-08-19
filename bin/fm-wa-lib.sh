@@ -62,6 +62,57 @@ fm_wa_env_get() {
   printf '%s' "$value"
 }
 
+# Normalise FM_WA_CAPTAIN to a space-separated list of numbers.
+#
+# The captain has two phones, so this takes a list - but "digits only" already
+# accepted a number written the way people actually write one, spaces and all,
+# and `+44 7700 900123` must not quietly become three numbers that match no
+# phone. Silently refusing his messages is the failure this channel exists to
+# prevent, so the ambiguity is resolved rather than guessed at:
+#
+#   - a comma is always a separator, and punctuation inside an entry is dropped,
+#     so `+44 7700 900123, 447700900124` is two numbers;
+#   - without a comma, whitespace separates only when every piece is already a
+#     plausible number on its own, so `447700900123 447700900124` is two and
+#     `+44 7700 900123` stays one.
+#
+# Anything that is not a digit or a separator is dropped, so a stray character
+# can never smuggle in a value.
+fm_wa_parse_captains() {
+  printf '%s' "$1" | awk '
+    function digits(s) { gsub(/[^0-9]/, "", s); return s }
+    {
+      raw = $0
+      out = ""
+      if (index(raw, ",") > 0) {
+        n = split(raw, part, ",")
+        for (i = 1; i <= n; i++) {
+          d = digits(part[i])
+          if (d != "") out = out (out == "" ? "" : " ") d
+        }
+        print out
+        next
+      }
+      n = split(raw, part, /[ \t]+/)
+      every = 1
+      for (i = 1; i <= n; i++) {
+        d = digits(part[i])
+        if (d == "") continue
+        if (length(d) < 8) every = 0
+      }
+      if (every) {
+        for (i = 1; i <= n; i++) {
+          d = digits(part[i])
+          if (d != "") out = out (out == "" ? "" : " ") d
+        }
+        print out
+        next
+      }
+      print digits(raw)
+    }
+  '
+}
+
 # Load the channel configuration. Returns 1 when the channel is off, which every
 # caller treats as "do nothing, say nothing".
 fm_wa_load_config() {
@@ -73,7 +124,7 @@ fm_wa_load_config() {
 
   FM_WA_CAPTAIN=$(fm_wa_env_get FM_WA_CAPTAIN "$file" 2>/dev/null) || FM_WA_CAPTAIN=
   [ -n "${FM_WA_CAPTAIN_OVERRIDE:-}" ] && FM_WA_CAPTAIN=$FM_WA_CAPTAIN_OVERRIDE
-  FM_WA_CAPTAIN=$(printf '%s' "$FM_WA_CAPTAIN" | tr -cd '0-9')
+  FM_WA_CAPTAIN=$(fm_wa_parse_captains "$FM_WA_CAPTAIN")
   [ -n "$FM_WA_CAPTAIN" ] || return 1
 
   FM_WA_ALLOW_DEVICES=$(fm_wa_env_get FM_WA_ALLOW_DEVICES "$file" 2>/dev/null) || FM_WA_ALLOW_DEVICES=
@@ -363,6 +414,23 @@ fm_wa_listener_pid() {
 # its own listener. It is deliberately distinct from a stale pid file: a stale
 # one is cleaned up without a word, while a live stranger must never be
 # signalled and must be said out loud instead.
+# A live pid we cannot claim, and that is genuinely another listener.
+#
+# The identity check alone is not enough to justify refusing. A pid file
+# outlives SIGKILL, an OOM kill and a reboot, and after a reboot low pids are
+# handed out again freely, so this record routinely names some unrelated process
+# that simply inherited the number. Treating that as an unclaimable listener
+# refused every repair path at once - stop, disarm, unpair and restart all -
+# and left the channel dead with no remedy but deleting the pid file by hand,
+# which nothing told the operator to do. A guard whose failure mode is a silent
+# permanent outage is worse than the race it prevents, because a dead channel
+# cannot be told apart from being ignored.
+#
+# So the refusal is narrowed to what actually justifies it: the one-connection-
+# per-credential-folder rule only bites when the live process really is a
+# listener. fm_wa_process_is_listener draws that line, so a recycled pid is
+# reported as the stale record it is and cleared, while a real listener this
+# home cannot claim is still never signalled.
 fm_wa_listener_pid_foreign() {
   local pid
   [ -f "$FM_WA_PIDFILE" ] || return 1
@@ -372,6 +440,7 @@ fm_wa_listener_pid_foreign() {
   esac
   kill -0 "$pid" 2>/dev/null || return 1
   fm_wa_listener_pid >/dev/null 2>&1 && return 1
+  fm_wa_process_is_listener "$pid" || return 1
   return 0
 }
 

@@ -22,6 +22,8 @@ LISTENER="$ROOT/bin/fm-wa-listen.mjs"
 LISTEN_SH="$ROOT/bin/fm-wa-listen.sh"
 LIB="$ROOT/bin/fm-wa-lib.sh"
 CAPTAIN=447700900123
+# A second captain number, for the two-phones case. Invented, like the first.
+CAPTAIN2=447700900124
 TMP_ROOT=$(fm_test_tmproot fm-wa-channel)
 
 new_home() {
@@ -93,6 +95,26 @@ deaf_listener() {
     >/dev/null 2>&1 || true
 }
 
+# A live process this home cannot claim that really IS another listener, which
+# is the only case that justifies refusing to act. An unrelated process holding
+# a recycled pid is a different thing entirely - see the stale-record test - so
+# it cannot be modelled with a bare `sleep`: the refusal is drawn on whether the
+# command names the listener program, exactly as fm_wa_process_is_listener does.
+foreign_listener() {
+  local home=$1 fake pid
+  fake="$TMP_ROOT/foreign-listener/fm-wa-listen.mjs"
+  mkdir -p "$(dirname "$fake")"
+  # No exec: the process must KEEP the script in its command line, which is what
+  # fm_wa_process_is_listener reads. exec would replace it with `sleep`.
+  printf 'sleep 300\n' > "$fake"
+  bash "$fake" >/dev/null 2>&1 &
+  pid=$!
+  FAKE_PIDS="$FAKE_PIDS $pid"
+  printf '%s\n' "$pid" > "$home/state/wa-listener.pid"
+  printf 'Sat Jan  1 00:00:00 2000\n' > "$home/state/wa-listener.pid-identity"
+  FOREIGN_PID=$pid
+}
+
 reap_fake_listeners() {
   local pid
   for pid in $FAKE_PIDS; do
@@ -101,7 +123,37 @@ reap_fake_listeners() {
   done
   FAKE_PIDS=
 }
-trap 'reap_fake_listeners; fm_test_cleanup' EXIT
+
+# Tests that exercise the real start, restart and autostart paths leave a real
+# node listener running in their fixture home, and nothing was reaping those:
+# only the SIGTERM-ignoring stand-ins above were tracked. Every run therefore
+# leaked one process per such test, which accumulate across runs until the host
+# runs out of memory - measured at 199 stranded listeners, and enough to make
+# unrelated work on the same machine fail to start.
+#
+# Both passes are scoped to THIS run's own temp root, so a listener belonging to
+# a real home, or to another run, is never signalled. The pid files are the
+# ordinary case; the /proc pass catches a listener whose home was already
+# removed, which is why it matches on FM_HOME rather than on the command name.
+reap_started_listeners() {
+  local pidfile pid env_home
+  for pidfile in "$TMP_ROOT"/*/state/wa-listener.pid; do
+    [ -f "$pidfile" ] || continue
+    pid=$(cat "$pidfile" 2>/dev/null) || continue
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill "$pid" 2>/dev/null || true
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  [ -d /proc ] || return 0
+  for pid in $(pgrep -f 'fm-wa-listen\.mjs listen' 2>/dev/null); do
+    env_home=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+      | sed -n 's/^FM_HOME=//p') || continue
+    case "$env_home" in
+      "$TMP_ROOT"/*) kill "$pid" 2>/dev/null || true; kill -9 "$pid" 2>/dev/null || true ;;
+    esac
+  done
+}
+trap 'reap_fake_listeners; reap_started_listeners; fm_test_cleanup' EXIT
 
 # --- the channel is inert until a home opts in ------------------------------
 
@@ -630,7 +682,8 @@ test_a_recycled_pid_is_never_signalled() {
   mkdir -p "$home/state/wa-auth"
   printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
   # An unrelated process that happens to hold the number a dead listener left in
-  # its pid file.
+  # its pid file. Deliberately NOT a listener: this is the pid-reuse case, and
+  # the refusal must not fire for it.
   sleep 300 &
   pid=$!
   FAKE_PIDS="$FAKE_PIDS $pid"
@@ -1773,6 +1826,266 @@ test_lid_acceptance_is_not_a_hole() {
   pass "accepting the captain's LID admits only him, never a group, broadcast or stranger"
 }
 
+
+# --- more than one captain number -------------------------------------------
+
+# The captain has two phones and wants either to reach firstmate, and every
+# update to reach both. FM_WA_CAPTAIN therefore holds a LIST. The parse has to
+# stay strict about what a number is while accepting either separator, and a
+# home that names one number must behave exactly as it did before the list
+# existed - that is the compatibility this asserts, not just that it parses.
+captain_parse() {
+  ( . "$LIB"
+    FM_HOME=$TMP_ROOT
+    FM_WA_ENV_FILE=$1 fm_wa_load_config >/dev/null || { printf 'REFUSED'; exit 0; }
+    printf '%s' "$FM_WA_CAPTAIN" )
+}
+
+write_env() {
+  mkdir -p "$(dirname "$1")"
+  printf 'FM_WA_CAPTAIN=%s\n' "$2" > "$1"
+}
+
+test_one_captain_number_parses_exactly_as_before() {
+  local env out
+  env="$TMP_ROOT/parse-one.env"
+
+  write_env "$env" "$CAPTAIN"
+  out=$(captain_parse "$env")
+  [ "$out" = "$CAPTAIN" ] || fail "a single number no longer parses to itself: '$out'"
+
+  # The old parse stripped every non-digit, and that must not change for a
+  # single value: punctuation people really type into a phone number is dropped
+  # rather than turning one number into two.
+  write_env "$env" "+44 7700 900123"
+  out=$(captain_parse "$env")
+  [ "$out" = "$CAPTAIN" ] || fail "a spaced and plus-prefixed single number did not normalise to '$CAPTAIN': '$out'"
+
+  pass "a single captain number behaves exactly as it did before the list"
+}
+
+test_two_captain_numbers_parse_as_a_list() {
+  local env out
+  env="$TMP_ROOT/parse-two.env"
+
+  write_env "$env" "$CAPTAIN,$CAPTAIN2"
+  out=$(captain_parse "$env")
+  [ "$out" = "$CAPTAIN $CAPTAIN2" ] || fail "a comma-separated pair did not parse to both numbers: '$out'"
+
+  write_env "$env" "$CAPTAIN $CAPTAIN2"
+  out=$(captain_parse "$env")
+  [ "$out" = "$CAPTAIN $CAPTAIN2" ] || fail "a space-separated pair did not parse to both numbers: '$out'"
+
+  write_env "$env" "  $CAPTAIN ,, $CAPTAIN2  "
+  out=$(captain_parse "$env")
+  [ "$out" = "$CAPTAIN $CAPTAIN2" ] || fail "untidy separators did not normalise to both numbers: '$out'"
+
+  # The one outcome that must never happen quietly: the numbers running together
+  # into a single value that matches neither phone. That is what the old
+  # digits-only strip did to a list, and it would refuse both captains while
+  # looking configured.
+  case "$out" in
+    *"$CAPTAIN$CAPTAIN2"*) fail "the two numbers were concatenated into one value" ;;
+  esac
+
+  pass "two captain numbers parse as a list, whatever the separator"
+}
+
+test_a_configuration_naming_no_number_is_still_refused() {
+  local env out
+  env="$TMP_ROOT/parse-none.env"
+
+  write_env "$env" ""
+  [ "$(captain_parse "$env")" = REFUSED ] || fail "a blank value was accepted as a captain list"
+
+  write_env "$env" " , , "
+  [ "$(captain_parse "$env")" = REFUSED ] || fail "separators with no digits were accepted as a captain list"
+
+  pass "a configuration that names no number is refused, list or not"
+}
+
+# --- a LID chat is resolved to a number, never trusted on its own ------------
+
+# `creds.me.lid` is OUR OWN account's LID, so comparing a chat's user against it
+# only ever matches a literal self-chat - which is why a real LID-addressed chat
+# from the captain was refused, his primary phone included. WhatsApp supplies
+# the mapping instead: baileys lifts the stanza's `sender_pn` onto the message
+# key, so the LID is resolved to a phone number by the server and then checked
+# against the configured numbers exactly as a plain chat is.
+#
+# These LIDs are invented, like the numbers.
+CAPTAIN2_LID=100000000000002
+STRANGER_LID=100000000000003
+
+lid_pn_msg() {
+  # lid_pn_msg <id> <chat-lid> <sender-pn|-> <inner-json>
+  local pn_field=''
+  [ "$3" = '-' ] || pn_field=$(printf ',"senderPn":"%s@s.whatsapp.net"' "$3")
+  printf '{"stanza_from":"%s:0@lid","message":{"key":{"id":"%s","remoteJid":"%s@lid","fromMe":true%s},"messageTimestamp":%s,"message":%s}}' \
+    "$2" "$1" "$2" "$pn_field" "$(next_ts)" "$4"
+}
+
+lid_pn_fixture() {
+  # lid_pn_fixture <home> <captain-config> <body>
+  printf '%s' "$3" | FM_WA_STATE="$1/state" FM_WA_AUTH_DIR="$1/state/wa-auth" \
+    FM_WA_CAPTAIN="$2" FM_WA_ALLOW_DEVICES=0 \
+    node "$LISTENER" handle-fixture 2>/dev/null
+}
+
+test_a_lid_chat_is_admitted_by_its_resolved_number() {
+  command -v node >/dev/null 2>&1 || { pass "LID resolution skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/lidpn"
+  new_home "$home"
+
+  # The primary phone, on a LID chat that is not our own self-chat. No
+  # FM_WA_SELF_LID is pinned: the server-supplied number is the whole proof.
+  out=$(lid_pn_fixture "$home" "$CAPTAIN" \
+    "$(lid_pn_msg LIDPN1 "$CAPTAIN_LID" "$CAPTAIN" '{"conversation":"from the primary phone"}')")
+  assert_contains "$out" 'ACCEPTED' \
+    "a LID chat resolving to the captain's own number was refused, so his messages are still dropped"
+
+  # The second phone, which has its own LID our credentials can never prove.
+  out=$(lid_pn_fixture "$home" "$CAPTAIN,$CAPTAIN2" \
+    "$(lid_pn_msg LIDPN2 "$CAPTAIN2_LID" "$CAPTAIN2" '{"conversation":"from the second phone"}')")
+  assert_contains "$out" 'ACCEPTED' \
+    "the second captain number was refused on a LID chat, so his other phone cannot reach firstmate"
+
+  pass "a LID chat is admitted by the number the server resolves it to"
+}
+
+test_a_lid_chat_is_never_trusted_on_its_own() {
+  command -v node >/dev/null 2>&1 || { pass "LID trust skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/lidpn-strict"
+  new_home "$home"
+
+  # A stranger's LID, whatever number it claims to be, is not a configured one.
+  out=$(lid_pn_fixture "$home" "$CAPTAIN,$CAPTAIN2" \
+    "$(lid_pn_msg LIDPNX "$STRANGER_LID" 447700900999 '{"conversation":"not the captain"}')")
+  assert_contains "$out" 'REJECTED' "a stranger's LID chat was accepted"
+
+  # A second number that is NOT configured must not get in just because some
+  # other number is. This is the security property the list must not weaken.
+  out=$(lid_pn_fixture "$home" "$CAPTAIN" \
+    "$(lid_pn_msg LIDPNY "$CAPTAIN2_LID" "$CAPTAIN2" '{"conversation":"an unconfigured second phone"}')")
+  assert_contains "$out" 'REJECTED' \
+    "a number absent from the configuration was admitted on a LID chat"
+
+  pass "a LID chat is never trusted on its own, only on a number we configured"
+}
+
+test_an_unresolvable_lid_is_refused_and_said_out_loud() {
+  command -v node >/dev/null 2>&1 || { pass "LID diagnostics skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/lidpn-quiet"
+  new_home "$home"
+
+  # No senderPn, and no self-LID to fall back on. It must fail closed - but this
+  # is the one refusal that can hide a real message from the captain, so it has
+  # to be distinguishable in the log from ordinary stranger traffic rather than
+  # looking like routine noise.
+  out=$(lid_pn_fixture "$home" "$CAPTAIN" \
+    "$(lid_pn_msg LIDPNQ "$CAPTAIN_LID" - '{"conversation":"no number to check"}')")
+  assert_contains "$out" 'REJECTED' "an unresolvable LID chat was accepted"
+  assert_contains "$out" 'no phone number' \
+    "an unresolvable LID was refused as an ordinary stranger, so a dropped message looks like routine traffic"
+
+  pass "an unresolvable LID chat is refused and says why"
+}
+
+
+# A pid file outlives SIGKILL, an OOM kill and a reboot, and after a reboot low
+# pids are handed out again freely, so this record routinely names some
+# unrelated process that merely inherited the number. Refusing every repair path
+# for that left the channel dead with no remedy but deleting the pid file by
+# hand, which nothing documented - a silent permanent outage, and the captain
+# cannot tell a dead channel from being ignored. So a recycled pid is a stale
+# record to clear, and only a real listener is refused.
+test_a_recycled_pid_is_a_stale_record_not_an_outage() {
+  local home out pid
+  home="$TMP_ROOT/pidrecover"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  # An unrelated process that inherited the number, exactly as a reboot leaves.
+  sleep 300 &
+  pid=$!
+  FAKE_PIDS="$FAKE_PIDS $pid"
+  printf '%s\n' "$pid" > "$home/state/wa-listener.pid"
+  printf 'Sat Jan  1 00:00:00 2000\n' > "$home/state/wa-listener.pid-identity"
+
+  # The documented repair must work rather than refusing, and it must not
+  # signal the unrelated process on its way through.
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" stop >/dev/null 2>&1 \
+    || fail "stop refused a recycled pid, so the channel cannot be repaired at all"
+  kill -0 "$pid" 2>/dev/null \
+    || fail "stop signalled an unrelated process that merely held the pid"
+  assert_absent "$home/state/wa-listener.pid" \
+    "the stale pid record survived the repair, so every later path refuses again"
+
+  pass "a recycled pid is cleared as a stale record instead of stranding the channel"
+}
+
+
+# He carries two phones, so an update that reaches only one of them is an update
+# he may never see. Every reply therefore goes to every configured number unless
+# one is named explicitly, and a send that reaches one phone but not the other
+# is reported as the partial failure it is rather than as success.
+test_a_reply_reaches_every_captain_number() {
+  local home fakebin out
+  home="$TMP_ROOT/sendboth"
+  new_home "$home"
+  printf 'FM_WA_CAPTAIN=%s,%s\nFM_WA_ALLOW_DEVICES=0\n' "$CAPTAIN" "$CAPTAIN2" \
+    > "$home/config/whatsapp.env"
+  printf 'both phones please\n' > "$TMP_ROOT/sendboth-reply.txt"
+
+  fakebin=$(fm_fakebin "$TMP_ROOT/sendboth-bin")
+  cat > "$fakebin/mudslide" <<'SH'
+#!/bin/sh
+# Record the recipient of each send, and fail only for the number named in
+# FAIL_FOR so the partial case can be driven.
+for a in "$@"; do
+  case "$a" in
+    [0-9][0-9]*) printf '%s
+' "$a" >> "$MUDSLIDE_LOG"
+      [ "$a" = "${FAIL_FOR:-}" ] && { echo "refused $a" >&2; exit 1; }
+      break ;;
+  esac
+done
+exit 0
+SH
+  chmod +x "$fakebin/mudslide"
+
+  MUDSLIDE_LOG="$TMP_ROOT/sendboth.log"; : > "$MUDSLIDE_LOG"
+  out=$(PATH="$fakebin:$PATH" MUDSLIDE_LOG="$MUDSLIDE_LOG" \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/sendboth-reply.txt" 2>&1) \
+    || fail "sending to both numbers failed: $out"
+  grep -qx "$CAPTAIN" "$MUDSLIDE_LOG" || fail "the reply never reached the first number"
+  grep -qx "$CAPTAIN2" "$MUDSLIDE_LOG" || fail "the reply never reached the second number"
+
+  # An explicit recipient still addresses exactly one, so a reply can follow an
+  # inbound message back to the phone it came from.
+  : > "$MUDSLIDE_LOG"
+  out=$(PATH="$fakebin:$PATH" MUDSLIDE_LOG="$MUDSLIDE_LOG" \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --to "$CAPTAIN2" --text-file "$TMP_ROOT/sendboth-reply.txt" 2>&1) \
+    || fail "an addressed send failed: $out"
+  grep -qx "$CAPTAIN2" "$MUDSLIDE_LOG" || fail "an addressed reply did not reach that number"
+  grep -qx "$CAPTAIN" "$MUDSLIDE_LOG" && fail "an addressed reply also went to the other number"
+
+  # Reaching one phone but not the other is not success.
+  : > "$MUDSLIDE_LOG"
+  out=$(PATH="$fakebin:$PATH" MUDSLIDE_LOG="$MUDSLIDE_LOG" FAIL_FOR="$CAPTAIN2" \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/sendboth-reply.txt" 2>&1) \
+    && fail "a reply that missed one phone was reported as sent: $out"
+  assert_contains "$out" "$CAPTAIN2" "the partial failure did not name the number that missed it"
+
+  pass "a reply reaches every captain number, and a partial delivery is not called success"
+}
+
 test_off_by_default
 test_removing_config_reverts_to_silence
 test_check_contract
@@ -1907,13 +2220,9 @@ test_a_listener_this_home_does_not_own_is_never_signalled() {
   new_home "$home"
   mkdir -p "$home/state/wa-auth"
   printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
-  # An unrelated process holding the number a dead listener left behind, with an
-  # identity that cannot be its own.
-  sleep 300 &
-  pid=$!
-  FAKE_PIDS="$FAKE_PIDS $pid"
-  printf '%s\n' "$pid" > "$home/state/wa-listener.pid"
-  printf 'Sat Jan  1 00:00:00 2000\n' > "$home/state/wa-listener.pid-identity"
+  # Another listener holding the number, with an identity that cannot be its own.
+  foreign_listener "$home"
+  pid=$FOREIGN_PID
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
 
   rm -f "$home/config/whatsapp.env"
@@ -1952,11 +2261,8 @@ test_the_restart_path_never_spawns_over_an_unclaimable_listener() {
   printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
   # Alive, paired, and holding a pid this home cannot bind to its own listener:
   # everything the restart path needs to decide the listener is gone.
-  sleep 300 &
-  pid=$!
-  FAKE_PIDS="$FAKE_PIDS $pid"
-  printf '%s\n' "$pid" > "$home/state/wa-listener.pid"
-  printf 'Sat Jan  1 00:00:00 2000\n' > "$home/state/wa-listener.pid-identity"
+  foreign_listener "$home"
+  pid=$FOREIGN_PID
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
 
   out=$(poll "$home")
@@ -2195,11 +2501,8 @@ test_disarm_never_signals_a_listener_this_home_cannot_claim() {
   mkdir -p "$home/state/wa-auth"
   printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
   # An unrelated process holding the number a dead listener left behind.
-  sleep 300 &
-  pid=$!
-  FAKE_PIDS="$FAKE_PIDS $pid"
-  printf '%s\n' "$pid" > "$home/state/wa-listener.pid"
-  printf 'Sat Jan  1 00:00:00 2000\n' > "$home/state/wa-listener.pid-identity"
+  foreign_listener "$home"
+  pid=$FOREIGN_PID
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
 
   out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" disarm 2>&1) \
@@ -2469,3 +2772,11 @@ test_a_configured_home_rearms_itself_at_session_start
 test_the_retiring_cycle_clears_the_captains_messages
 test_unpair_clears_the_messages_only_once_the_channel_is_off
 test_a_send_without_mudslide_leaves_no_echo_trap
+test_one_captain_number_parses_exactly_as_before
+test_two_captain_numbers_parse_as_a_list
+test_a_configuration_naming_no_number_is_still_refused
+test_a_lid_chat_is_admitted_by_its_resolved_number
+test_a_lid_chat_is_never_trusted_on_its_own
+test_an_unresolvable_lid_is_refused_and_said_out_loud
+test_a_recycled_pid_is_a_stale_record_not_an_outage
+test_a_reply_reaches_every_captain_number

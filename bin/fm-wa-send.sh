@@ -67,9 +67,20 @@ if [ -n "$TEXT_FILE" ]; then
 fi
 [ -n "$TEXT" ] || { usage; exit 2; }
 
-TO=${TO:-$FM_WA_CAPTAIN}
-TO=$(printf '%s' "$TO" | tr -cd '0-9')
-[ -n "$TO" ] || { echo "error: recipient must be a number in international form" >&2; exit 1; }
+# With no explicit recipient the reply goes to EVERY configured captain number,
+# because he carries more than one phone and an update that reaches only one of
+# them is an update he may never see. An explicit --to still addresses exactly
+# one, which is how a reply follows an inbound message back to where it came
+# from. RECIPIENTS is a space-separated list of digits; the config parse has
+# already rejected anything that is not a number.
+if [ -n "$TO" ]; then
+  RECIPIENTS=$(printf '%s' "$TO" | tr -cd '0-9')
+else
+  RECIPIENTS=$FM_WA_CAPTAIN
+fi
+[ -n "$RECIPIENTS" ] || { echo "error: recipient must be a number in international form" >&2; exit 1; }
+# Named for the records and messages that carry a single address.
+TO=${RECIPIENTS%% *}
 
 # Proved present BEFORE the echo marker below is written, not after it. The
 # marker outlives this command by the listener's whole echo window, and a marker
@@ -124,17 +135,42 @@ fi
 # place a refused or failed send says why, and a reply that never arrives is
 # exactly the silence this channel exists to prevent.
 SEND_OUT=$(mktemp "${TMPDIR:-/tmp}/fm-wa-send.XXXXXX" 2>/dev/null) || SEND_OUT=
-if [ -n "$SEND_OUT" ]; then
-  mudslide send -- "$TO" "$TEXT" > "$SEND_OUT" 2>&1
-  STATUS=$?
-else
-  mudslide send -- "$TO" "$TEXT" >/dev/null 2>&1
-  STATUS=$?
+STATUS=0
+DELIVERED=
+FAILED=
+for RECIPIENT in $RECIPIENTS; do
+  if [ -n "$SEND_OUT" ]; then
+    mudslide send -- "$RECIPIENT" "$TEXT" >> "$SEND_OUT" 2>&1
+    ONE=$?
+  else
+    mudslide send -- "$RECIPIENT" "$TEXT" >/dev/null 2>&1
+    ONE=$?
+  fi
+  if [ "$ONE" -eq 0 ]; then
+    DELIVERED="$DELIVERED $RECIPIENT"
+  else
+    FAILED="$FAILED $RECIPIENT"
+    STATUS=$ONE
+  fi
+done
+DELIVERED=${DELIVERED# }
+FAILED=${FAILED# }
+
+# A send that reached one phone but not another is not a success, because the
+# missed one is silence the captain cannot distinguish from being ignored. It is
+# reported as the partial failure it is, naming which number missed it - but the
+# echo marker is KEPT, because the message really did go out somewhere and will
+# echo back from the phones that got it.
+if [ -n "$DELIVERED" ] && [ -n "$FAILED" ]; then
+  [ -z "$SEND_OUT" ] || rm -f -- "$SEND_OUT" 2>/dev/null || true
+  echo "sent to $DELIVERED"
+  echo "error: the reply did not reach $FAILED" >&2
+  exit 1
 fi
 
 if [ "$STATUS" -eq 0 ]; then
   [ -z "$SEND_OUT" ] || rm -f -- "$SEND_OUT" 2>/dev/null || true
-  echo "sent to $TO"
+  echo "sent to $DELIVERED"
 else
   # Nothing went out, so nothing can echo back: drop the marker rather than
   # leaving it to suppress the captain saying those same words himself.
