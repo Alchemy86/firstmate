@@ -994,6 +994,22 @@ EOF
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
 }
 
+# Whether the channel's OWN reader makes this home's configuration usable.
+#
+# Asked through fm_wa_load_config rather than re-derived here, because a second
+# parse of the same line is how one entry point accepts what another refuses:
+# a digit filter over a raw read keeps `FM_WA_CAPTAIN= # was 447700900999` and
+# arms a home whose channel reports itself off, which then sweeps every thirty
+# seconds for a message it could never deliver. Read in a separate process so
+# the library's own defaults cannot leak into this run or into anything else it
+# spawns.
+wa_channel_names_captain() {
+  FM_WA_ENV_FILE="$1" FM_HOME="$FM_HOME" FM_CONFIG_OVERRIDE="$CONFIG" \
+    FM_STATE_OVERRIDE="$STATE" \
+    bash -c '. "$1/fm-wa-lib.sh" && fm_wa_load_config' bootstrap-wa "$SCRIPT_DIR" \
+    >/dev/null 2>&1
+}
+
 # Inbound WhatsApp channel (opt-in): converge the generated arming artifacts on
 # what config/whatsapp.env says, the same way x_mode_setup above converges
 # Relay's on FMX_PAIRING_TOKEN.
@@ -1013,12 +1029,10 @@ EOF
 # Idempotent and silent - with the artifacts already in place it changes nothing
 # and prints nothing, so a home that never opted in sees no change at all.
 wa_mode_converge() {
-  local env_file captain
+  local env_file
   env_file="$CONFIG/whatsapp.env"
   [ -f "$env_file" ] || return 0
-  captain=$(fmx_env_get FM_WA_CAPTAIN "$env_file")
-  captain=$(printf '%s' "$captain" | tr -cd '0-9')
-  [ -n "$captain" ] || return 0
+  wa_channel_names_captain "$env_file" || return 0
   if [ -f "$STATE/wa-watch.check.sh" ] \
     && [ -f "$STATE/wa-watch.check-trust" ] \
     && [ -f "$CONFIG/wa-mode.env" ]; then

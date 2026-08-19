@@ -460,7 +460,7 @@ It is captain-private and is **not** inherited by secondmate homes.
 | `FM_WA_DRY_RUN` | *(off)* | `1` records replies to `state/wa-outbox/` and transmits nothing |
 | `FM_WA_HISTORY_HORIZON` | `0` | seconds of backlog accepted on first run |
 | `FM_WA_REANNOUNCE` | `1800` | seconds before an undrained inbox is announced again |
-| `FM_WA_BAILEYS_DIR` | *(auto)* | baileys package directory, when auto-discovery misses it |
+| `FM_WA_BAILEYS_DIR` | *(auto)* | baileys package directory, when auto-discovery misses it; a path holding no baileys package is reported as a configuration fault and auto-discovery is used |
 
 `bin/fm-wa-setup.sh arm` turns that configuration into generated local state: `state/wa-watch.check.sh`, an identity shim for `bin/fm-wa-poll.sh` bound through `bin/fm-check-register.sh`, and `config/wa-mode.env`, which exports `FM_CHECK_INTERVAL=30` for watcher processes in that home.
 The cadence contract is the Relay one above, and the value is deliberately identical so a home running both channels cannot end up with two cadences that disagree.

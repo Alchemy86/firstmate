@@ -199,6 +199,7 @@ FM_WA_ALLOW_DEVICES=0,22   # phone and desktop
 ```
 
 An unquoted `# ...` tail is a note and is dropped; a `#` inside quotes belongs to the value.
+A key that is blank once its note is removed is blank, so retiring a number and writing down which one it was does not put it back.
 A line that cannot be read that way - an unterminated quote, text after a closing one - is refused and reported rather than quietly falling back to a default, as is a value that is not valid for its key.
 The report arrives as an ordinary channel fault naming the key to fix, and `bin/fm-wa-listen.sh status` prints it too.
 
@@ -235,7 +236,7 @@ That single non-empty value is the switch. Everything else is optional:
 | `FM_WA_DRY_RUN` | *(off)* | `1` records replies to `state/wa-outbox/` and sends nothing |
 | `FM_WA_HISTORY_HORIZON` | `0` | seconds of backlog to accept on first run |
 | `FM_WA_REANNOUNCE` | `1800` | seconds before an undrained inbox is announced again |
-| `FM_WA_BAILEYS_DIR` | *(auto)* | baileys package directory, when auto-discovery misses it |
+| `FM_WA_BAILEYS_DIR` | *(auto)* | baileys package directory, when auto-discovery misses it. A path holding no baileys package is reported as a configuration fault and auto-discovery is used, rather than surfacing later as a listener that will not stay up |
 
 Two further inputs are read from the environment and are deliberately **not** configuration keys:
 

@@ -3198,6 +3198,44 @@ test_a_configured_home_rearms_itself_at_session_start() {
   pass "a configured home whose arming artifacts went missing arms itself again"
 }
 
+# Session start and the channel itself have to agree on whether a home is on.
+# Bootstrap used to decide with a raw read plus a digit filter, which keeps a
+# number written into a note beside a blanked key: it would arm the check shim
+# and the thirty-second cadence for a home whose own channel reports itself off,
+# so the home sweeps for ever for a message it could never deliver. One reader
+# decides, and it is the channel's.
+test_session_start_arms_only_what_the_channel_itself_reads() {
+  local home out
+  home="$TMP_ROOT/rearm-blanked"
+  mkdir -p "$home/state" "$home/config"
+  chmod 700 "$home/state"
+  printf 'FM_WA_CAPTAIN= # was %s, ask before re-enabling\n' "$CAPTAIN2" \
+    > "$home/config/whatsapp.env"
+
+  # The channel's own answer first, so the assertion below is about agreement
+  # rather than about either side in isolation.
+  [ -z "$(config_load "$home" captain)" ] \
+    || fail "the channel itself read a captain out of a blanked key"
+
+  out=$(FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null \
+    | grep '^WA:' || true)
+  [ -z "$out" ] || fail "session start armed a home whose channel reads itself off: $out"
+  assert_absent "$home/state/wa-watch.check.sh" \
+    "session start armed the check shim for a home that names no captain"
+  assert_absent "$home/config/wa-mode.env" \
+    "session start armed the 30s cadence for a home that names no captain"
+
+  # And a line the channel refuses outright is not armed around either.
+  printf 'FM_WA_CAPTAIN="%s\n' "$CAPTAIN" > "$home/config/whatsapp.env"
+  out=$(FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null \
+    | grep '^WA:' || true)
+  [ -z "$out" ] || fail "session start armed a home whose configuration cannot be read: $out"
+  assert_absent "$home/state/wa-watch.check.sh" \
+    "session start armed the check shim from an unreadable configuration line"
+
+  pass "session start arms a home only when the channel's own reader says it is on"
+}
+
 # --- opting out takes the captain's words with it ---------------------------
 
 SECRET_TEXT='meet me at the harbour at dawn'
@@ -3386,11 +3424,16 @@ test_an_annotated_configuration_reads_the_way_it_is_written() {
   [ "$(config_load "$home" reannounce)" = 900 ] || fail "an annotated FM_WA_REANNOUNCE did not load"
 
   # A `#` that is genuinely inside quotes belongs to the value, exactly as the
-  # shell would read it.
-  write_config "$home" "FM_WA_CAPTAIN=\"$CAPTAIN\" # quoted" 'FM_WA_BAILEYS_DIR="/tmp/wa#lib" # quoted too'
+  # shell would read it. A real package directory, so the value survives the
+  # usability check as well as the parse.
+  mkdir -p "$TMP_ROOT/wa#lib/lib"
+  : > "$TMP_ROOT/wa#lib/lib/index.js"
+  write_config "$home" "FM_WA_CAPTAIN=\"$CAPTAIN\" # quoted" \
+    "FM_WA_BAILEYS_DIR=\"$TMP_ROOT/wa#lib\" # quoted too"
   [ "$(config_load "$home" captain)" = "$CAPTAIN" ] || fail "a quoted captain number did not load"
   out=$(config_load "$home" baileys)
-  [ "$out" = "/tmp/wa#lib" ] || fail "a quoted value lost the # that was part of it: '$out'"
+  [ "$out" = "$TMP_ROOT/wa#lib" ] || fail "a quoted value lost the # that was part of it: '$out'"
+  [ -z "$(config_load "$home" fault)" ] || fail "a usable quoted baileys directory was reported as a fault"
 
   # Stripping the note must not start expanding the value: the file is still
   # read as data, so a substitution stays the literal text it was written as.
@@ -3401,6 +3444,95 @@ test_an_annotated_configuration_reads_the_way_it_is_written() {
     "reading the configuration executed a substitution written into it"
 
   pass "an annotated configuration line loads the value, not the note"
+}
+
+# Blanking a key and writing down why is how an operator retires a number, and
+# for a while the note was read as the value - so `FM_WA_CAPTAIN= # was
+# 447700900999` armed the channel on the very number he had just taken out,
+# fanned every reply to it, and accepted anything it sent as an instruction.
+# The other keys landed the other way round, raising a channel fault for a line
+# that is not malformed at all. Empty once the note is removed means empty.
+test_a_blanked_key_keeps_its_note_out_of_its_value() {
+  local home out
+  home="$TMP_ROOT/blanked"
+  mkdir -p "$home/state" "$home/config"
+
+  write_config "$home" "FM_WA_CAPTAIN= # was $CAPTAIN2, ask before re-enabling"
+  out=$(config_load "$home" captain)
+  [ -z "$out" ] \
+    || fail "a blanked captain key resurrected '$out' out of the note beside it"
+  [ -z "$(config_load "$home" fault)" ] \
+    || fail "blanking a key with a note beside it was reported as unreadable"
+
+  # Blanked with no note at all, for the same reason: the two must agree.
+  write_config "$home" "FM_WA_CAPTAIN="
+  [ -z "$(config_load "$home" captain)" ] || fail "a blanked captain key produced a number"
+
+  # The switch the operator is most likely to blank while deciding: read as off
+  # here it sends live traffic, so it must be the documented default and not the
+  # word "decide" turning into one.
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_DRY_RUN= # decide later"
+  [ -z "$(config_load "$home" dry)" ] || fail "a blanked FM_WA_DRY_RUN did not read as off"
+  [ -z "$(config_load "$home" fault)" ] \
+    || fail "a blanked FM_WA_DRY_RUN with a note was reported as unreadable"
+
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_ALLOW_DEVICES= # widen later"
+  [ "$(config_load "$home" devices)" = 0 ] \
+    || fail "a blanked device list did not fall back to the documented default"
+  [ -z "$(config_load "$home" fault)" ] \
+    || fail "a blanked device list with a note was reported as unreadable"
+
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_HISTORY_HORIZON= # none for now" \
+    "FM_WA_REANNOUNCE= # default is fine"
+  [ "$(config_load "$home" horizon)" = 0 ] || fail "a blanked history horizon did not default"
+  [ "$(config_load "$home" reannounce)" = 1800 ] || fail "a blanked re-announce did not default"
+  [ -z "$(config_load "$home" fault)" ] \
+    || fail "blanked interval keys with notes beside them were reported as unreadable"
+
+  # A `#` with nothing between it and the `=` is a value, not a note, exactly as
+  # the shell reads it - stripping notes must not start eating values.
+  write_config "$home" "FM_WA_CAPTAIN=#$CAPTAIN"
+  [ "$(config_load "$home" captain)" = "$CAPTAIN" ] \
+    || fail "a # written against the = was treated as a note instead of a value"
+
+  pass "a key blanked with a note beside it stays blank"
+}
+
+# FM_WA_BAILEYS_DIR was the one key handed to the listener unchecked, so a stale
+# or mistyped path surfaced three restarts later as "will not stay healthy after
+# restart" - a remedy that cannot repair a wrong path. It belongs on the same
+# footing as every other key: absent takes its default in silence, present and
+# unusable says so.
+test_an_unusable_baileys_directory_is_reported() {
+  local home out
+  home="$TMP_ROOT/baileysdir"
+  mkdir -p "$home/state" "$home/config"
+
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN"
+  [ -z "$(config_load "$home" fault)" ] \
+    || fail "an absent FM_WA_BAILEYS_DIR did not take its auto-discovery default in silence"
+
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_BAILEYS_DIR=$TMP_ROOT/no-such-baileys"
+  out=$(config_load "$home" fault)
+  assert_contains "$out" 'FM_WA_BAILEYS_DIR' "a baileys directory that does not exist was not reported"
+  [ -z "$(config_load "$home" baileys)" ] \
+    || fail "an unusable baileys directory was still handed to the listener"
+
+  # A directory that is there but holds no package is the likelier typo, and it
+  # fails in exactly the same unhelpful way.
+  mkdir -p "$TMP_ROOT/empty-baileys"
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_BAILEYS_DIR=$TMP_ROOT/empty-baileys"
+  assert_contains "$(config_load "$home" fault)" 'FM_WA_BAILEYS_DIR' \
+    "a directory holding no baileys package was accepted"
+
+  mkdir -p "$TMP_ROOT/real-baileys/lib"
+  : > "$TMP_ROOT/real-baileys/lib/index.js"
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_BAILEYS_DIR=$TMP_ROOT/real-baileys"
+  [ "$(config_load "$home" baileys)" = "$TMP_ROOT/real-baileys" ] \
+    || fail "a usable baileys directory did not survive the check"
+  [ -z "$(config_load "$home" fault)" ] || fail "a usable baileys directory was reported as a fault"
+
+  pass "a baileys directory that cannot be used is reported instead of failing as a sick listener"
 }
 
 # The whole class of bug here is a value that quietly became a default, so a
@@ -3607,6 +3739,7 @@ SH
 test_an_unreadable_config_is_never_an_opt_out
 test_an_unconfigured_home_is_still_silent
 test_a_configured_home_rearms_itself_at_session_start
+test_session_start_arms_only_what_the_channel_itself_reads
 test_the_retiring_cycle_clears_the_captains_messages
 test_unpair_clears_the_messages_only_once_the_channel_is_off
 test_a_send_without_mudslide_leaves_no_echo_trap
@@ -3631,6 +3764,8 @@ test_a_phone_that_missed_the_reply_drops_its_own_marker
 test_a_failed_send_drops_its_markers_under_a_home_with_a_space
 test_a_dry_run_records_every_delivery_it_would_make
 test_an_annotated_configuration_reads_the_way_it_is_written
+test_a_blanked_key_keeps_its_note_out_of_its_value
+test_an_unusable_baileys_directory_is_reported
 test_a_configuration_line_that_cannot_be_read_is_reported
 test_a_configuration_fault_reaches_the_captain_once
 test_an_annotated_dry_run_still_sends_nothing

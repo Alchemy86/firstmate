@@ -63,7 +63,9 @@ fm_wa_paths() {
 # loaded as OFF and a commented captain number armed the channel while matching
 # no phone. Nothing is expanded or executed to achieve it: the quotes are
 # stripped as data, character by character, and a `$(...)` inside them stays the
-# literal text it was written as.
+# literal text it was written as. A note is a note wherever it starts, so
+# `KEY= # was 447700900999` is an empty value and not that number wearing a
+# comment - blanking a key while writing down why must never re-enable it.
 #
 # A line naming the key that cannot be read that way - an unterminated quote,
 # anything but a note after a closing one - is refused rather than guessed at,
@@ -89,6 +91,7 @@ fm_wa_env_get() {
       if (eq == 0) next
       if (substr(line, 1, eq - 1) != key) next
       rest = substr(line, eq + 1)
+      spaced = (rest ~ /^[ \t]/)
       sub(/^[ \t]+/, "", rest)
       q = substr(rest, 1, 1)
       if (q == "\"" || q == sq) {
@@ -114,6 +117,7 @@ fm_wa_env_get() {
         have = 1
         next
       }
+      if (spaced && q == "#") { value = ""; have = 1; next }
       cut = 0
       n = length(rest)
       for (i = 2; i <= n; i++) {
@@ -277,6 +281,16 @@ fm_wa_load_config() {
 
   fm_wa_env_load FM_WA_BAILEYS_DIR "$file"
   FM_WA_BAILEYS_DIR=${FM_WA_BAILEYS_DIR_ENV:-$FM_WA_ENV_VALUE}
+  # The listener tests exactly this for every directory it discovers on its own,
+  # so a hand-written one that fails it is a configuration fault and not a
+  # listener that mysteriously will not stay up: unvalidated, a stale path
+  # surfaced three restarts later as "will not stay healthy after restart",
+  # which names a remedy that cannot repair a wrong path. Cleared so the
+  # documented auto-discovery still applies, loudly rather than silently.
+  if [ -n "$FM_WA_BAILEYS_DIR" ] && [ ! -f "$FM_WA_BAILEYS_DIR/lib/index.js" ]; then
+    fm_wa_config_fault "FM_WA_BAILEYS_DIR does not hold a baileys package, so the listener falls back to whichever one it can find; check it in ${file##*/}"
+    FM_WA_BAILEYS_DIR=
+  fi
 
   fm_wa_env_load FM_WA_HISTORY_HORIZON "$file"
   FM_WA_HISTORY_HORIZON=$FM_WA_ENV_VALUE
