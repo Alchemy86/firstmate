@@ -321,7 +321,7 @@ With the channel still on it also leaves `state/wa-inbox/` alone, so a re-pair n
 
 ## Dry-run
 
-`FM_WA_DRY_RUN=1` lets the whole loop - poll, wake, compose, would-send - run end to end without live traffic. The reply is recorded to `state/wa-outbox/<epoch>-<pid>.json` and nothing is transmitted:
+`FM_WA_DRY_RUN=1` lets the whole loop - poll, wake, compose, would-send - run end to end without live traffic. The reply is recorded to `state/wa-outbox/<epoch>-<pid>-<n>.json` and nothing is transmitted:
 
 ```sh
 FM_WA_DRY_RUN=1 bin/fm-wa-send.sh --text-file /tmp/reply.txt
@@ -331,7 +331,10 @@ Set it in `config/whatsapp.env` to make it the standing mode for the home, or in
 
 The record is `fm-wa-outbox-v1` JSON, encoded by `bin/fm-wa-lib.sh` rather than by `jq`, so a host without `jq` still gets valid JSON instead of a `.json` file holding raw text.
 
-A dry run records the same outbound digest under `state/wa-sent/` that a real send does, so the echo guard behaves identically either way.
+One record is written per recipient, so a reply that would fan out to both phones records both deliveries and each names the number it would go to in `to`.
+The dry run is the only place the fan-out can be inspected before it reaches his phones, so a single record naming the first number would understate what a real send does.
+
+A dry run records the same outbound digest under `state/wa-sent/` that a real send does, one marker per recipient, so the echo guard behaves identically either way.
 
 ## Security
 
@@ -340,7 +343,7 @@ Inbound WhatsApp text is untrusted input arriving over a network into a shell en
 - Message text is **never** interpolated into a command. `bin/fm-wa-send.sh` takes it from a file and hands it to mudslide as one argument-vector element; nothing goes through `eval` or `sh -c`.
   That element is passed after a `--`, which ends mudslide's own option parsing, so a reply that opens with a dash - a bulleted line, say - is sent as text rather than read as an unknown option and never delivered.
 - Message ids are validated against `[A-Za-z0-9._-]{1,128}`, with a leading dot excluded, before any path is built from them. The listener and `bin/fm-wa-lib.sh` hold the identical rule, so the listener can never stash an entry the poll would have to skip.
-- The listener accepts only a direct chat with the captain, only `fromMe`, and only from an accepted device. He is admitted under either of the two identities described in [His two identities](#his-two-identities) - the configured number, or the LID taken from this listener's own pairing credentials - and under nothing else. Group chats, broadcasts, status, newsletters and forwarded messages are refused and logged.
+- The listener accepts only a direct chat with the captain, and only under one of the two shapes described in [His two identities](#his-two-identities): our own self-chat, proved from this listener's own pairing credentials and necessarily `fromMe`, from an accepted device; or a chat whose counterparty resolves to a configured number, on an **inbound** message only. Our own outgoing words in anybody else's chat are refused, which is what keeps his private conversations with third parties out of firstmate. Group chats, broadcasts, status, newsletters and forwarded messages are refused and logged.
 - `config/whatsapp.env` is read as data, key by key, never sourced, so a stray backtick in it cannot execute.
 - Credentials, the inbox, and the logs are `0600` files inside `0700` directories under the home's gitignored `state/`.
 - A WhatsApp message carries the captain's ordinary authority for normal reversible work. Destructive, irreversible and security-sensitive actions still need confirmation on the trusted session channel, matching the boundary Relay already draws. The `wa-respond` skill owns that rule.

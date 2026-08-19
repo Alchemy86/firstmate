@@ -22,7 +22,9 @@
 # FM_WA_DRY_RUN=1 (or FM_WA_DRY_RUN in config/whatsapp.env) records what WOULD
 # be sent to state/wa-outbox/ and sends nothing, so the whole
 # poll -> wake -> compose -> would-send loop can be exercised without live
-# traffic.
+# traffic. It records one entry per recipient, matching the deliveries and the
+# echo markers a real send makes, because the dry run is the only place the
+# fan-out can be inspected before it reaches the captain's phones.
 #
 # Every send also records a digest of its normalized text under state/wa-sent/,
 # one marker per recipient, because each delivery echoes back separately and the
@@ -81,8 +83,6 @@ else
   RECIPIENTS=$FM_WA_CAPTAIN
 fi
 [ -n "$RECIPIENTS" ] || { echo "error: recipient must be a number in international form" >&2; exit 1; }
-# Named for the records and messages that carry a single address.
-TO=${RECIPIENTS%% *}
 
 # Proved present BEFORE the echo marker below is written, not after it. The
 # marker outlives this command by the listener's whole echo window, and a marker
@@ -116,7 +116,12 @@ DIGEST=$(printf '%s' "$NORMALIZED" | fm_wa_sha256) || DIGEST=
 # Identical replies are ordinary traffic here, not a corner case: the routine
 # acknowledgement firstmate sends is a fixed sentence.
 SEND_KEY="$(date +%s)-$$"
-MARKERS=
+# An ARRAY, not a joined string. Every marker path starts at FM_HOME, and a home
+# under a path containing a space would be shredded into fragments by the word
+# splitting a joined list needs: the cleanup below would then delete nothing and
+# a reply that never went out would leave its digest sitting there for the whole
+# echo window, swallowing the captain saying those same words himself.
+MARKERS=()
 marker_for() {
   [ -n "$DIGEST" ] || return 1
   printf '%s/%s.%s-%s.sent' "$FM_WA_SENT" "$DIGEST" "$SEND_KEY" "$1"
@@ -126,47 +131,72 @@ if [ -n "$DIGEST" ] && fm_wa_id_safe "$DIGEST"; then
   for RECIPIENT in $RECIPIENTS; do
     IDX=$(( IDX + 1 ))
     if : | fm_wa_publish_stdin "$FM_WA_SENT" "$DIGEST.$SEND_KEY-$IDX.sent" 2>/dev/null; then
-      MARKERS="$MARKERS $(marker_for "$IDX")"
+      MARKERS+=("$(marker_for "$IDX")")
     fi
   done
 fi
 drop_markers() {
   local marker
-  for marker in $MARKERS; do
+  for marker in ${MARKERS[@]+"${MARKERS[@]}"}; do
     rm -f -- "$marker" 2>/dev/null || true
   done
-  MARKERS=
+  MARKERS=()
 }
 # Only ever drop a marker THIS send created. An identical reply still inside the
 # echo window already owns its markers, and removing one of those would spend
 # the guard belonging to a message that really did go out.
 drop_marker() {
-  local marker=$1 kept=
-  for kept in $MARKERS; do
-    if [ "$kept" = "$marker" ]; then
+  local marker=$1 kept dropped=
+  local -a remaining=()
+  for kept in ${MARKERS[@]+"${MARKERS[@]}"}; do
+    if [ -z "$dropped" ] && [ "$kept" = "$marker" ]; then
       rm -f -- "$marker" 2>/dev/null || true
-      MARKERS=$(printf '%s' "$MARKERS" | tr ' ' '\n' | grep -vxF "$marker" | tr '\n' ' ')
-      return 0
+      dropped=1
+    else
+      remaining+=("$kept")
     fi
   done
+  MARKERS=(${remaining[@]+"${remaining[@]}"})
   return 0
 }
 
 if [ -n "$FM_WA_DRY_RUN" ]; then
   STAMP=$(date +%s)
-  BASE="$STAMP-$$.json"
   # Built with the library's own encoder rather than jq: the record is read back
   # as fm-wa-outbox-v1 JSON, so a host without jq must still produce valid JSON
   # instead of a .json file holding raw text.
   JSON_TEXT=$(printf '%s' "$TEXT" | fm_wa_json_string) || JSON_TEXT=
-  if [ -n "$JSON_TEXT" ] && printf '{"schema":"fm-wa-outbox-v1","dry_run":true,"to":"%s","digest":"%s","text":%s}\n' \
-    "$TO" "${DIGEST:-}" "$JSON_TEXT" \
-    | fm_wa_publish_stdin "$FM_WA_OUTBOX" "$BASE"; then
-    echo "dry-run: recorded state/wa-outbox/$BASE (nothing sent)"
+  # ONE RECORD PER RECIPIENT, exactly as a real send makes one delivery and one
+  # echo marker per recipient. A dry run is the only place the fan-out can be
+  # inspected before it reaches the captain's phones, so a single record naming
+  # the first number would be evidence quietly saying less than the truth. The
+  # `to` field keeps meaning one address rather than growing into a list.
+  RECORDS=()
+  DRY_OK=1
+  IDX=0
+  for RECIPIENT in $RECIPIENTS; do
+    IDX=$(( IDX + 1 ))
+    BASE="$STAMP-$$-$IDX.json"
+    if [ -n "$JSON_TEXT" ] && printf '{"schema":"fm-wa-outbox-v1","dry_run":true,"to":"%s","digest":"%s","text":%s}\n' \
+      "$RECIPIENT" "${DIGEST:-}" "$JSON_TEXT" \
+      | fm_wa_publish_stdin "$FM_WA_OUTBOX" "$BASE"; then
+      RECORDS+=("$FM_WA_OUTBOX/$BASE")
+      echo "dry-run: recorded state/wa-outbox/$BASE for $RECIPIENT (nothing sent)"
+    else
+      DRY_OK=
+      break
+    fi
+  done
+  if [ -n "$DRY_OK" ] && [ "${#RECORDS[@]}" -gt 0 ]; then
     exit 0
   fi
   # Nothing was ever going to be sent, so the echo markers have nothing to guard
-  # against and must not sit there swallowing those words from the captain.
+  # against and must not sit there swallowing those words from the captain. The
+  # records already written go with them: a run that could not record every
+  # delivery it would have made is not evidence of the fan-out.
+  for RECORD in ${RECORDS[@]+"${RECORDS[@]}"}; do
+    rm -f -- "$RECORD" 2>/dev/null || true
+  done
   drop_markers
   echo "error: cannot record the dry-run reply" >&2
   exit 1

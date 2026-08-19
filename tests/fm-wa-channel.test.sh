@@ -2550,6 +2550,94 @@ SH
   pass "a phone that missed the reply drops its own echo marker and no one else's"
 }
 
+# Every marker path starts at FM_HOME, so a home under a path containing a space
+# is where a cleanup that word-splits its list quietly deletes nothing. The
+# markers of a reply that never went out then sit there for the whole echo
+# window, and the captain typing those same words himself is dropped as
+# firstmate's own echo - silently, from his side.
+test_a_failed_send_drops_its_markers_under_a_home_with_a_space() {
+  local home fakebin out markers
+  home="$TMP_ROOT/echo spaced home"
+  new_home "$home"
+  printf 'FM_WA_CAPTAIN=%s,%s\n' "$CAPTAIN" "$CAPTAIN2" > "$home/config/whatsapp.env"
+  printf 'Captain, nothing went out.\n' > "$TMP_ROOT/echospaced-reply.txt"
+
+  fakebin=$(fm_fakebin "$TMP_ROOT/echospaced-bin")
+  cat > "$fakebin/mudslide" <<'SH'
+#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    [0-9][0-9]*) [ "$a" = "${ONLY_FOR:-}" ] || { echo "refused $a" >&2; exit 1; }
+      break ;;
+  esac
+done
+exit 0
+SH
+  chmod +x "$fakebin/mudslide"
+
+  # Nothing reached either phone, so nothing can echo back from either.
+  out=$(PATH="$fakebin:$PATH" ONLY_FOR=none FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/echospaced-reply.txt" 2>&1) \
+    && fail "a send that reached no phone was reported as sent: $out"
+  markers=$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$markers" -eq 0 ] \
+    || fail "a send that went nowhere left $markers echo markers under a home with a space in its path"
+
+  # And the partial case, where exactly the phone that missed it drops its own.
+  out=$(PATH="$fakebin:$PATH" ONLY_FOR="$CAPTAIN" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/echospaced-reply.txt" 2>&1) \
+    && fail "a reply that missed one phone was reported as sent: $out"
+  markers=$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$markers" -eq 1 ] \
+    || fail "a partial delivery left $markers echo markers under a home with a space in its path"
+
+  # The dry run has its own cleanup path over the same list.
+  rm -f "$home"/state/wa-sent/*.sent
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_DRY_RUN=1 \
+    "$SEND" --text-file "$TMP_ROOT/echospaced-reply.txt" 2>&1) \
+    || fail "a dry run under a home with a space in its path failed: $out"
+  markers=$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$markers" -eq 2 ] \
+    || fail "a dry run to two phones recorded $markers echo markers under a home with a space in its path"
+
+  pass "a send that went nowhere leaves no echo trap when the home path contains a space"
+}
+
+# The dry run is the only place the fan-out can be inspected before it reaches
+# the captain's phones, so a record naming one number where two deliveries would
+# happen is evidence quietly saying less than the truth.
+test_a_dry_run_records_every_delivery_it_would_make() {
+  local home out records first second
+  home="$TMP_ROOT/dryrunfanout"
+  new_home "$home"
+  printf 'FM_WA_CAPTAIN=%s,%s\n' "$CAPTAIN" "$CAPTAIN2" > "$home/config/whatsapp.env"
+  printf 'Captain, both phones would have this.\n' > "$TMP_ROOT/dryrunfanout-reply.txt"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_DRY_RUN=1 \
+    "$SEND" --text-file "$TMP_ROOT/dryrunfanout-reply.txt" 2>&1) \
+    || fail "the dry run failed: $out"
+
+  records=$(find "$home/state/wa-outbox" -name '*.json' -type f | wc -l | tr -d ' ')
+  [ "$records" -eq 2 ] \
+    || fail "a dry run that would reach two phones recorded $records deliveries, not one each"
+  first=$(grep -l "\"to\":\"$CAPTAIN\"" "$home"/state/wa-outbox/*.json 2>/dev/null | head -n 1)
+  second=$(grep -l "\"to\":\"$CAPTAIN2\"" "$home"/state/wa-outbox/*.json 2>/dev/null | head -n 1)
+  [ -n "$first" ] || fail "no dry-run record names the first configured number"
+  [ -n "$second" ] || fail "no dry-run record names the second configured number"
+  [ "$first" != "$second" ] || fail "both configured numbers came from one record"
+  assert_grep 'both phones would have this' "$second" \
+    "the record for the second phone lost the reply text"
+
+  # An addressed reply still records exactly the one delivery it would make.
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_DRY_RUN=1 \
+    "$SEND" --to "$CAPTAIN2" --text "just you" 2>&1) \
+    || fail "an addressed dry run failed: $out"
+  [ "$(grep -l '"text":"just you"' "$home"/state/wa-outbox/*.json 2>/dev/null | wc -l | tr -d ' ')" -eq 1 ] \
+    || fail "an addressed dry run recorded more than the one delivery it would make"
+
+  pass "a dry run records one entry per recipient, matching what a real send would do"
+}
+
 test_off_by_default
 test_removing_config_reverts_to_silence
 test_check_contract
@@ -3254,3 +3342,5 @@ test_a_redelivered_echo_does_not_spend_a_second_marker
 test_a_redelivered_self_chat_echo_leaves_the_other_marker_alone
 test_an_identical_reply_adds_markers_rather_than_replacing_them
 test_a_phone_that_missed_the_reply_drops_its_own_marker
+test_a_failed_send_drops_its_markers_under_a_home_with_a_space
+test_a_dry_run_records_every_delivery_it_would_make
