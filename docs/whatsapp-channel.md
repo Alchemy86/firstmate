@@ -183,6 +183,10 @@ Until it lands, a voice note reaches firstmate and gets an honest answer rather 
 
 ## Setup
 
+It needs what outbound already needed, plus nothing else: `node` on `PATH`, and a globally installed `mudslide`, whose own `node_modules` is where the listener finds the baileys package.
+Discovery looks under `~/.local/lib/node_modules`, `/usr/local/lib/node_modules` and `/usr/lib/node_modules`, for either `mudslide/node_modules/baileys` or a top-level `baileys`.
+A baileys installed anywhere else needs `FM_WA_BAILEYS_DIR` pointing at its package directory; without it the listener refuses to start and says so rather than half-running.
+
 ### 1. Opt in
 
 Write the gitignored `config/whatsapp.env`:
@@ -206,7 +210,8 @@ The report arrives as an ordinary channel fault naming the key to fix, and `bin/
 
 ### More than one captain number
 
-The captain may carry more than one phone, so `FM_WA_CAPTAIN` takes a list. Replies go to all of them.
+The captain may carry more than one phone, so `FM_WA_CAPTAIN` takes a list. Replies go to all of them, unless `bin/fm-wa-send.sh --to <number>` addresses exactly one, which is how a reply follows an inbound message back to the phone it came from.
+A delivery that reaches some phones and not others fails, naming the number that missed it and reporting what mudslide said, rather than passing as sent.
 
 ```sh
 FM_WA_CAPTAIN=447700900123,447700900124
@@ -448,3 +453,9 @@ The practical consequence is that `disarm` keeps the channel down only until the
 | `state/wa-auth/` | this listener's linked-device credentials |
 | `state/wa-listener.log` | listener log, including every refusal and why |
 | `state/wa-listener.beat` | touched only while the connection is open; the poll's liveness signal |
+| `state/wa-listener.pid` `state/wa-listener.pid-identity` | the running listener and the identity every stop is proved against |
+| `state/wa-listener.status` | what the listener says about its own connection and the faults it hit |
+| `state/wa-listener.error.*` | per-fault dedupe records, so one report is not repeated every cycle |
+| `state/wa-listener.restart` `state/wa-listener.restarts` | the last restart the poll spawned, and how many it has spent |
+| `state/wa-watermark` | newest accepted send time, so redelivery cannot replay old messages |
+| `state/wa-poll.offered` `state/wa-poll.error` | the announced pending set, and the deduped fault report |

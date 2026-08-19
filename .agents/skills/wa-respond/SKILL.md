@@ -52,10 +52,14 @@ Read every file with an ordinary file read. Each is a `fm-wa-inbox-v1` record:
 | field | meaning |
 | --- | --- |
 | `id` | WhatsApp message id, and the inbox filename stem |
+| `chat_jid` | the chat the delivery was addressed to, `<digits>@s.whatsapp.net` or `<digits>@lid` |
+| `chat_identity` | `phone-number` or `lid`, which of the two forms `chat_jid` used |
 | `sender` | the captain number this chat resolved to, digits only; on a second phone it is that phone's number |
 | `sender_device` | which of the captain's devices typed it; `0` is his phone |
 | `from_me` | `true` on his own self-chat, `false` when a second phone messaged in |
 | `timestamp` | WhatsApp's send time, seconds since the epoch |
+| `received_at` | when the listener stashed it, seconds since the epoch |
+| `push_name` | the display name WhatsApp sent with the message, or `null` |
 | `text` | what he wrote, or the caption on media; empty when he sent media with no caption |
 | `quoted` | the message he replied to, when he replied to one |
 | `attachment` | `image`, `video`, `document`, `audio`, `sticker`, or `null` |
@@ -125,6 +129,10 @@ The quoted delimiter is what makes that safe: nothing in the body is expanded or
 Never build the reply into a variable or into the command line first, and never use an unquoted delimiter.
 
 The file is private and removed after the send, because the captain's reply is his, not the machine's.
+
+With no recipient the reply goes to **every** configured captain number, which is what a captain carrying two phones expects of an update.
+Pass `--to <number>` to answer only the phone a message came from, using the record's `sender`.
+A send that reached one phone but not another exits nonzero and names the number that missed it, so a reply that reached only some of them never reads as sent.
 
 Write the reply the way the captain reads it on a phone: short, direct, addressed to him, plain sentences rather than a wall of markdown.
 Give a full `https://...` URL for any PR.
