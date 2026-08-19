@@ -6,8 +6,9 @@
 # The one cycle that finds the configuration definitively gone retires its own
 # artifacts, stops the listener this home started, clears the captain's stashed
 # messages with them, and speaks only when that listener cannot be stopped. A
-# configuration this cycle merely could not READ is not an opt-out: nothing is
-# torn down, and the unreadable configuration is reported instead.
+# configuration that is still there but yields no captain - unreadable,
+# truncated, blanked or commented out - is not an opt-out: nothing is torn down,
+# and the configuration that names nobody is reported instead.
 # The watcher runs it through the ordinary registered-custom-check path
 # (state/wa-watch.check.sh, bound by bin/fm-check-register.sh), so nothing in
 # the supervision loop itself changes: its contract is "output => wake
@@ -190,16 +191,20 @@ emit_poll_error() { emit_error_once "$FM_WA_ERROR" wa-poll.error "$1"; }
 # that keep this home supervised. The clearing waits on the stop, because a
 # listener still running would only write the inbox straight back.
 #
-# A configuration that merely could not be READ is not an opt-out and must never
-# be treated as one. A permission failure, or the instant an editor has
-# truncated the file to rewrite it, would otherwise take the whole channel down
-# for a non-reason - and nothing would ever bring it back on its own within this
-# cycle, so the captain would be left messaging a home that cannot answer and
-# cannot say why. Everything is therefore left exactly as it is and reported
-# through the ordinary deduped fault path, so a transient blip costs one line an
-# hour rather than a wake every cycle. It is reported only when this home has
-# something armed or running to lose: a home that never opted in stays the hard
-# no-op it has always been.
+# A configuration that is present but yields no captain is not an opt-out and
+# must never be treated as one. A permission failure, the instant an editor has
+# truncated the file to rewrite it, a blanked value and a commented-out key all
+# land here, and only the last two could even be an attempt to switch the
+# channel off - which is why none of them may. Acting on them would take the
+# whole channel down for what may be a non-reason, and nothing would bring it
+# back on its own within this cycle, so the captain would be left messaging a
+# home that cannot answer and cannot say why. Everything is therefore left
+# exactly as it is and reported through the ordinary deduped fault path, so a
+# transient blip costs one line an hour rather than a wake every cycle. The
+# report names the deliberate off switches instead, because the file reading
+# perfectly well and simply naming nobody is the commonest way here. It speaks
+# only when this home has something armed or running to lose: a home that never
+# opted in stays the hard no-op it has always been.
 if [ -z "$CONFIG_OK" ]; then
   if fm_wa_config_confirmed_absent; then
     if retire_listener; then
@@ -207,7 +212,7 @@ if [ -z "$CONFIG_OK" ]; then
     fi
     self_disarm
   elif [ -f "$FM_WA_STATE/wa-watch.check.sh" ] || fm_wa_listener_pid >/dev/null 2>&1; then
-    emit_poll_error "the WhatsApp channel configuration cannot be read, so the channel is left armed and running untouched; check ${FM_WA_CONFIG_FILE:-config/whatsapp.env}"
+    emit_poll_error "no captain could be read from the WhatsApp channel configuration, so the channel is left armed and running untouched; blanking or commenting FM_WA_CAPTAIN is not the off switch - remove ${FM_WA_CONFIG_FILE:-config/whatsapp.env} or run bin/fm-wa-setup.sh disarm"
   fi
   exit 0
 fi
@@ -368,6 +373,19 @@ ensure_listener() {
     else
       return 0
     fi
+  fi
+  # A pid file naming a live process this home cannot claim is not a stale one,
+  # and the difference matters most here. Every other path - stop, unpair,
+  # disarm, status, and the retiring cycle - reports it rather than acting,
+  # because signalling a stranger is not this home's to do; spawning past it
+  # would instead put a SECOND connection on the one credential folder WhatsApp
+  # allows, which is the failure the whole design is built to avoid, and would
+  # then overwrite the pid file so the first listener is untracked as well. This
+  # is the only unattended path, so it is the one place that must not be the
+  # exception: it says so and starts nothing.
+  if fm_wa_listener_pid_foreign; then
+    emit_listener_error foreign "the recorded WhatsApp listener pid is a live process this home cannot prove is its own listener, so nothing was started or signalled; check state/wa-listener.pid by hand"
+    return 1
   fi
   if [ "$state" = "logged-out" ]; then
     emit_listener_error logged-out "WhatsApp listener was logged out; re-pair with bin/fm-wa-listen.sh unpair then pair"

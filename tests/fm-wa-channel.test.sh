@@ -1531,6 +1531,56 @@ test_the_real_echo_consumes_its_own_marker() {
   pass "firstmate's echo clears its own digest instead of leaving it as a trap"
 }
 
+# FM_WA_ALLOW_DEVICES=* accepts every device, mudslide's included, so on such a
+# home the digest is the only thing standing between firstmate and its own words.
+# It is kept rather than refused because it is the only way a host whose baileys
+# exposes no raw stanza hook can read the captain at all - but one mechanism is
+# not enough for something that runs unattended, and the digest is single-consume
+# by design. WhatsApp delivers the same message twice routinely: once as `notify`
+# and again as `append`, and again after a restart for anything that was offline.
+# The second delivery finds no digest, and a self-reply loop over the captain's
+# own account is the result. The durable per-message marker is the second
+# mechanism, and it outlives the digest by thirty days.
+wildcard_fixture() {
+  local home=$1 body=$2
+  printf '%s' "$body" | FM_WA_STATE="$home/state" FM_WA_AUTH_DIR="$home/state/wa-auth" \
+    FM_WA_CAPTAIN="$CAPTAIN" FM_WA_ALLOW_DEVICES='*' \
+    node "$LISTENER" handle-fixture 2>/dev/null
+}
+
+test_a_consumed_echo_cannot_be_redelivered() {
+  command -v node >/dev/null 2>&1 || { pass "echo redelivery guard skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/echoredeliver"
+  new_home "$home"
+  printf 'Captain, the checks are green.\n' > "$TMP_ROOT/echoredeliver-reply.txt"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_DRY_RUN=1 \
+    "$SEND" --text-file "$TMP_ROOT/echoredeliver-reply.txt" >/dev/null 2>&1 \
+    || fail "recording the outbound reply failed"
+
+  out=$(wildcard_fixture "$home" "$(msg ECHOREDELIVER 2 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, the checks are green."}')")
+  assert_refused "$out" 'matches firstmate outbound' \
+    "firstmate's own reply came back as a new instruction"
+  assert_present "$home/state/wa-seen/ECHOREDELIVER.seen" \
+    "the echo was dropped without leaving anything a redelivery could be caught by"
+
+  # The digest is gone now, exactly as it is in the field. The same delivery
+  # arriving again must still not become an instruction.
+  out=$(wildcard_fixture "$home" "$(msg ECHOREDELIVER 2 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, the checks are green."}')")
+  assert_refused "$out" 'already handled' \
+    "a redelivered echo was stashed as a fresh captain instruction"
+  assert_absent "$home/state/wa-inbox/ECHOREDELIVER.json" \
+    "a redelivered echo reached the inbox with every device accepted"
+
+  # ...and the marker is per message, so the captain repeating those exact words
+  # under his own id is still heard.
+  out=$(wildcard_fixture "$home" "$(msg CAPGREEN 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, the checks are green."}')")
+  assert_contains "$out" 'ACCEPTED' \
+    "the durable echo marker swallowed the captain's own words"
+
+  pass "a consumed echo stays refused when WhatsApp delivers it again"
+}
+
 # A stalled listener is reported AND repaired in the same cycle, so the poll
 # carries on to the restart budget after speaking. Two fault lines in one cycle
 # would break the one-line check contract, and a shared record would leave the
@@ -1770,6 +1820,7 @@ test_listener_is_idempotent
 test_listener_captures_quoted_context
 test_echo_digest_guard
 test_the_real_echo_consumes_its_own_marker
+test_a_consumed_echo_cannot_be_redelivered
 test_two_faults_in_one_cycle_still_speak_once
 test_echo_digest_normalization_matches
 test_stale_echo_marker_does_not_swallow_the_captain
@@ -1883,6 +1934,56 @@ test_a_listener_this_home_does_not_own_is_never_signalled() {
     || fail "stop killed a process it could not prove was this home's listener"
 
   pass "a live process this home cannot claim is reported, never signalled"
+}
+
+# The same refusal, on the one path nobody is watching. The channel-off paths
+# report an unclaimable pid rather than signalling it, but the poll's automatic
+# restart is what runs unattended, and it is the direction where guessing costs
+# more: spawning past a live stranger puts a SECOND connection on the one
+# credential folder WhatsApp allows - the failure the whole design exists to
+# avoid - and then overwrites the pid file, so the first process keeps running
+# with nothing tracking it. Unattended is exactly when that happens and exactly
+# when nobody sees it, so this path must be the same as every other.
+test_the_restart_path_never_spawns_over_an_unclaimable_listener() {
+  local home out pid
+  home="$TMP_ROOT/restartforeign"
+  new_home "$home"
+  mkdir -p "$home/state/wa-auth"
+  printf '{"registered": true}\n' > "$home/state/wa-auth/creds.json"
+  # Alive, paired, and holding a pid this home cannot bind to its own listener:
+  # everything the restart path needs to decide the listener is gone.
+  sleep 300 &
+  pid=$!
+  FAKE_PIDS="$FAKE_PIDS $pid"
+  printf '%s\n' "$pid" > "$home/state/wa-listener.pid"
+  printf 'Sat Jan  1 00:00:00 2000\n' > "$home/state/wa-listener.pid-identity"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$SETUP" arm >/dev/null 2>&1 || fail "arm failed"
+
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-channel-error' \
+    "the restart path passed an unclaimable listener record without saying so"
+  assert_contains "$out" 'cannot prove' "the report did not name why nothing was started"
+  [ "$(cat "$home/state/wa-listener.pid")" = "$pid" ] \
+    || fail "the restart path overwrote the pid of a process it could not claim"
+  kill -0 "$pid" 2>/dev/null \
+    || fail "the restart path signalled a process it never proved was its own listener"
+  assert_absent "$home/state/wa-listener.restart" \
+    "the restart path spawned a second listener onto the one credential folder"
+
+  # ...and it is deduped like every other fault, so an unattended home does not
+  # wake firstmate every cycle over a condition only a human can clear.
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "the unclaimable listener was reported again on the next cycle: $out"
+
+  # The command that actually writes the pid file refuses for the same reason,
+  # so the guard does not depend on the caller having checked first.
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$LISTEN_SH" start 2>&1) \
+    && fail "start wrote over the pid of a process it could not claim"
+  assert_contains "$out" 'cannot prove' "start did not say why it started nothing"
+  [ "$(cat "$home/state/wa-listener.pid")" = "$pid" ] \
+    || fail "start overwrote the pid of a process it could not claim"
+
+  pass "the unattended restart path refuses an unclaimable listener like every other path"
 }
 
 # The listener and the shell library both decide whether a message id may become
@@ -2118,6 +2219,7 @@ test_stopping_works_after_the_config_is_gone
 test_the_retiring_cycle_stops_the_listener
 test_status_reports_a_stranded_listener
 test_a_listener_this_home_does_not_own_is_never_signalled
+test_the_restart_path_never_spawns_over_an_unclaimable_listener
 test_a_deaf_listener_is_reported_as_stopped_once_it_is
 test_a_deaf_wedged_listener_is_cleaned_up_and_replaced
 test_disarm_stops_the_listener
@@ -2128,11 +2230,14 @@ test_a_host_that_cannot_hash_says_so
 
 # --- the channel goes down only for a reason, and comes back on its own ------
 
-# Every reason config/whatsapp.env cannot be read looks the same from outside,
-# and only one of them is the captain switching the channel off. Answering all
-# of them by stopping the listener and deleting the poll means a single unlucky
-# cycle takes the channel down for good, after which he messages a home that
-# will never answer and cannot tell that apart from being ignored.
+# Every reason a present config/whatsapp.env yields no captain looks the same
+# from outside, and none of them is the deliberate opt-out. Answering them by
+# stopping the listener and deleting the poll means one unlucky cycle - or one
+# blanked value typed as a guess at the off switch - takes the channel down for
+# good, after which he messages a home that will never answer and cannot tell
+# that apart from being ignored. The report has to name the real off switches,
+# because a file that read perfectly well and simply names nobody is the
+# commonest way into this state.
 test_an_unreadable_config_is_never_an_opt_out() {
   local variant home out pid
   for variant in empty truncated unreadable; do
@@ -2156,8 +2261,10 @@ test_an_unreadable_config_is_never_an_opt_out() {
     out=$(poll "$home")
     assert_contains "$out" 'wa-channel-error' \
       "a $variant config was treated as an opt-out instead of being reported"
-    assert_contains "$out" 'cannot be read' \
-      "the report did not say the configuration is unreadable rather than gone"
+    assert_contains "$out" 'no captain could be read' \
+      "the report did not say the configuration names no captain rather than being gone"
+    assert_contains "$out" 'is not the off switch' \
+      "the report did not name the deliberate off switches"
 
     kill -0 "$pid" 2>/dev/null \
       || fail "a $variant config stopped the listener"
@@ -2177,7 +2284,7 @@ test_an_unreadable_config_is_never_an_opt_out() {
     chmod 600 "$home/config/whatsapp.env" 2>/dev/null || true
   done
 
-  pass "a configuration that cannot be read leaves the channel armed and running"
+  pass "a configuration that names no captain leaves the channel armed and running"
 }
 
 # A home that never opted in has nothing armed and nothing running, so the poll

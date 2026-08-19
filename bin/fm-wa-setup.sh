@@ -29,7 +29,12 @@
 #   - run disarm: the check artifact, its registration, and the cadence file are
 #     removed, the home stops counting as needing supervision, and the listener
 #     this home started is stopped as well - disarm is what removes the cycle
-#     that would otherwise have stopped it, so it has to do that itself
+#     that would otherwise have stopped it, so it has to do that itself.
+#     It takes the channel down NOW, not for good: while config/whatsapp.env
+#     still names a captain, the next session start re-arms the shim and the
+#     cadence, exactly as Relay's are re-armed while a pairing token is present.
+#     Deleting the config is what makes it permanent, so use disarm to stop the
+#     channel immediately and remove the config when it should stay off
 
 # shellcheck disable=SC2030,SC2031 # bin/fm-wa-lib.sh reads a process identity
 # inside a subshell that sources bin/fm-wake-lib.sh, and that library assigns its

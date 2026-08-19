@@ -96,6 +96,17 @@ cmd_start() {
     echo "listener already running (pid $(fm_wa_listener_pid))"
     return 0
   fi
+  # A live pid this home cannot claim is not a stale record to write over. Every
+  # path that stops the listener refuses to signal one, and starting past it is
+  # the mirror image of the same mistake: it would put a second connection on the
+  # one credential folder WhatsApp allows and then overwrite the pid file, so the
+  # first process is left running and untracked. This is also the only place the
+  # pid file is ever written, so the refusal belongs here as well as in the
+  # poll's own restart path, which reaches the spawn through this command.
+  if fm_wa_listener_pid_foreign; then
+    echo "error: state/wa-listener.pid names a live process this home cannot prove is its own listener; nothing was started, check it by hand" >&2
+    return 1
+  fi
   if ! fm_wa_paired; then
     echo "not paired: run bin/fm-wa-listen.sh pair and have the captain enter the code" >&2
     return 1

@@ -607,7 +607,23 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
   // then sit out the whole TTL as a trap for the captain typing those same
   // words himself. Letting the echo consume its marker here bounds that window
   // to the seconds the round trip actually takes.
-  if (await consumeOwnEcho(text)) return reject('matches firstmate outbound', id)
+  // The digest is single-consume by design, so on its own it stops exactly one
+  // delivery. WhatsApp gives no such guarantee: one message arrives as `notify`
+  // and again as `append`, and a restart replays what was offline. The second
+  // delivery finds no digest, and with FM_WA_ALLOW_DEVICES=* no device filter
+  // either, so firstmate's own words would be stashed as a fresh instruction it
+  // then answers - a self-reply loop over the captain's own account, unattended.
+  //
+  // The wildcard is kept rather than refused because it has a real use: it is
+  // the only way a host whose baileys exposes no raw stanza hook can read the
+  // captain at all, and refusing it there would silently take the channel down.
+  // So the guard gains a second, durable mechanism instead of relying on one:
+  // the same per-id marker that already makes a redelivery idempotent is
+  // written here, and it outlives the digest by thirty days.
+  if (await consumeOwnEcho(text)) {
+    publishOnce(SEEN, `${id}.seen`, `${timestamp}\n`)
+    return reject('matches firstmate outbound', id)
+  }
 
   const device = deviceById.get(id) ?? null
   if (!deviceAllowed(device)) {

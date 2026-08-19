@@ -453,7 +453,7 @@ It is captain-private and is **not** inherited by secondmate homes.
 
 | key | default | meaning |
 | --- | --- | --- |
-| `FM_WA_CAPTAIN` | *(none)* | captain's number, digits only; empty or absent means the channel is off |
+| `FM_WA_CAPTAIN` | *(none)* | captain's number, digits only; the channel is on while the file names one, and blanking or commenting the key does not switch it off |
 | `FM_WA_ALLOW_DEVICES` | `0` | comma-separated accepted sender-device numbers, or `*` for any |
 | `FM_WA_DRY_RUN` | *(off)* | `1` records replies to `state/wa-outbox/` and transmits nothing |
 | `FM_WA_HISTORY_HORIZON` | `0` | seconds of backlog accepted on first run |
@@ -464,7 +464,10 @@ It is captain-private and is **not** inherited by secondmate homes.
 The cadence contract is the Relay one above, and the value is deliberately identical so a home running both channels cannot end up with two cadences that disagree.
 An armed `state/wa-watch.check.sh` counts as a reason to supervise the home in `bin/fm-supervision-lib.sh`, the same way `state/x-watch.check.sh` does, because the captain messages precisely when nothing else is running.
 `bin/fm-wa-setup.sh disarm` removes those artifacts and stops the listener this home started, and the first poll cycle after `config/whatsapp.env` disappears retires the artifacts itself, stops that listener, and clears this home's stashed WhatsApp messages and records, so whichever way the channel is switched off, whatever runs next cleans it up.
-Only a *confirmed absent* `config/whatsapp.env` counts as that opt-out: a file that merely cannot be read leaves the channel armed and the listener running, and is reported instead.
+Only a *confirmed absent* `config/whatsapp.env` counts as that opt-out.
+A file that is still there but yields no captain - unreadable, truncated, blanked, or with the key commented out - is indeterminate, so the channel stays armed and the listener keeps running, and the poll reports that no captain could be read instead.
+That is deliberate and settled: staying armed when the captain wanted it off is a mistake he can see and correct in one command, while going silently dead is the exact failure this channel exists to prevent.
+The two deliberate off switches are removing the file and `bin/fm-wa-setup.sh disarm`; blanking a value is never one.
 In the other direction, `bin/fm-bootstrap.sh` re-arms the shim and cadence at every session start while the file still names a captain, exactly as it re-arms Relay's artifacts while `FMX_PAIRING_TOKEN` is present, so a home cannot end up configured but silently unable to hear him.
 
 [whatsapp-channel.md](whatsapp-channel.md) owns everything else about this channel: the one-connection-per-credential-folder constraint and the second-linked-device decision it forced, pairing and re-pairing, the two captain identities the listener accepts, the accepted-device and echo-suppression guards, the dry-run switch, the listener health and restart contract, and the full turn-off procedure.

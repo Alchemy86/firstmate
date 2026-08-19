@@ -120,7 +120,7 @@ That single non-empty value is the switch. Everything else is optional:
 
 | key | default | meaning |
 | --- | --- | --- |
-| `FM_WA_CAPTAIN` | *(none)* | captain's number, digits only. Empty or absent = channel off |
+| `FM_WA_CAPTAIN` | *(none)* | captain's number, digits only. The channel is on while the file names one; see [A configuration that names no captain is not an opt-out](#a-configuration-that-names-no-captain-is-not-an-opt-out) |
 | `FM_WA_ALLOW_DEVICES` | `0` | comma-separated device numbers to accept; `*` accepts any |
 | `FM_WA_DRY_RUN` | *(off)* | `1` records replies to `state/wa-outbox/` and sends nothing |
 | `FM_WA_HISTORY_HORIZON` | `0` | seconds of backlog to accept on first run |
@@ -295,12 +295,17 @@ Only `start` and `pair` refuse, because they act as the captain and the identity
 
 `mudslide send` keeps working through all of it.
 
-### A configuration that cannot be read is not an opt-out
+### A configuration that names no captain is not an opt-out
 
 Only a configuration that is definitively *gone* switches the channel off.
-A permission failure, an unreadable file, or the instant an editor has truncated `config/whatsapp.env` to rewrite it all leave the channel exactly as it is: the listener keeps running, the shim stays armed, and nothing is cleared.
-The poll reports the unreadable configuration through its ordinary deduped fault line instead, so a transient blip costs one report rather than the channel.
+A permission failure, an unreadable file, the instant an editor has truncated `config/whatsapp.env` to rewrite it, a blanked `FM_WA_CAPTAIN`, and a commented-out one all leave the channel exactly as it is: the listener keeps running, the shim stays armed, and nothing is cleared.
+The poll reports that no captain could be read through its ordinary deduped fault line instead, so a transient blip costs one report rather than the channel.
 Conflating the two would mean a single unlucky read could stop the listener and delete the poll, after which nothing would ever poll this home again, and the captain would be messaging a home that could not answer and could not say why.
+
+The blanked and commented cases are in that group on purpose, even though they are the likeliest deliberate attempt to switch the channel off.
+The two outcomes are not symmetric: a channel that stays armed when he wanted it off is a mistake he can see and correct in one command, while a channel that goes quietly dead is indistinguishable from being ignored, which is the one failure he cannot debug from his phone.
+So the deliberate off switches are `rm config/whatsapp.env` and `bin/fm-wa-setup.sh disarm`, and emptying a value is never one.
+This is settled; the fault line names both switches rather than leaving him to guess.
 
 The arming artifacts converge back for the same reason.
 While `config/whatsapp.env` names a captain, every session start re-arms the check shim and the cadence if either has gone missing, exactly as `bin/fm-bootstrap.sh` re-arms Relay's while a pairing token is present.
