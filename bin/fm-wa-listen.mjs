@@ -298,8 +298,9 @@ async function consumeOwnEcho(text) {
   const digest = createHash('sha256').update(normalized, 'utf8').digest('hex')
   let entries = []
   try { entries = fs.readdirSync(SENT) } catch { return false }
-  // `<digest>.sent` and `<digest>.<n>.sent` both match, so a marker written by
-  // an older send is still consumed by the echo it belongs to.
+  // Everything after the digest is the send's own key, so `<digest>.sent`,
+  // `<digest>.<n>.sent` and `<digest>.<send>-<n>.sent` all match and a marker
+  // written by an older send is still consumed by the echo it belongs to.
   const prefix = `${digest}.`
   for (const entry of entries.filter((e) => e.startsWith(prefix) && e.endsWith('.sent')).sort()) {
     try {
@@ -672,17 +673,31 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
     if (verdict.unresolved) {
       return reject('LID chat carries no phone number to check against the configured captains', remoteJid)
     }
-    // Equally distinct: this is us talking, in a chat that is not our own, so
-    // no configured number can make it an instruction.
+    // Equally distinct, and named so an operator can tell the two things it
+    // covers apart: usually it is one delivery of firstmate's own reply coming
+    // back, but it is ALSO what a message from the captain looks like when his
+    // chat identity is not recognised, and that second case is a dropped
+    // instruction rather than routine traffic. docs/whatsapp-channel.md
+    // troubleshoots it alongside the device filter.
     //
-    // It may still be one delivery of a reply that fanned out to several
-    // phones, coming back. Its digest marker is consumed here even though the
-    // message is refused anyway, because a marker no echo ever consumes
-    // outlives the reply as a trap: the first time the captain himself typed
-    // those words inside the echo window, his instruction would be swallowed.
-    // One marker per delivery, one delivery consuming each.
+    // A fanned-out reply echoes back once per delivery, so the digest marker is
+    // consumed here even though the message is refused anyway: a marker no echo
+    // ever consumes outlives the reply as a trap, and the first time the captain
+    // himself typed those words inside the echo window his instruction would be
+    // swallowed. One marker per delivery, one delivery consuming each.
+    //
+    // The consume is single-shot, and WhatsApp redelivers - the same echo
+    // arrives as `notify` and again as `append`, and a restart replays what was
+    // offline - so a redelivery would spend a SECOND marker and leave the echo
+    // it belonged to unguarded. The per-id marker that already makes the
+    // accepted path idempotent does the same job here.
     if (verdict.outgoing) {
-      await consumeOwnEcho(extractText(unwrap(msg.message)))
+      if (fs.existsSync(path.join(SEEN, `${id}.seen`))) {
+        return reject('our own outgoing message, already accounted for', remoteJid)
+      }
+      if (await consumeOwnEcho(extractText(unwrap(msg.message)))) {
+        publishOnce(SEEN, `${id}.seen`, `${timestamp}\n`)
+      }
       return reject('our own outgoing message in a chat that is not the captain\'s own', remoteJid)
     }
     return reject('not the captain\'s direct chat', remoteJid)

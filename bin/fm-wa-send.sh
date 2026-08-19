@@ -107,16 +107,25 @@ DIGEST=$(printf '%s' "$NORMALIZED" | fm_wa_sha256) || DIGEST=
 # unguarded - which under FM_WA_ALLOW_DEVICES=* is firstmate reading its own
 # reply back as a fresh captain instruction. The index also lets a recipient
 # that never got the message drop its own marker below and no one else's.
+#
+# The name is keyed to THIS send as well as to the text. The publish is an
+# atomic rename, so naming a marker by digest and index alone would let a second
+# send of identical words inside the echo window REWRITE the first send's
+# markers instead of adding to them, leaving twice the echoes with half the
+# markers - the same ledger imbalance one marker per send had, one level up.
+# Identical replies are ordinary traffic here, not a corner case: the routine
+# acknowledgement firstmate sends is a fixed sentence.
+SEND_KEY="$(date +%s)-$$"
 MARKERS=
 marker_for() {
   [ -n "$DIGEST" ] || return 1
-  printf '%s/%s.%s.sent' "$FM_WA_SENT" "$DIGEST" "$1"
+  printf '%s/%s.%s-%s.sent' "$FM_WA_SENT" "$DIGEST" "$SEND_KEY" "$1"
 }
 if [ -n "$DIGEST" ] && fm_wa_id_safe "$DIGEST"; then
   IDX=0
   for RECIPIENT in $RECIPIENTS; do
     IDX=$(( IDX + 1 ))
-    if : | fm_wa_publish_stdin "$FM_WA_SENT" "$DIGEST.$IDX.sent" 2>/dev/null; then
+    if : | fm_wa_publish_stdin "$FM_WA_SENT" "$DIGEST.$SEND_KEY-$IDX.sent" 2>/dev/null; then
       MARKERS="$MARKERS $(marker_for "$IDX")"
     fi
   done

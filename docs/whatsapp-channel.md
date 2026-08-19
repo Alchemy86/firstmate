@@ -73,6 +73,8 @@ That does mean everything on this chat is `fromMe`, including firstmate's own re
 1. **Sender device.** WhatsApp numbers devices: the captain's phone is device `0`, mudslide is a linked device, and the listener is another. Only device `0` is accepted by default. baileys drops the device from the message key, so the listener reads it from the raw stanza and correlates by message id.
 2. **Outbound digest.** `bin/fm-wa-send.sh` records a digest of every message it sends under `state/wa-sent/`, **one marker per recipient**. If matching text arrives back, the listener consumes one marker and drops the message.
    A reply goes to every configured number, each delivery echoes back separately under its own message id, and the listener spends exactly one marker per echo, so a single marker would be spent by the first echo and leave the rest unguarded.
+   Each marker is keyed to the send that wrote it as well as to the text, so a second reply of identical words inside the window adds its own markers rather than overwriting the first reply's - byte-identical replies are ordinary traffic here.
+   A redelivery of one echo is caught by the durable per-message marker instead of spending a second digest, because WhatsApp delivers the same message more than once.
    The digest is checked before the sender-device filter, so firstmate's own reply consumes its own marker on the way in rather than being rejected as mudslide's device first and leaving the marker behind.
    An echo returns within seconds, so a digest older than ten minutes is swept instead of matched.
    Otherwise the first time the captain himself typed something firstmate once said, his instruction would be swallowed as an echo.
@@ -113,6 +115,21 @@ Add only the devices the captain actually types on.
 
 If the log shows no such lines at all, the message is being refused earlier - `ignored (...)` names which rule - or is not reaching the listener at all, and `bin/fm-wa-listen.sh status` is the next thing to read.
 
+**Then check the two refusals that can hide a real message.**
+Both are logged under their own reason precisely so they can be grepped apart from routine traffic.
+
+```sh
+grep -e 'no phone number' -e 'our own outgoing message' "$FM_HOME/state/wa-listener.log" | tail
+```
+
+`ignored (LID chat carries no phone number to check against the configured captains) <jid>` means the server sent a `@lid` chat with no `sender_pn` to resolve it by, so there was nothing to check against `FM_WA_CAPTAIN`.
+That is refused rather than assumed, and there is no configuration that widens it.
+
+`ignored (our own outgoing message in a chat that is not the captain's own) <jid>` is usually just firstmate's own reply coming back on one of its deliveries, which is routine.
+It is also, however, exactly what a message **from the captain** looks like when the listener does not recognise the chat as his - so if this line names a chat he was typing in, it is a dropped instruction, not an echo.
+Compare the `<jid>` against his own number and against `FM_WA_CAPTAIN`: a `@lid` chat that is neither the self-chat nor resolvable to a configured number lands here, and the fix is to configure the number the chat resolves to rather than to widen the identity rules.
+`ignored (our own outgoing message, already accounted for)` is the same message arriving a second time and is always routine.
+
 ### His two identities
 
 One account, two identifiers, and WhatsApp uses both. The same self-chat arrives addressed to his phone number (`<digits>@s.whatsapp.net`) on some deliveries and to his **LID** (`<digits>@lid`) on others.
@@ -138,9 +155,11 @@ A LID-addressed chat that is not the self-chat is admitted only by the number th
 
 The stashed message records which identity the chat used in its `chat_identity` field, the number the chat actually resolved to in `sender`, and the direction in `from_me`, so a record from a second phone names that phone rather than whichever number happens to be listed first.
 
-`FM_WA_SELF_LID` overrides the LID the listener treats as its own, which is how `tests/fm-wa-channel.test.sh` drives the self-chat path with an invented LID rather than committing a real identity.
-It is an environment variable rather than a `config/whatsapp.env` key on purpose: it is a test input, not a supported way to configure the channel.
-Because it decides an access-control question, do not set it in an operator's environment - a wrong value there both admits the wrong LID and refuses the captain's own.
+`FM_WA_SELF_LID` overrides the LID the listener treats as **this account's own**, which is how `tests/fm-wa-channel.test.sh` drives the self-chat path with an invented LID rather than committing a real identity.
+It is an environment variable rather than a `config/whatsapp.env` key on purpose: it is a test input, not a supported way to configure the channel, and it is deliberately not plumbed through `bin/fm-wa-listen.sh`.
+**Never set it to another party's LID, including the second phone's.**
+Doing so tells the listener that party's chat is its own, and the rules invert exactly: that phone's real messages arrive inbound and are refused, while firstmate's own replies into the chat are `fromMe` and are read as fresh instructions - a self-reply loop running over the captain's own account.
+A second phone needs no LID setting at all; it gets in by its configured number, on the inbound rule above.
 
 ## Media, and what is not read yet
 
@@ -177,14 +196,14 @@ That rule exists so a single number written the way people actually write one ca
 
 The security property is unchanged by the list. Only the configured numbers are accepted, on either identity form, and a number absent from the file is refused even when another number in the file is present.
 
-**Do not rely on the second phone yet.**
-A second phone with its own number is a separate WhatsApp account, so its message to firstmate is not the self-chat: it arrives inbound, from that number, and is admitted by the inbound rule in [His two identities](#his-two-identities) above.
-That path is implemented and covered by tests, but it has **not** been proven against a real second handset - no message from one has ever landed in `state/wa-inbox/`.
-Until one does, treat the first configured number as the only proven way in.
-If it turns out the second phone needs a linked device of its own, that is a second pairing and this document will say so plainly rather than implying it already works.
+**The second phone reaches firstmate through this listener, and needs no pairing of its own.**
+It is a separate WhatsApp account, so its message is not the self-chat: it arrives inbound, from its own number, and is admitted by the inbound rule in [His two identities](#his-two-identities) above.
+Pairing links exactly **one** account - the first number in the list - and the inbound path is what carries the rest, so there is nothing to link on the second handset.
 
-Pairing itself always targets **one** account, the first number in the list.
-The others need no device of their own under the inbound path above.
+**It is verified by fixture only.**
+The path is covered by tests, but no message from a real second handset has ever landed in `state/wa-inbox/`.
+Until one does, treat the first configured number as the only proven way in and do not rely on the second.
+If a real message from it turns out to need a linked device of its own after all, that is a second pairing and this document will say so plainly rather than implying it already works.
 
 That single non-empty value is the switch. Everything else is optional:
 
