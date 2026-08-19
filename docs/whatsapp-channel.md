@@ -115,6 +115,16 @@ Add only the devices the captain actually types on.
 
 If the log shows no such lines at all, the message is being refused earlier - `ignored (...)` names which rule - or is not reaching the listener at all, and `bin/fm-wa-listen.sh status` is the next thing to read.
 
+**Check that the configuration reads the way it is written.**
+A key whose line cannot be parsed, or whose value is not valid for it, falls back to its documented default - and the default for `FM_WA_ALLOW_DEVICES` is the one that drops the captain's own phone.
+That is reported rather than taken silently, so `bin/fm-wa-listen.sh status` names it:
+
+```sh
+bin/fm-wa-listen.sh status | grep 'config problem'
+```
+
+The same fault reaches firstmate as a `wa-channel-error` naming the key, once rather than on every cycle, and again if it is fixed and later comes back.
+
 **Then check the two refusals that can hide a real message.**
 Both are logged under their own reason precisely so they can be grepped apart from routine traffic.
 
@@ -180,6 +190,17 @@ Write the gitignored `config/whatsapp.env`:
 ```sh
 FM_WA_CAPTAIN=447700900123
 ```
+
+The file is read as data and never sourced, so nothing written in it is ever executed - but it is read the way the shell would read it, so annotating a line does what it looks like it does:
+
+```sh
+FM_WA_CAPTAIN=447700900123 # main phone
+FM_WA_ALLOW_DEVICES=0,22   # phone and desktop
+```
+
+An unquoted `# ...` tail is a note and is dropped; a `#` inside quotes belongs to the value.
+A line that cannot be read that way - an unterminated quote, text after a closing one - is refused and reported rather than quietly falling back to a default, as is a value that is not valid for its key.
+The report arrives as an ordinary channel fault naming the key to fix, and `bin/fm-wa-listen.sh status` prints it too.
 
 
 ### More than one captain number

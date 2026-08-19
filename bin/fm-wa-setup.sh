@@ -95,7 +95,11 @@ EOF
 cmd_arm() {
   paths
   if ! fm_wa_load_config; then
-    echo "error: nothing to arm; put FM_WA_CAPTAIN in ${FM_WA_CONFIG_FILE:-config/whatsapp.env} first" >&2
+    if [ -n "${FM_WA_CONFIG_ERROR:-}" ]; then
+      echo "error: nothing to arm; $FM_WA_CONFIG_ERROR" >&2
+    else
+      echo "error: nothing to arm; put FM_WA_CAPTAIN in ${FM_WA_CONFIG_FILE:-config/whatsapp.env} first" >&2
+    fi
     return 1
   fi
   local home_abs root_abs
@@ -184,6 +188,10 @@ cmd_status() {
   else
     echo "config: off (${FM_WA_CONFIG_FILE:-config/whatsapp.env} has no FM_WA_CAPTAIN)"
   fi
+  # A key that could not be read has already fallen back to its default, so
+  # nothing above shows it: without this line the report says the channel is
+  # fine while the file says something else entirely.
+  [ -z "${FM_WA_CONFIG_ERROR:-}" ] || echo "config problem: $FM_WA_CONFIG_ERROR"
   if [ -f "$CHECK" ]; then
     echo "check: present at state/$CHECK_ID.check.sh"
     [ -f "$TRUST" ] && echo "registration: present" || echo "registration: MISSING - re-run arm"

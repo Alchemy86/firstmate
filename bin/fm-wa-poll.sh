@@ -182,6 +182,14 @@ emit_error_once() {
 # the listener program can no longer attach.
 emit_listener_error() { emit_error_once "$LISTENER_ERROR.$1" "wa-listener.error.$1" "$2"; }
 emit_poll_error() { emit_error_once "$FM_WA_ERROR" wa-poll.error "$1"; }
+# A configuration fault keeps its own marker, and must: the quiet cycles below
+# clear $FM_WA_ERROR whenever the inbox is empty and healthy, so a fault that is
+# permanent until an operator edits the file would be reported, forgotten and
+# reported again every other cycle - a wake storm out of one bad line, which is
+# the opposite of saying it once. This one is cleared only when the
+# configuration reads cleanly again.
+CONFIG_ERROR_MARKER="$FM_WA_ERROR.config"
+emit_config_error() { emit_error_once "$CONFIG_ERROR_MARKER" wa-poll.error.config "$1"; }
 
 # The channel is off, and which KIND of off decides everything that follows.
 #
@@ -212,9 +220,30 @@ if [ -z "$CONFIG_OK" ]; then
     fi
     self_disarm
   elif [ -f "$FM_WA_STATE/wa-watch.check.sh" ] || fm_wa_listener_pid >/dev/null 2>&1; then
-    emit_poll_error "no captain could be read from the WhatsApp channel configuration, so the channel is left armed and running untouched; blanking or commenting FM_WA_CAPTAIN is not the off switch - remove ${FM_WA_CONFIG_FILE:-config/whatsapp.env} or run bin/fm-wa-setup.sh disarm"
+    # A line that could not be read names its own cause, and says it instead of
+    # the generic report: "no captain could be read" beside a file that plainly
+    # names one reads as a contradiction the operator cannot act on.
+    if [ -n "${FM_WA_CONFIG_ERROR:-}" ]; then
+      emit_config_error "$FM_WA_CONFIG_ERROR - the channel is left armed and running untouched"
+    else
+      emit_poll_error "no captain could be read from the WhatsApp channel configuration, so the channel is left armed and running untouched; blanking or commenting FM_WA_CAPTAIN is not the off switch - remove ${FM_WA_CONFIG_FILE:-config/whatsapp.env} or run bin/fm-wa-setup.sh disarm"
+    fi
   fi
   exit 0
+fi
+
+# The channel is usable, but something in its configuration still is not: a
+# device list that is not a list, a dry-run switch that is neither on nor off, a
+# line whose quoting cannot be read. Every one of those has a documented default
+# behind it, and taking that default without a word is how a home ends up
+# behaving the opposite of what the file says - the operator reading
+# `FM_WA_DRY_RUN=1` while replies go live to the captain's phones. Reported on
+# the ordinary deduped fault path, so it costs one line an hour rather than a
+# wake per cycle, and the next cycle goes on to announce his messages.
+if [ -n "${FM_WA_CONFIG_ERROR:-}" ]; then
+  emit_config_error "$FM_WA_CONFIG_ERROR"
+else
+  rm -f -- "$CONFIG_ERROR_MARKER" 2>/dev/null || true
 fi
 
 # The listener's own last reported connection state, or empty when it never

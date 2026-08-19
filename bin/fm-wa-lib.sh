@@ -25,6 +25,13 @@ FM_WA_BAILEYS_DIR=
 FM_WA_HISTORY_HORIZON=
 FM_WA_REANNOUNCE=
 FM_WA_CONFIG_FILE=
+# The first configuration line this home could not read, or read into a value
+# that is not valid for its key. Empty when the configuration parsed cleanly.
+# Callers report it; the poll is the one that reaches the captain with it.
+FM_WA_CONFIG_ERROR=
+# Scratch for fm_wa_env_load, so a caller can tell an absent key from one whose
+# line was refused without threading a second return value through every read.
+FM_WA_ENV_VALUE=
 
 # Consumers source this library and read these; shellcheck cannot see across
 # that boundary.
@@ -47,19 +54,113 @@ fm_wa_paths() {
 # Read one KEY=VALUE from an env-style file without sourcing it. The file is
 # operator-written, but treating it as data rather than shell keeps a stray
 # backtick or `$(...)` from becoming execution.
+#
+# It still has to READ the way the operator expects, though, and what an
+# env-style file promises is the shell's reading: an unquoted `# ...` tail is a
+# note, and a `#` inside quotes is part of the value. Without that, annotating a
+# line - the first thing anyone does to a configuration file - folded the note
+# into the value silently, so `FM_WA_DRY_RUN=1 # never send live while testing`
+# loaded as OFF and a commented captain number armed the channel while matching
+# no phone. Nothing is expanded or executed to achieve it: the quotes are
+# stripped as data, character by character, and a `$(...)` inside them stays the
+# literal text it was written as.
+#
+# A line naming the key that cannot be read that way - an unterminated quote,
+# anything but a note after a closing one - is refused rather than guessed at,
+# because silently becoming a default is the whole failure this is fixing.
+#
+# Exit status: 0 with the value on stdout, 1 when the key is absent, 2 when a
+# line naming the key cannot be parsed.
 fm_wa_env_get() {
-  local key=$1 file=$2 line value
-  [ -f "$file" ] || return 1
-  line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -n 1) || return 1
-  [ -n "$line" ] || return 1
-  value=${line#*=}
-  value=${value#"${value%%[![:space:]]*}"}
-  value=${value%"${value##*[![:space:]]}"}
-  case "$value" in
-    \"*\") value=${value#\"}; value=${value%\"} ;;
-    \'*\') value=${value#\'}; value=${value%\'} ;;
+  local key=$1 file=$2
+  # A file this process cannot open is an absent key, not a malformed line: it
+  # says nothing about how the operator wrote it, and reporting bad quoting for
+  # a permission failure would send them looking at the wrong thing entirely.
+  # fm_wa_config_confirmed_absent is what tells the two apart destructively.
+  { [ -f "$file" ] && [ -r "$file" ]; } || return 1
+  FM_WA_ENV_KEY=$key awk '
+    BEGIN { key = ENVIRON["FM_WA_ENV_KEY"]; sq = sprintf("%c", 39); bad = 0; have = 0; value = "" }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/^[ \t]+/, "", line)
+      sub(/^export[ \t]+/, "", line)
+      eq = index(line, "=")
+      if (eq == 0) next
+      if (substr(line, 1, eq - 1) != key) next
+      rest = substr(line, eq + 1)
+      sub(/^[ \t]+/, "", rest)
+      q = substr(rest, 1, 1)
+      if (q == "\"" || q == sq) {
+        val = ""
+        closed = 0
+        n = length(rest)
+        i = 2
+        while (i <= n) {
+          c = substr(rest, i, 1)
+          if (q == "\"" && c == "\\" && i < n) {
+            e = substr(rest, i + 1, 1)
+            if (e == "\"" || e == "\\" || e == "$" || e == "`") { val = val e; i += 2; continue }
+          }
+          if (c == q) { closed = 1; i++; break }
+          val = val c
+          i++
+        }
+        if (!closed) { bad = 1; exit }
+        tail = substr(rest, i)
+        sub(/^[ \t]+/, "", tail)
+        if (tail != "" && substr(tail, 1, 1) != "#") { bad = 1; exit }
+        value = val
+        have = 1
+        next
+      }
+      cut = 0
+      n = length(rest)
+      for (i = 2; i <= n; i++) {
+        if (substr(rest, i, 1) != "#") continue
+        p = substr(rest, i - 1, 1)
+        if (p == " " || p == "\t") { cut = i; break }
+      }
+      if (cut > 0) rest = substr(rest, 1, cut - 1)
+      sub(/[ \t]+$/, "", rest)
+      if (index(rest, "\"") > 0 || index(rest, sq) > 0) { bad = 1; exit }
+      value = rest
+      have = 1
+    }
+    END {
+      if (bad) exit 2
+      if (!have) exit 1
+      printf "%s", value
+    }
+  ' "$file"
+}
+
+# Record the first thing about this home's configuration that could not be read.
+#
+# The first is kept rather than the last because it is the one nearest the
+# operator's edit, and because a channel fault is one line: a second message
+# would only replace the one that names the cause.
+fm_wa_config_fault() {
+  [ -n "$FM_WA_CONFIG_ERROR" ] || FM_WA_CONFIG_ERROR=$1
+}
+
+# Read one key into FM_WA_ENV_VALUE, turning an unreadable line into a recorded
+# fault instead of an empty value that is indistinguishable from an absent key.
+# Always returns 0 so the caller carries on to its documented default with the
+# fault already recorded - the default is still applied, it just no longer
+# happens silently.
+fm_wa_env_load() {
+  local key=$1 file=$2 rc=0
+  FM_WA_ENV_VALUE=$(fm_wa_env_get "$key" "$file" 2>/dev/null) || rc=$?
+  case "$rc" in
+    0) ;;
+    2)
+      FM_WA_ENV_VALUE=
+      fm_wa_config_fault "$key is written in a way this home cannot read; check its quoting in ${file##*/}"
+      ;;
+    *) FM_WA_ENV_VALUE= ;;
   esac
-  printf '%s' "$value"
+  return 0
 }
 
 # Normalise FM_WA_CAPTAIN to a space-separated list of numbers.
@@ -130,39 +231,74 @@ fm_wa_captains_wire() {
 # Load the channel configuration. Returns 1 when the channel is off, which every
 # caller treats as "do nothing, say nothing".
 fm_wa_load_config() {
-  local file
+  local file raw
   fm_wa_paths
   file="${FM_WA_ENV_FILE:-$FM_WA_CONFIG_DIR/whatsapp.env}"
   # shellcheck disable=SC2034  # read by sourcing scripts for their diagnostics.
   FM_WA_CONFIG_FILE=$file
+  FM_WA_CONFIG_ERROR=
 
-  FM_WA_CAPTAIN=$(fm_wa_env_get FM_WA_CAPTAIN "$file" 2>/dev/null) || FM_WA_CAPTAIN=
-  [ -n "${FM_WA_CAPTAIN_OVERRIDE:-}" ] && FM_WA_CAPTAIN=$FM_WA_CAPTAIN_OVERRIDE
-  FM_WA_CAPTAIN=$(fm_wa_parse_captains "$FM_WA_CAPTAIN")
-  [ -n "$FM_WA_CAPTAIN" ] || return 1
+  # Every key is read before the channel-off answer is given, because a fault in
+  # a later key is exactly as invisible as one in the first and the captain only
+  # ever hears about a configuration through this. An absent key still takes its
+  # documented default in silence; a key that is THERE and cannot be used says
+  # so, so a default is never mistaken for the operator's intent.
+  fm_wa_env_load FM_WA_CAPTAIN "$file"
+  raw=$FM_WA_ENV_VALUE
+  [ -z "${FM_WA_CAPTAIN_OVERRIDE:-}" ] || raw=$FM_WA_CAPTAIN_OVERRIDE
+  FM_WA_CAPTAIN=$(fm_wa_parse_captains "$raw")
+  if [ -n "$raw" ] && [ -z "$FM_WA_CAPTAIN" ]; then
+    fm_wa_config_fault "FM_WA_CAPTAIN names no number, so no phone can reach this home; check it in ${file##*/}"
+  fi
 
-  FM_WA_ALLOW_DEVICES=$(fm_wa_env_get FM_WA_ALLOW_DEVICES "$file" 2>/dev/null) || FM_WA_ALLOW_DEVICES=
+  fm_wa_env_load FM_WA_ALLOW_DEVICES "$file"
+  FM_WA_ALLOW_DEVICES=$FM_WA_ENV_VALUE
   case "$FM_WA_ALLOW_DEVICES" in
-    ''|*[!0-9,*[:space:]]*) FM_WA_ALLOW_DEVICES=0 ;;
+    '') FM_WA_ALLOW_DEVICES=0 ;;
+    *[!0-9,*[:space:]]*)
+      fm_wa_config_fault "FM_WA_ALLOW_DEVICES is not a list of sender device numbers, so only device 0 is accepted and the captain's own phone may be dropped; check it in ${file##*/}"
+      FM_WA_ALLOW_DEVICES=0
+      ;;
   esac
 
-  FM_WA_DRY_RUN=${FM_WA_DRY_RUN_ENV:-$(fm_wa_env_get FM_WA_DRY_RUN "$file" 2>/dev/null || true)}
+  fm_wa_env_load FM_WA_DRY_RUN "$file"
+  FM_WA_DRY_RUN=${FM_WA_DRY_RUN_ENV:-$FM_WA_ENV_VALUE}
   case "$FM_WA_DRY_RUN" in
     1|true|yes|on) FM_WA_DRY_RUN=1 ;;
-    *) FM_WA_DRY_RUN= ;;
+    ''|0|false|no|off) FM_WA_DRY_RUN= ;;
+    *)
+      # Reported rather than guessed at in either direction: read as on, a home
+      # that meant to reply goes silent; read as off, a home that meant to
+      # rehearse sends live traffic to the captain's phones.
+      fm_wa_config_fault "FM_WA_DRY_RUN is neither on nor off, so replies are being sent live; check it in ${file##*/}"
+      FM_WA_DRY_RUN=
+      ;;
   esac
 
-  FM_WA_BAILEYS_DIR=${FM_WA_BAILEYS_DIR_ENV:-$(fm_wa_env_get FM_WA_BAILEYS_DIR "$file" 2>/dev/null || true)}
+  fm_wa_env_load FM_WA_BAILEYS_DIR "$file"
+  FM_WA_BAILEYS_DIR=${FM_WA_BAILEYS_DIR_ENV:-$FM_WA_ENV_VALUE}
 
-  FM_WA_HISTORY_HORIZON=$(fm_wa_env_get FM_WA_HISTORY_HORIZON "$file" 2>/dev/null) || FM_WA_HISTORY_HORIZON=
+  fm_wa_env_load FM_WA_HISTORY_HORIZON "$file"
+  FM_WA_HISTORY_HORIZON=$FM_WA_ENV_VALUE
   case "$FM_WA_HISTORY_HORIZON" in
-    ''|*[!0-9]*) FM_WA_HISTORY_HORIZON=0 ;;
+    '') FM_WA_HISTORY_HORIZON=0 ;;
+    *[!0-9]*)
+      fm_wa_config_fault "FM_WA_HISTORY_HORIZON is not a number of seconds, so no history is accepted; check it in ${file##*/}"
+      FM_WA_HISTORY_HORIZON=0
+      ;;
   esac
 
-  FM_WA_REANNOUNCE=$(fm_wa_env_get FM_WA_REANNOUNCE "$file" 2>/dev/null) || FM_WA_REANNOUNCE=
+  fm_wa_env_load FM_WA_REANNOUNCE "$file"
+  FM_WA_REANNOUNCE=$FM_WA_ENV_VALUE
   case "$FM_WA_REANNOUNCE" in
-    ''|*[!0-9]*) FM_WA_REANNOUNCE=1800 ;;
+    '') FM_WA_REANNOUNCE=1800 ;;
+    *[!0-9]*)
+      fm_wa_config_fault "FM_WA_REANNOUNCE is not a number of seconds, so an undrained message is repeated on the default half-hour; check it in ${file##*/}"
+      FM_WA_REANNOUNCE=1800
+      ;;
   esac
+
+  [ -n "$FM_WA_CAPTAIN" ] || return 1
 }
 
 # Whether this home's channel configuration is CONFIRMED gone, as distinct from
@@ -218,6 +354,7 @@ fm_wa_purge_channel_state() {
     "$FM_WA_STATE/wa-watermark" \
     "$FM_WA_OFFERED" \
     "$FM_WA_ERROR" \
+    "$FM_WA_ERROR".* \
     "$FM_WA_LOG" \
     "$FM_WA_STATE/wa-listener.status" \
     "$FM_WA_STATE/wa-listener.beat" \

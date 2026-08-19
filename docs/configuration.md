@@ -448,7 +448,9 @@ See [verification/public-followup.md](verification/public-followup.md) for the c
 
 The captain's inbound WhatsApp channel is off unless the firstmate home's gitignored `config/whatsapp.env` holds a non-empty `FM_WA_CAPTAIN`.
 That single value is the whole switch, exactly as `FMX_PAIRING_TOKEN` is for Relay: with it absent every WhatsApp entry point is a hard no-op that polls nothing, writes nothing, and changes no behavior.
-The file is parsed key by key as data and never sourced.
+The file is parsed key by key as data and never sourced, so nothing written in it is ever executed.
+It is still read the way the shell would read it: an unquoted trailing `# ...` is a note and is dropped, and a `#` inside quotes belongs to the value.
+A line that cannot be parsed, or a value that is not valid for its key, is reported as a channel fault naming that key rather than silently taking the default below.
 It is captain-private and is **not** inherited by secondmate homes.
 
 | key | default | meaning |

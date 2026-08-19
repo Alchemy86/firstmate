@@ -47,7 +47,11 @@ usage() {
 # Starting and pairing act AS the captain, so they genuinely need his identity.
 require_config() {
   if ! fm_wa_load_config; then
-    echo "WhatsApp channel is off: no FM_WA_CAPTAIN in ${FM_WA_CONFIG_FILE:-config/whatsapp.env}" >&2
+    if [ -n "${FM_WA_CONFIG_ERROR:-}" ]; then
+      echo "WhatsApp channel is off: $FM_WA_CONFIG_ERROR" >&2
+    else
+      echo "WhatsApp channel is off: no FM_WA_CAPTAIN in ${FM_WA_CONFIG_FILE:-config/whatsapp.env}" >&2
+    fi
     return 1
   fi
   command -v node >/dev/null 2>&1 || { echo "error: node is required for the WhatsApp listener" >&2; return 1; }
@@ -213,6 +217,9 @@ cmd_status() {
     # operator cannot even see that one is still holding a linked device.
     echo "channel: off (no FM_WA_CAPTAIN in ${FM_WA_CONFIG_FILE:-config/whatsapp.env})"
   fi
+  # Both branches above report a default as though it were a choice when a key
+  # could not be read, so the reason is printed beside them either way.
+  [ -z "${FM_WA_CONFIG_ERROR:-}" ] || echo "config problem: $FM_WA_CONFIG_ERROR"
   if ! fm_wa_paired; then
     echo '{"paired": false}'
   elif command -v node >/dev/null 2>&1 && [ -f "$LISTENER" ] && [ ! -L "$LISTENER" ]; then

@@ -61,7 +61,11 @@ while [ "$#" -gt 0 ]; do
 done
 
 if ! fm_wa_load_config; then
-  echo "error: WhatsApp channel is off; no FM_WA_CAPTAIN in ${FM_WA_CONFIG_FILE:-config/whatsapp.env}" >&2
+  if [ -n "${FM_WA_CONFIG_ERROR:-}" ]; then
+    echo "error: WhatsApp channel is off; $FM_WA_CONFIG_ERROR" >&2
+  else
+    echo "error: WhatsApp channel is off; no FM_WA_CAPTAIN in ${FM_WA_CONFIG_FILE:-config/whatsapp.env}" >&2
+  fi
   exit 1
 fi
 
@@ -172,6 +176,11 @@ if [ -n "$FM_WA_DRY_RUN" ]; then
   # the first number would be evidence quietly saying less than the truth. The
   # `to` field keeps meaning one address rather than growing into a list.
   RECORDS=()
+  # Announced only once every record survives. A later recipient failing to
+  # publish rolls the whole run back, so a line printed as each one is written
+  # would leave the operator holding the names of files that are no longer
+  # there - evidence of a fan-out that was undone.
+  NOTES=()
   DRY_OK=1
   IDX=0
   for RECIPIENT in $RECIPIENTS; do
@@ -181,13 +190,16 @@ if [ -n "$FM_WA_DRY_RUN" ]; then
       "$RECIPIENT" "${DIGEST:-}" "$JSON_TEXT" \
       | fm_wa_publish_stdin "$FM_WA_OUTBOX" "$BASE"; then
       RECORDS+=("$FM_WA_OUTBOX/$BASE")
-      echo "dry-run: recorded state/wa-outbox/$BASE for $RECIPIENT (nothing sent)"
+      NOTES+=("dry-run: recorded state/wa-outbox/$BASE for $RECIPIENT (nothing sent)")
     else
       DRY_OK=
       break
     fi
   done
   if [ -n "$DRY_OK" ] && [ "${#RECORDS[@]}" -gt 0 ]; then
+    for NOTE in ${NOTES[@]+"${NOTES[@]}"}; do
+      echo "$NOTE"
+    done
     exit 0
   fi
   # Nothing was ever going to be sent, so the echo markers have nothing to guard
@@ -201,6 +213,21 @@ if [ -n "$FM_WA_DRY_RUN" ]; then
   echo "error: cannot record the dry-run reply" >&2
   exit 1
 fi
+
+# mudslide's own words are the only place a refused or failed delivery says why,
+# and reporting a failure without them names the symptom while discarding the
+# cause. A partial send is now the commonest real failure - one number reachable
+# on WhatsApp and another not - so it is held to the same promise as a total
+# one. Idempotent, and clears SEND_OUT so the caller cannot report it twice.
+report_send_output() {
+  if [ -n "$SEND_OUT" ] && [ -s "$SEND_OUT" ]; then
+    echo "mudslide said:" >&2
+    head -n 20 -- "$SEND_OUT" >&2
+    [ "$(wc -l < "$SEND_OUT")" -le 20 ] || echo "(output truncated at 20 lines)" >&2
+  fi
+  [ -z "$SEND_OUT" ] || rm -f -- "$SEND_OUT" 2>/dev/null || true
+  SEND_OUT=
+}
 
 # Single argv element: the shell never re-parses the captain's words. `--` ends
 # mudslide's own option parsing before the positionals, so a reply that opens
@@ -245,9 +272,9 @@ FAILED=${FAILED# }
 # markers of the phones that DID get it are KEPT, because the message really did
 # go out to them and will echo back from each of them.
 if [ -n "$DELIVERED" ] && [ -n "$FAILED" ]; then
-  [ -z "$SEND_OUT" ] || rm -f -- "$SEND_OUT" 2>/dev/null || true
   echo "sent to $DELIVERED"
   echo "error: the reply did not reach $FAILED" >&2
+  report_send_output
   exit 1
 fi
 
@@ -259,11 +286,6 @@ else
   # leaving them to suppress the captain saying those same words himself.
   drop_markers
   echo "error: mudslide could not send the reply" >&2
-  if [ -n "$SEND_OUT" ] && [ -s "$SEND_OUT" ]; then
-    echo "mudslide said:" >&2
-    head -n 20 -- "$SEND_OUT" >&2
-    [ "$(wc -l < "$SEND_OUT")" -le 20 ] || echo "(output truncated at 20 lines)" >&2
-  fi
-  [ -z "$SEND_OUT" ] || rm -f -- "$SEND_OUT" 2>/dev/null || true
+  report_send_output
   exit 1
 fi

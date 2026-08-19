@@ -1870,7 +1870,8 @@ test_lid_acceptance_is_not_a_hole() {
 # home that names one number must behave exactly as it did before the list
 # existed - that is the compatibility this asserts, not just that it parses.
 captain_parse() {
-  ( . "$LIB"
+  ( # shellcheck source=bin/fm-wa-lib.sh
+    . "$LIB"
     FM_HOME=$TMP_ROOT
     FM_WA_ENV_FILE=$1 fm_wa_load_config >/dev/null || { printf 'REFUSED'; exit 0; }
     printf '%s' "$FM_WA_CAPTAIN" )
@@ -3318,6 +3319,291 @@ test_a_send_without_mudslide_leaves_no_echo_trap() {
   pass "a send with no mudslide installed leaves no digest to swallow the captain"
 }
 
+# --- an annotated configuration reads the way it is written ------------------
+
+# config/whatsapp.env is presented as an env file, so the first thing anyone
+# does to it is annotate a line - and until this it took the note as part of the
+# value. Every key was affected and every one failed silently: a captain number
+# with a comment appended matched no phone while the channel reported itself on,
+# a device list reverted to the default that drops his own handset, and
+# `FM_WA_DRY_RUN=1 # never send live while testing` loaded as OFF, so the file
+# said the opposite of what the home did. Read here through the real
+# fm_wa_load_config, one key at a time.
+config_load() {
+  local home=$1 field=$2
+  ( # shellcheck source=bin/fm-wa-lib.sh
+    . "$LIB"
+    FM_HOME=$home fm_wa_load_config >/dev/null 2>&1
+    case "$field" in
+      captain) printf '%s' "$FM_WA_CAPTAIN" ;;
+      devices) printf '%s' "$FM_WA_ALLOW_DEVICES" ;;
+      dry) printf '%s' "$FM_WA_DRY_RUN" ;;
+      horizon) printf '%s' "$FM_WA_HISTORY_HORIZON" ;;
+      reannounce) printf '%s' "$FM_WA_REANNOUNCE" ;;
+      baileys) printf '%s' "$FM_WA_BAILEYS_DIR" ;;
+      fault) printf '%s' "$FM_WA_CONFIG_ERROR" ;;
+    esac )
+}
+
+write_config() {
+  local home=$1
+  shift
+  mkdir -p "$home/config"
+  printf '%s\n' "$@" > "$home/config/whatsapp.env"
+}
+
+test_an_annotated_configuration_reads_the_way_it_is_written() {
+  local home out
+  home="$TMP_ROOT/annotated"
+  mkdir -p "$home/state" "$home/config"
+
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN # main phone"
+  out=$(config_load "$home" captain)
+  [ "$out" = "$CAPTAIN" ] || fail "an annotated captain number loaded as '$out'"
+  [ -z "$(config_load "$home" fault)" ] || fail "a well-formed annotated line was reported as a fault"
+
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN,$CAPTAIN2   # both phones"
+  out=$(config_load "$home" captain)
+  [ "$out" = "$CAPTAIN $CAPTAIN2" ] || fail "an annotated captain list loaded as '$out'"
+
+  # The one with real-world consequences: the operator wrote down that this home
+  # must not send, and the home reading that as permission to send live is the
+  # config and its behaviour being exact opposites.
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_DRY_RUN=1 # never send live while testing"
+  [ "$(config_load "$home" dry)" = 1 ] \
+    || fail "an annotated FM_WA_DRY_RUN=1 turned dry run OFF, so a rehearsing home sends live traffic"
+
+  # The device list is the likeliest reason a correctly configured channel still
+  # hears nothing, so silently reverting it to 0 hides the fix as well as the fault.
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_ALLOW_DEVICES=0,2,22 # phone and web"
+  out=$(config_load "$home" devices)
+  [ "$out" = "0,2,22" ] || fail "an annotated device list loaded as '$out'"
+
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_HISTORY_HORIZON=600 # only the last ten minutes"
+  [ "$(config_load "$home" horizon)" = 600 ] || fail "an annotated FM_WA_HISTORY_HORIZON did not load"
+
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_REANNOUNCE=900 # nag sooner"
+  [ "$(config_load "$home" reannounce)" = 900 ] || fail "an annotated FM_WA_REANNOUNCE did not load"
+
+  # A `#` that is genuinely inside quotes belongs to the value, exactly as the
+  # shell would read it.
+  write_config "$home" "FM_WA_CAPTAIN=\"$CAPTAIN\" # quoted" 'FM_WA_BAILEYS_DIR="/tmp/wa#lib" # quoted too'
+  [ "$(config_load "$home" captain)" = "$CAPTAIN" ] || fail "a quoted captain number did not load"
+  out=$(config_load "$home" baileys)
+  [ "$out" = "/tmp/wa#lib" ] || fail "a quoted value lost the # that was part of it: '$out'"
+
+  # Stripping the note must not start expanding the value: the file is still
+  # read as data, so a substitution stays the literal text it was written as.
+  rm -f "$TMP_ROOT/annotated-PWNED"
+  write_config "$home" "FM_WA_CAPTAIN=\"\$(touch $TMP_ROOT/annotated-PWNED)$CAPTAIN\" # sneaky"
+  config_load "$home" captain >/dev/null
+  assert_absent "$TMP_ROOT/annotated-PWNED" \
+    "reading the configuration executed a substitution written into it"
+
+  pass "an annotated configuration line loads the value, not the note"
+}
+
+# The whole class of bug here is a value that quietly became a default, so a
+# line that cannot be read must announce itself rather than joining it.
+test_a_configuration_line_that_cannot_be_read_is_reported() {
+  local home out
+  home="$TMP_ROOT/badline"
+  mkdir -p "$home/state" "$home/config"
+
+  write_config "$home" "FM_WA_CAPTAIN=\"$CAPTAIN" 
+  out=$(config_load "$home" fault)
+  assert_contains "$out" 'FM_WA_CAPTAIN' "an unterminated quote was not reported against its key"
+  [ -z "$(config_load "$home" captain)" ] \
+    || fail "an unterminated quote still produced a captain number"
+
+  write_config "$home" "FM_WA_CAPTAIN=\"$CAPTAIN\" oops"
+  assert_contains "$(config_load "$home" fault)" 'FM_WA_CAPTAIN' \
+    "text after a closing quote was accepted as a value"
+
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_ALLOW_DEVICES=phone,web"
+  out=$(config_load "$home" fault)
+  assert_contains "$out" 'FM_WA_ALLOW_DEVICES' "an unusable device list was not reported"
+  [ "$(config_load "$home" devices)" = 0 ] \
+    || fail "an unusable device list did not fall back to the documented default"
+
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_DRY_RUN=maybe"
+  assert_contains "$(config_load "$home" fault)" 'FM_WA_DRY_RUN' \
+    "a dry-run switch that is neither on nor off was not reported"
+
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_REANNOUNCE=half an hour"
+  assert_contains "$(config_load "$home" fault)" 'FM_WA_REANNOUNCE' \
+    "a re-announce interval that is not a number of seconds was not reported"
+
+  write_config "$home" "FM_WA_CAPTAIN=nobody"
+  assert_contains "$(config_load "$home" fault)" 'names no number' \
+    "a captain value naming no number was not reported"
+
+  pass "a configuration line that cannot be read is reported instead of silently defaulting"
+}
+
+# ...and it reaches the captain through the channel's own fault path, once,
+# rather than becoming a wake every cycle for as long as the line is there.
+test_a_configuration_fault_reaches_the_captain_once() {
+  local home out
+  home="$TMP_ROOT/badlinepoll"
+  new_home "$home"
+  fake_listener "$home"
+  stash_message "$home" MSGBADCFG
+  printf 'FM_WA_CAPTAIN=%s\nFM_WA_ALLOW_DEVICES=phone\n' "$CAPTAIN" > "$home/config/whatsapp.env"
+
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-channel-error' "an unusable configuration value was never reported"
+  assert_contains "$out" 'FM_WA_ALLOW_DEVICES' "the report did not name the key to fix"
+  assert_not_contains "$out" 'wa-message' "a fault cycle also announced the inbox"
+
+  # Said once. The message the captain is waiting on is not starved behind it.
+  out=$(poll "$home")
+  assert_contains "$out" 'wa-message 1 pending, including MSGBADCFG' \
+    "the pending message stayed buried behind the configuration fault"
+  assert_not_contains "$out" 'wa-channel-error' "the configuration fault was reported twice"
+
+  # A quiet cycle clears the ordinary poll marker, and a permanent fault sharing
+  # it would be forgotten and re-reported for ever - one bad line becoming a
+  # wake storm. Draining the inbox is the quiet cycle.
+  rm -f "$home/state/wa-inbox/MSGBADCFG.json"
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "the configuration fault re-fired on a quiet cycle: $out"
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "the configuration fault re-fired on a later quiet cycle: $out"
+
+  # Fixed at the file, reported again if it ever comes back.
+  printf 'FM_WA_CAPTAIN=%s\nFM_WA_ALLOW_DEVICES=0,22\n' "$CAPTAIN" > "$home/config/whatsapp.env"
+  out=$(poll "$home")
+  [ -z "$out" ] || fail "a repaired configuration still reported a fault: $out"
+  printf 'FM_WA_CAPTAIN=%s\nFM_WA_ALLOW_DEVICES=phone\n' "$CAPTAIN" > "$home/config/whatsapp.env"
+  out=$(poll "$home")
+  assert_contains "$out" 'FM_WA_ALLOW_DEVICES' \
+    "a fault that came back after being fixed was never reported again"
+
+  pass "a configuration fault reaches the captain once and stays reportable"
+}
+
+# The end-to-end consequence of the dry-run key, driven through the real send
+# rather than only through the parse: the operator wrote that this home must not
+# send, so nothing may leave it.
+test_an_annotated_dry_run_still_sends_nothing() {
+  local home out bin
+  home="$TMP_ROOT/annotateddry"
+  mkdir -p "$home/state" "$home/config"
+  chmod 700 "$home/state"
+  write_config "$home" "FM_WA_CAPTAIN=$CAPTAIN" "FM_WA_DRY_RUN=1 # never send live while testing"
+  printf 'Captain, shipshape.\n' > "$TMP_ROOT/annotateddry-reply.txt"
+
+  # No mudslide on PATH at all, so a send that went live could not even pretend
+  # to succeed - the dry run is the only way this can pass.
+  bin="$TMP_ROOT/annotateddry-bin"
+  path_excluding "$bin" mudslide
+
+  out=$(PATH="$bin" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/annotateddry-reply.txt" 2>&1) \
+    || fail "the annotated dry run failed: $out"
+  assert_contains "$out" 'nothing sent' "the annotated dry run did not report itself as a dry run"
+  [ "$(find "$home/state/wa-outbox" -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')" -eq 1 ] \
+    || fail "the annotated dry run did not record what it would have sent"
+
+  pass "an annotated FM_WA_DRY_RUN=1 keeps the home from sending live traffic"
+}
+
+# A reply that never arrived is the one failure this channel cannot afford, and
+# mudslide's own output is the only place it says why. Reporting which phone
+# missed it while discarding that output names the symptom and throws away the
+# diagnosis - and now that a reply fans out, one number reachable and another
+# not is the commonest real failure, not the rare one.
+test_a_partial_delivery_reports_what_mudslide_said() {
+  local home fakebin out
+  home="$TMP_ROOT/partialsays"
+  new_home "$home"
+  printf 'FM_WA_CAPTAIN=%s,%s\n' "$CAPTAIN" "$CAPTAIN2" > "$home/config/whatsapp.env"
+  printf 'Captain, the build is green.\n' > "$TMP_ROOT/partialsays-reply.txt"
+
+  fakebin=$(fm_fakebin "$TMP_ROOT/partialsays-bin")
+  cat > "$fakebin/mudslide" <<'SH'
+#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    [0-9][0-9]*)
+      if [ "$a" = "${FAIL_FOR:-}" ]; then
+        echo "not a WhatsApp account: $a" >&2
+        exit 1
+      fi
+      break ;;
+  esac
+done
+exit 0
+SH
+  chmod +x "$fakebin/mudslide"
+
+  out=$(PATH="$fakebin:$PATH" FAIL_FOR="$CAPTAIN2" \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/partialsays-reply.txt" 2>&1) \
+    && fail "a partial delivery was reported as success: $out"
+  assert_contains "$out" "$CAPTAIN2" "the partial failure did not name the number that missed it"
+  assert_contains "$out" 'mudslide said' "the partial failure discarded mudslide's own output"
+  assert_contains "$out" 'not a WhatsApp account' "the cause of the missed delivery was never printed"
+
+  # A total failure still says the same thing, so the two paths cannot drift.
+  out=$(PATH="$fakebin:$PATH" FAIL_FOR="$CAPTAIN" \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --to "$CAPTAIN" --text-file "$TMP_ROOT/partialsays-reply.txt" 2>&1) \
+    && fail "a failed send was reported as success: $out"
+  assert_contains "$out" 'not a WhatsApp account' "a total failure stopped reporting mudslide's output"
+
+  pass "a delivery that missed a phone reports mudslide's own cause, partial or total"
+}
+
+# The dry run is evidence, so its output has to match what is on disk: a later
+# recipient failing to record rolls the whole run back, and lines already
+# printed would leave the operator holding the names of files that are gone.
+test_a_rolled_back_dry_run_names_no_record() {
+  local home fakebin out records real_mktemp
+  # Resolved BEFORE the fake goes on PATH: a command prefix's assignments take
+  # effect left to right, so resolving it inline would point the stub at itself.
+  real_mktemp=$(command -v mktemp)
+  home="$TMP_ROOT/dryrollback"
+  new_home "$home"
+  printf 'FM_WA_CAPTAIN=%s,%s\n' "$CAPTAIN" "$CAPTAIN2" > "$home/config/whatsapp.env"
+  printf 'Captain, shipshape.\n' > "$TMP_ROOT/dryrollback-reply.txt"
+
+  # Lets the first delivery record and refuses the second, which is the only
+  # shape that can print a line and then take the file away again.
+  fakebin=$(fm_fakebin "$TMP_ROOT/dryrollback-bin")
+  cat > "$fakebin/mktemp" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  */wa-outbox/*)
+    n=$(cat "$MKTEMP_COUNT" 2>/dev/null) || n=0
+    n=$(( n + 1 ))
+    printf '%s\n' "$n" > "$MKTEMP_COUNT"
+    [ "$n" -ge 2 ] && exit 1
+    ;;
+esac
+exec "$REAL_MKTEMP" "$@"
+SH
+  chmod +x "$fakebin/mktemp"
+  : > "$TMP_ROOT/dryrollback.count"
+
+  out=$(PATH="$fakebin:$PATH" MKTEMP_COUNT="$TMP_ROOT/dryrollback.count" \
+    REAL_MKTEMP="$real_mktemp" \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WA_DRY_RUN=1 \
+    "$SEND" --text-file "$TMP_ROOT/dryrollback-reply.txt" 2>&1) \
+    && fail "a dry run that could not record every delivery reported success: $out"
+  assert_contains "$out" 'cannot record the dry-run reply' "the rolled-back dry run did not say why"
+  assert_not_contains "$out" 'dry-run: recorded' \
+    "the rolled-back dry run named a record it then deleted"
+
+  records=$(find "$home/state/wa-outbox" -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$records" -eq 0 ] || fail "the rolled-back dry run left $records records behind"
+  [ -z "$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null)" ] \
+    || fail "a dry run that recorded nothing left an echo marker behind"
+
+  pass "a dry run that rolls back names no record it has taken away"
+}
+
 test_an_unreadable_config_is_never_an_opt_out
 test_an_unconfigured_home_is_still_silent
 test_a_configured_home_rearms_itself_at_session_start
@@ -3344,3 +3630,9 @@ test_an_identical_reply_adds_markers_rather_than_replacing_them
 test_a_phone_that_missed_the_reply_drops_its_own_marker
 test_a_failed_send_drops_its_markers_under_a_home_with_a_space
 test_a_dry_run_records_every_delivery_it_would_make
+test_an_annotated_configuration_reads_the_way_it_is_written
+test_a_configuration_line_that_cannot_be_read_is_reported
+test_a_configuration_fault_reaches_the_captain_once
+test_an_annotated_dry_run_still_sends_nothing
+test_a_partial_delivery_reports_what_mudslide_said
+test_a_rolled_back_dry_run_names_no_record
