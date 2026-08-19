@@ -22,6 +22,8 @@
 //   handle-fixture
 //                 read one synthetic message on stdin and report whether it
 //                 would be stashed; used by tests/fm-wa-channel.test.sh
+//   captains      print the parsed captain numbers, one per line, so a test can
+//                 hold this parse against the shell's own
 //
 // Everything it writes is private (0600 files, 0700 directories) and lives
 // under the home's gitignored state/ tree.
@@ -29,8 +31,9 @@
 // Environment (all set by bin/fm-wa-listen.sh):
 //   FM_WA_STATE        state directory (required)
 //   FM_WA_AUTH_DIR     credential folder for THIS device (required)
-//   FM_WA_CAPTAIN      captain's number(s), digits only; comma or space
-//                      separated for more than one, e.g. 447700900123,447700900124
+//   FM_WA_CAPTAIN      captain's number(s); bin/fm-wa-listen.sh hands this the
+//                      already-parsed list joined by commas, e.g.
+//                      447700900123,447700900124
 //   FM_WA_ALLOW_DEVICES  comma-separated WhatsApp device numbers to accept
 //                        (default "0" - the captain's own phone)
 //   FM_WA_BAILEYS_DIR  baileys package directory (auto-discovered when unset)
@@ -44,12 +47,16 @@ import process from 'node:process'
 
 const STATE = requiredEnv('FM_WA_STATE')
 const AUTH_DIR = requiredEnv('FM_WA_AUTH_DIR')
-// Same rule as fm_wa_parse_captains in bin/fm-wa-lib.sh, and it has to stay the
-// same: a comma always separates, while whitespace separates only when every
-// piece is already a plausible number, so `+44 7700 900123` stays one number
-// instead of becoming three that match no phone. The shell normalises before
-// launching the listener, but the listener is also run directly, so it cannot
-// rely on having been handed a tidy list.
+// fm_wa_parse_captains in bin/fm-wa-lib.sh decides the split, and this must not
+// decide it a second time: bin/fm-wa-listen.sh hands over the parsed list joined
+// by commas, which is unambiguous because a comma cannot occur inside a number,
+// so the comma branch reproduces that list entry for entry.
+//
+// The whitespace heuristic below is only for a listener run directly by hand on
+// a raw value, and it carries the same rule the shell applies to one: a comma
+// always separates, while whitespace separates only when every piece is already
+// a plausible number, so `+44 7700 900123` stays one number instead of becoming
+// three that match no phone.
 function parseCaptains(raw) {
   const digits = (s) => s.replace(/[^0-9]/g, '')
   const value = String(raw || '')
@@ -290,6 +297,19 @@ function pruneStaleEchoes() {
 // FM_WA_ALLOW_DEVICES=* is firstmate reading its own reply as a fresh
 // instruction and answering it - the unattended self-reply loop this exists to
 // prevent.
+// Whether any reply is still waiting to be echoed back. Almost none of the
+// captain's own outgoing traffic is one - his linked device sees every message
+// he sends to anyone - so this is what keeps the work and the durable per-id
+// claim below to the window where a reply is actually outstanding, rather than
+// spending both on every word he types to somebody else.
+function echoMarkersPending() {
+  try {
+    return fs.readdirSync(SENT).some((entry) => entry.endsWith('.sent'))
+  } catch {
+    return false
+  }
+}
+
 async function consumeOwnEcho(text) {
   const normalized = normalizeText(text)
   if (normalized === '') return false
@@ -629,15 +649,27 @@ async function runListen() {
       }
     })
 
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    // The emitter does not wait for an async handler, so two emissions would
+    // otherwise run interleaved - and WhatsApp routinely emits the same message
+    // twice, once as `notify` and again as `append`, with a restart replaying
+    // what was offline on top. Every guard here is a read followed by a write
+    // (has this id been handled, is this text an unconsumed echo), and two
+    // deliveries of one id crossing inside that gap each spend a marker the
+    // other still needed. Handling is chained so one message is finished before
+    // the next begins; the durable per-id claims below then cover a restart and
+    // a second process, which serialisation on its own cannot.
+    let handling = Promise.resolve()
+    sock.ev.on('messages.upsert', ({ messages, type }) => {
       if (type !== 'notify' && type !== 'append') return
-      for (const msg of messages ?? []) {
-        try {
-          await handleMessage(msg, deviceById, () => watermark, (ts) => { watermark = ts })
-        } catch (err) {
-          logLine(`message handling failed: ${err.message}`)
+      handling = handling.then(async () => {
+        for (const msg of messages ?? []) {
+          try {
+            await handleMessage(msg, deviceById, () => watermark, (ts) => { watermark = ts })
+          } catch (err) {
+            logLine(`message handling failed: ${err.message}`)
+          }
         }
-      }
+      })
     })
   }
 
@@ -689,19 +721,33 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
     // The consume is single-shot, and WhatsApp redelivers - the same echo
     // arrives as `notify` and again as `append`, and a restart replays what was
     // offline - so a redelivery would spend a SECOND marker and leave the echo
-    // it belonged to unguarded. The per-id marker that already makes the
-    // accepted path idempotent does the same job here.
-    if (verdict.outgoing) {
-      if (fs.existsSync(path.join(SEEN, `${id}.seen`))) {
+    // it belonged to unguarded.
+    //
+    // The create-exclusive marker IS the claim, rather than something read
+    // before the consume and written after it: that pair is not atomic across
+    // the await inside the consume, and it does not survive a restart or a
+    // second process at all. Nothing is lost by claiming first here because the
+    // message is refused either way, and the claim is only taken while a reply
+    // is actually outstanding, so the captain's ordinary traffic to everybody
+    // else leaves nothing behind.
+    if (verdict.outgoing && echoMarkersPending()) {
+      if (!publishOnce(SEEN, `${id}.seen`, `${timestamp}\n`)) {
         return reject('our own outgoing message, already accounted for', remoteJid)
       }
-      if (await consumeOwnEcho(extractText(unwrap(msg.message)))) {
-        publishOnce(SEEN, `${id}.seen`, `${timestamp}\n`)
-      }
+      await consumeOwnEcho(extractText(unwrap(msg.message)))
+    }
+    if (verdict.outgoing) {
       return reject('our own outgoing message in a chat that is not the captain\'s own', remoteJid)
     }
     return reject('not the captain\'s direct chat', remoteJid)
   }
+
+  // Ahead of everything the accepted path does, the echo consume included. The
+  // marker outlives the inbox file, so a message firstmate has already drained
+  // is never re-offered - and a redelivery that reached the consume would spend
+  // a marker belonging to an echo that has not arrived yet, or swallow the
+  // captain's own repeat of words firstmate happened to send.
+  if (fs.existsSync(path.join(SEEN, `${id}.seen`))) return reject('already handled', id)
 
   const body = unwrap(msg.message)
   if (!body) return reject('no readable message body', id)
@@ -749,10 +795,6 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
     // Device 2 is mudslide, i.e. firstmate's own outbound echoing back.
     return reject(`device ${device ?? 'unknown'} is not an accepted captain device`, id)
   }
-
-  // The durable marker outlives the inbox file, so a message firstmate has
-  // already drained is never re-offered even after the inbox entry is removed.
-  if (fs.existsSync(path.join(SEEN, `${id}.seen`))) return reject('already handled', id)
 
   const record = {
     schema: 'fm-wa-inbox-v1',
@@ -980,6 +1022,9 @@ switch (command) {
   case 'status':
     runStatus()
     break
+  case 'captains':
+    process.stdout.write(CAPTAINS.map((n) => `${n}\n`).join(''))
+    break
   case 'handle-fixture':
     runFixture().catch((err) => {
       process.stderr.write(`fm-wa-listen: ${err.stack ?? err.message}\n`)
@@ -987,6 +1032,6 @@ switch (command) {
     })
     break
   default:
-    process.stderr.write('usage: fm-wa-listen.mjs listen|pair [<e164>] [<rounds>]|status|handle-fixture\n')
+    process.stderr.write('usage: fm-wa-listen.mjs listen|pair [<e164>] [<rounds>]|status|captains|handle-fixture\n')
     process.exit(2)
 }

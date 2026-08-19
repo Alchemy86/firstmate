@@ -135,12 +135,21 @@ reap_fake_listeners() {
 # a real home, or to another run, is never signalled. The pid files are the
 # ordinary case; the /proc pass catches a listener whose home was already
 # removed, which is why it matches on FM_HOME rather than on the command name.
+#
+# Where the pid file SITS proves nothing about the process the number now names:
+# several tests leave a pid file behind on purpose for a process that has
+# already exited, so by the time this runs that number can belong to anything on
+# the developer's own machine. The process is proved before it is signalled,
+# exactly as the production paths do it.
 reap_started_listeners() {
   local pidfile pid env_home
   for pidfile in "$TMP_ROOT"/*/state/wa-listener.pid; do
     [ -f "$pidfile" ] || continue
     pid=$(cat "$pidfile" 2>/dev/null) || continue
     case "$pid" in ''|*[!0-9]*) continue ;; esac
+    ( # shellcheck source=bin/fm-wa-lib.sh
+      . "$LIB"
+      fm_wa_process_is_listener "$pid" ) >/dev/null 2>&1 || continue
     kill "$pid" 2>/dev/null || true
     kill -9 "$pid" 2>/dev/null || true
   done
@@ -1917,6 +1926,62 @@ test_two_captain_numbers_parse_as_a_list() {
   pass "two captain numbers parse as a list, whatever the separator"
 }
 
+# Both entry points read FM_WA_CAPTAIN, and a message accepted by one and
+# dropped by the other is the failure the shared rule exists to prevent. The
+# shell decides the split and hands the listener the result, so what has to hold
+# is that the listener reproduces that list rather than re-deriving it - checked
+# here over the inputs that pulled the two apart, a short entry above all: a
+# list carrying one came back out of the listener's whitespace heuristic
+# concatenated, so a genuine second number was replied to and never heard.
+listener_captains() {
+  ( FM_WA_STATE="$TMP_ROOT/parse-agree/state" \
+    FM_WA_AUTH_DIR="$TMP_ROOT/parse-agree/state/wa-auth" \
+    FM_WA_CAPTAIN="$1" node "$LISTENER" captains 2>/dev/null | tr '\n' ' ' \
+    | sed 's/ $//' )
+}
+
+test_both_entry_points_read_one_captain_list() {
+  command -v node >/dev/null 2>&1 || { pass "parser agreement skipped: node is unavailable"; return 0; }
+  local env raw shell_out wire listener_out
+  env="$TMP_ROOT/parse-agree.env"
+  mkdir -p "$TMP_ROOT/parse-agree/state"
+
+  for raw in \
+    "$CAPTAIN" \
+    "+44 7700 900123" \
+    "$CAPTAIN,$CAPTAIN2" \
+    "$CAPTAIN $CAPTAIN2" \
+    "  $CAPTAIN ,, $CAPTAIN2  " \
+    "1234567,$CAPTAIN2" \
+    "$CAPTAIN,,$CAPTAIN2" \
+    ",$CAPTAIN,"
+  do
+    write_env "$env" "$raw"
+    shell_out=$(captain_parse "$env")
+    [ "$shell_out" != REFUSED ] || fail "the shell refused '$raw', which this case assumes it accepts"
+    wire=$(
+      # shellcheck source=bin/fm-wa-lib.sh
+      . "$LIB"
+      fm_wa_captains_wire "$shell_out" )
+    listener_out=$(listener_captains "$wire")
+    [ "$listener_out" = "$shell_out" ] \
+      || fail "'$raw' parsed to '$shell_out' for the shell and '$listener_out' for the listener"
+  done
+
+  # A value naming no number is refused on both sides rather than becoming an
+  # empty list one of them still treats as configured.
+  write_env "$env" " , , "
+  [ "$(captain_parse "$env")" = REFUSED ] || fail "a value naming no number was accepted by the shell"
+  wire=$(
+    # shellcheck source=bin/fm-wa-lib.sh
+    . "$LIB"
+    fm_wa_captains_wire '' )
+  [ -z "$(listener_captains "$wire")" ] \
+    || fail "the listener built a captain list out of a value naming no number"
+
+  pass "the shell and the listener resolve the same captain list from every input"
+}
+
 test_a_configuration_naming_no_number_is_still_refused() {
   local env out
   env="$TMP_ROOT/parse-none.env"
@@ -2114,6 +2179,15 @@ test_our_own_outgoing_words_are_never_an_instruction() {
     "$(msg PNOUT 0 "$CAPTAIN2@s.whatsapp.net" true '{"conversation":"see you at six"}')")
   assert_contains "$out" 'REJECTED' \
     "our own outgoing message to the second number was ingested as an instruction"
+
+  # The linked device sees everything he sends to anybody, so the per-delivery
+  # claim that keeps a redelivered echo from spending another echo's marker is
+  # taken only while a reply is actually outstanding. Taken on all of it, his
+  # ordinary traffic would accumulate a record per message for a month.
+  assert_absent "$home/state/wa-seen/LIDOUT.seen" \
+    "a private message to a third party left a durable record behind with no reply outstanding"
+  assert_absent "$home/state/wa-seen/PNOUT.seen" \
+    "an outgoing message left a durable record behind with no reply outstanding"
 
   pass "our own outgoing words in someone else's chat are never read as an instruction"
 }
@@ -2367,6 +2441,53 @@ test_a_redelivered_echo_does_not_spend_a_second_marker() {
     "firstmate stashed its own reply as an instruction to answer"
 
   pass "a redelivered echo never spends a marker belonging to another delivery"
+}
+
+# The same redelivery, but on the echo that IS ingestable - the one arriving in
+# the captain's own chat, which reaches the accepted path rather than being
+# turned away as outgoing. Nothing there consulted the durable per-id marker
+# before consuming, so the second delivery of one echo spent the marker written
+# for the other phone's, and that phone's echo then had nothing left to catch it.
+test_a_redelivered_self_chat_echo_leaves_the_other_marker_alone() {
+  command -v node >/dev/null 2>&1 || { pass "self-chat echo redelivery skipped: node is unavailable"; return 0; }
+  local home fakebin out markers ts
+  home="$TMP_ROOT/echoselfredeliver"
+  new_home "$home"
+  printf 'FM_WA_CAPTAIN=%s,%s\nFM_WA_ALLOW_DEVICES=*\n' "$CAPTAIN" "$CAPTAIN2" \
+    > "$home/config/whatsapp.env"
+  printf 'Captain, shipshape.\n' > "$TMP_ROOT/echoselfredeliver-reply.txt"
+
+  fakebin=$(fm_fakebin "$TMP_ROOT/echoselfredeliver-bin")
+  fm_fake_exit0 "$fakebin" mudslide
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/echoselfredeliver-reply.txt" 2>&1) \
+    || fail "sending to both numbers failed: $out"
+
+  ts=$(next_ts)
+  out=$(wildcard_fixture "$home" \
+    "$(msg SELFECHO 2 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, shipshape."}' "$ts")" \
+    "$CAPTAIN,$CAPTAIN2")
+  assert_refused "$out" 'matches firstmate outbound' \
+    "the self-chat echo of a fanned-out reply came back as a fresh captain instruction"
+  out=$(wildcard_fixture "$home" \
+    "$(msg SELFECHO 2 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, shipshape."}' "$ts")" \
+    "$CAPTAIN,$CAPTAIN2")
+  assert_refused "$out" 'already handled' \
+    "a redelivered self-chat echo was treated as a new one"
+  markers=$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$markers" -eq 1 ] \
+    || fail "a redelivered self-chat echo left $markers markers, so it spent one belonging to another delivery"
+
+  # The delivery to the other phone still finds the marker written for it.
+  out=$(wildcard_fixture "$home" \
+    "$(msg SELFECHOOTHER 2 "$CAPTAIN2@s.whatsapp.net" true '{"conversation":"Captain, shipshape."}')" \
+    "$CAPTAIN,$CAPTAIN2")
+  assert_contains "$out" 'REJECTED' "our own reply to the second phone came back as an instruction"
+  [ -z "$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null)" ] \
+    || fail "an echo marker outlived the echoes it was written for"
+
+  pass "a redelivered self-chat echo never spends the marker another delivery needs"
 }
 
 # Byte-identical replies are ordinary traffic, not a corner case: the routine
@@ -3118,6 +3239,7 @@ test_a_send_without_mudslide_leaves_no_echo_trap
 test_one_captain_number_parses_exactly_as_before
 test_two_captain_numbers_parse_as_a_list
 test_a_configuration_naming_no_number_is_still_refused
+test_both_entry_points_read_one_captain_list
 test_a_second_phone_reaches_us_by_messaging_in
 test_a_lid_chat_is_admitted_by_its_resolved_number
 test_the_lid_self_chat_is_proved_by_our_own_credentials
@@ -3129,5 +3251,6 @@ test_a_reply_reaches_every_captain_number
 test_pairing_uses_one_number_not_the_whole_list
 test_every_delivery_of_one_reply_has_its_own_echo_marker
 test_a_redelivered_echo_does_not_spend_a_second_marker
+test_a_redelivered_self_chat_echo_leaves_the_other_marker_alone
 test_an_identical_reply_adds_markers_rather_than_replacing_them
 test_a_phone_that_missed_the_reply_drops_its_own_marker

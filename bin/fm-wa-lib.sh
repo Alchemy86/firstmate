@@ -113,6 +113,20 @@ fm_wa_parse_captains() {
   '
 }
 
+# The form the already-parsed list is handed to the listener in.
+#
+# fm_wa_parse_captains is the ONE place the split is decided, and the listener
+# must not have to decide it a second time. Its own parse keeps a whitespace
+# heuristic for a hand-run listener, and re-reading a space-separated list
+# through that heuristic is where the two sides drifted: a list holding an entry
+# shorter than a plausible number came back out of it concatenated, so a genuine
+# second number was written to and never heard from. A comma cannot occur inside
+# a number, so joining on one leaves nothing to guess at and every entry survives
+# exactly as this side parsed it.
+fm_wa_captains_wire() {
+  printf '%s' "${1-}" | tr ' ' ','
+}
+
 # Load the channel configuration. Returns 1 when the channel is off, which every
 # caller treats as "do nothing, say nothing".
 fm_wa_load_config() {
