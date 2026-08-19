@@ -66,34 +66,77 @@ The rejected alternative, option (a) - one process that both listens and sends, 
 
 The mudslide device is linked to the captain's own account, so the channel is his **chat with himself** - "Message yourself" on his phone.
 He types there, his linked devices see it, and firstmate's replies land in the same place. No group, no third party, nothing to route.
+A second configured phone is a separate account and reaches firstmate as an ordinary inbound message instead; see [More than one captain number](#more-than-one-captain-number) for how far that is proven.
 
 That does mean everything on this chat is `fromMe`, including firstmate's own replies coming back. Two independent guards stop firstmate reading its own words as new instructions:
 
 1. **Sender device.** WhatsApp numbers devices: the captain's phone is device `0`, mudslide is a linked device, and the listener is another. Only device `0` is accepted by default. baileys drops the device from the message key, so the listener reads it from the raw stanza and correlates by message id.
-2. **Outbound digest.** `bin/fm-wa-send.sh` records a digest of every message it sends under `state/wa-sent/`. If matching text arrives back, the listener consumes the marker and drops it.
+2. **Outbound digest.** `bin/fm-wa-send.sh` records a digest of every message it sends under `state/wa-sent/`, **one marker per recipient**. If matching text arrives back, the listener consumes one marker and drops the message.
+   A reply goes to every configured number, each delivery echoes back separately under its own message id, and the listener spends exactly one marker per echo, so a single marker would be spent by the first echo and leave the rest unguarded.
    The digest is checked before the sender-device filter, so firstmate's own reply consumes its own marker on the way in rather than being rejected as mudslide's device first and leaving the marker behind.
    An echo returns within seconds, so a digest older than ten minutes is swept instead of matched.
    Otherwise the first time the captain himself typed something firstmate once said, his instruction would be swallowed as an echo.
    A send that fails drops its own digest for the same reason: nothing went out, so nothing can come back.
+   On a partial delivery only the phone that missed it drops its marker, because the phones that got the message will still echo it back.
    It also reports what mudslide said, so a reply that never reached the captain names its own cause instead of failing silently.
 
 If the captain also wants to command firstmate from WhatsApp Web or Desktop, add those device numbers to `FM_WA_ALLOW_DEVICES`. Do **not** add the device mudslide uses; that is firstmate's own outbound and would loop.
+
+### When the channel is configured correctly and still receives nothing
+
+**Check the device filter first.**
+It is the last gate a message passes, after every identity check, and it is the most likely reason a correct configuration still leaves `state/wa-inbox/` empty.
+
+`FM_WA_ALLOW_DEVICES` defaults to `0` on the assumption that the captain's phone is device `0`.
+That is not reliable: found live, a real phone was sending as device `22` and later as device `2`.
+Both were silently discarded, and from the phone that is indistinguishable from being ignored.
+
+The listener log names the device on every refusal, so read it rather than guessing:
+
+```sh
+grep 'is not an accepted captain device' "$FM_HOME/state/wa-listener.log" | tail
+```
+
+Each line reads `ignored (device N is not an accepted captain device) <id>`.
+Add the `N` the captain's own messages are arriving on to the list and restart the listener:
+
+```sh
+FM_WA_ALLOW_DEVICES=0,2,22
+```
+
+```sh
+bin/fm-wa-listen.sh restart
+```
+
+Add only the devices the captain actually types on.
+`*` accepts every device including mudslide's, so it leans the whole echo guard on the outbound digest alone; it exists for a host whose baileys exposes no raw stanza hook, not as a shortcut past this.
+
+If the log shows no such lines at all, the message is being refused earlier - `ignored (...)` names which rule - or is not reaching the listener at all, and `bin/fm-wa-listen.sh status` is the next thing to read.
 
 ### His two identities
 
 One account, two identifiers, and WhatsApp uses both. The same self-chat arrives addressed to his phone number (`<digits>@s.whatsapp.net`) on some deliveries and to his **LID** (`<digits>@lid`) on others.
 That is not a corner case: it was found live, when every real message he sent arrived under his LID, was refused as somebody else's chat, and left `state/wa-inbox/` empty while he believed he was messaging firstmate.
 
-So **both identities are accepted, and only his**:
+So **both identities are accepted, and only his**.
+Two shapes of message get in, and they prove themselves by opposite evidence.
 
-- A `@s.whatsapp.net` chat is addressed by phone number, so the number is the evidence: it must be one of the numbers in `FM_WA_CAPTAIN`.
-- A `@lid` chat is addressed by an opaque identity that carries no number, so something else has to supply one. WhatsApp itself does: baileys lifts the stanza's `sender_pn` attribute onto the message key, and the channel resolves the LID to that number and then checks it against `FM_WA_CAPTAIN` exactly as the other branch does. **The LID is never trusted on its own.**
-- The listener's own LID, read from its pairing credentials (`state/wa-auth/creds.json`), still admits its own self-chat.
-- A `@lid` chat that resolves to no number at all is refused rather than assumed, and reported distinctly from an ordinary stranger, because that is the one refusal that can hide a real message from the captain. Nothing else changes: groups, broadcasts, status and newsletters carry their own server suffixes and can never match either form.
+**Our own chat with ourselves** is recognised from the listener's own pairing credentials (`state/wa-auth/creds.json`): the chat's user is our own phone number on a `@s.whatsapp.net` delivery, or our own LID on a `@lid` one.
+Each identity is only ever compared inside its own namespace, so a LID can never be mistaken for a phone number.
+That chat is necessarily `fromMe`, and the sender-device filter is what keeps discriminating there between the captain's phone and firstmate's own replies coming back.
 
-`creds.me.lid` is **this account's own** LID, not the LID of whoever is in the chat. Comparing a chat's user against it therefore only ever matches a literal self-chat, which is why LID-addressed messages from the captain's own phone were being refused until the server-supplied number was used instead. If a home still pins `FM_WA_SELF_LID` to work around that, it is no longer needed and can be removed.
+**Any other chat** is a conversation with a second person, so it must satisfy both halves:
 
-The stashed message records which identity the chat used in its `chat_identity` field, and always records the captain's number as the sender, so a reply goes back to one place whichever form it arrived on.
+- The counterparty must be one of the numbers in `FM_WA_CAPTAIN`. On a `@s.whatsapp.net` chat that is the chat's own user. On a `@lid` chat the address is opaque and carries no number, so the server supplies one: baileys lifts the stanza's `sender_pn` attribute onto the message key. **The LID is never trusted on its own.**
+- The message must be **inbound** - `fromMe` false. This is the load-bearing half. `sender_pn` names the **sender**, so on a message we sent it is always our own number, and checking it without also requiring the message to be inbound matched the configured list in *every* chat the captain has. That turned his private conversations with third parties into firstmate instructions, which firstmate then acted on and replied to inside them. Requiring the message to come *from* him makes that structurally impossible rather than patched around.
+- A chat that resolves to no number at all is refused rather than assumed, and reported distinctly from an ordinary stranger, because that is the one refusal that can hide a real message from the captain.
+
+Nothing else changes: groups, broadcasts, status and newsletters carry their own server suffixes and can never match either form.
+
+`creds.me.lid` is **this account's own** LID, not the LID of whoever is in the chat, which is why it identifies the self-chat and nothing else.
+A LID-addressed chat that is not the self-chat is admitted only by the number the server resolves it to, on an inbound message.
+
+The stashed message records which identity the chat used in its `chat_identity` field, the number the chat actually resolved to in `sender`, and the direction in `from_me`, so a record from a second phone names that phone rather than whichever number happens to be listed first.
 
 `FM_WA_SELF_LID` overrides the LID the listener treats as its own, which is how `tests/fm-wa-channel.test.sh` drives the self-chat path with an invented LID rather than committing a real identity.
 It is an environment variable rather than a `config/whatsapp.env` key on purpose: it is a test input, not a supported way to configure the channel.
@@ -122,7 +165,7 @@ FM_WA_CAPTAIN=447700900123
 
 ### More than one captain number
 
-The captain may carry more than one phone, so `FM_WA_CAPTAIN` takes a list. Either phone can reach firstmate, and replies go to all of them.
+The captain may carry more than one phone, so `FM_WA_CAPTAIN` takes a list. Replies go to all of them.
 
 ```sh
 FM_WA_CAPTAIN=447700900123,447700900124
@@ -134,12 +177,21 @@ That rule exists so a single number written the way people actually write one ca
 
 The security property is unchanged by the list. Only the configured numbers are accepted, on either identity form, and a number absent from the file is refused even when another number in the file is present.
 
+**Do not rely on the second phone yet.**
+A second phone with its own number is a separate WhatsApp account, so its message to firstmate is not the self-chat: it arrives inbound, from that number, and is admitted by the inbound rule in [His two identities](#his-two-identities) above.
+That path is implemented and covered by tests, but it has **not** been proven against a real second handset - no message from one has ever landed in `state/wa-inbox/`.
+Until one does, treat the first configured number as the only proven way in.
+If it turns out the second phone needs a linked device of its own, that is a second pairing and this document will say so plainly rather than implying it already works.
+
+Pairing itself always targets **one** account, the first number in the list.
+The others need no device of their own under the inbound path above.
+
 That single non-empty value is the switch. Everything else is optional:
 
 | key | default | meaning |
 | --- | --- | --- |
 | `FM_WA_CAPTAIN` | *(none)* | captain's number, or a list of them when he carries more than one phone. The channel is on while the file names one; see [More than one captain number](#more-than-one-captain-number) and [A configuration that names no captain is not an opt-out](#a-configuration-that-names-no-captain-is-not-an-opt-out) |
-| `FM_WA_ALLOW_DEVICES` | `0` | comma-separated device numbers to accept; `*` accepts any |
+| `FM_WA_ALLOW_DEVICES` | `0` | comma-separated device numbers to accept; `*` accepts any. The default is a guess and is the most likely reason a correct configuration receives nothing; see [When the channel is configured correctly and still receives nothing](#when-the-channel-is-configured-correctly-and-still-receives-nothing) |
 | `FM_WA_DRY_RUN` | *(off)* | `1` records replies to `state/wa-outbox/` and sends nothing |
 | `FM_WA_HISTORY_HORIZON` | `0` | seconds of backlog to accept on first run |
 | `FM_WA_REANNOUNCE` | `1800` | seconds before an undrained inbox is announced again |
@@ -157,6 +209,9 @@ Two further inputs are read from the environment and are deliberately **not** co
 ```sh
 bin/fm-wa-listen.sh pair --rounds 20
 ```
+
+With no number given this pairs the **first** number in `FM_WA_CAPTAIN`, because a pairing links exactly one account.
+Pass a number to pair a different one.
 
 It prints `PAIRING_CODE XXXX-XXXX`. On the captain's phone:
 

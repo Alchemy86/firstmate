@@ -24,11 +24,13 @@
 # poll -> wake -> compose -> would-send loop can be exercised without live
 # traffic.
 #
-# Every send also records a digest of its normalized text under state/wa-sent/.
-# The listener consumes that marker if the same text arrives back, which is the
-# second line of defence (behind the sender-device filter) against firstmate
-# reading its own replies as new captain instructions. A dry run records the
-# same marker so the loop behaves identically either way.
+# Every send also records a digest of its normalized text under state/wa-sent/,
+# one marker per recipient, because each delivery echoes back separately and the
+# listener consumes one marker per echo. The listener consumes those markers if
+# the same text arrives back, which is the second line of defence (behind the
+# sender-device filter) against firstmate reading its own replies as new captain
+# instructions. A dry run records the same markers so the loop behaves
+# identically either way.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -99,12 +101,47 @@ fi
 # cannot sit there forever waiting to swallow those exact words from him.
 NORMALIZED=$(printf '%s' "$TEXT" | fm_wa_normalize_text)
 DIGEST=$(printf '%s' "$NORMALIZED" | fm_wa_sha256) || DIGEST=
-MARKER=
+# ONE MARKER PER RECIPIENT, not one per send. Each delivery echoes back on its
+# own message id, and the listener consumes exactly one marker per echo, so a
+# single marker would be spent by the first echo and leave every later one
+# unguarded - which under FM_WA_ALLOW_DEVICES=* is firstmate reading its own
+# reply back as a fresh captain instruction. The index also lets a recipient
+# that never got the message drop its own marker below and no one else's.
+MARKERS=
+marker_for() {
+  [ -n "$DIGEST" ] || return 1
+  printf '%s/%s.%s.sent' "$FM_WA_SENT" "$DIGEST" "$1"
+}
 if [ -n "$DIGEST" ] && fm_wa_id_safe "$DIGEST"; then
-  if : | fm_wa_publish_stdin "$FM_WA_SENT" "$DIGEST.sent" 2>/dev/null; then
-    MARKER="$FM_WA_SENT/$DIGEST.sent"
-  fi
+  IDX=0
+  for RECIPIENT in $RECIPIENTS; do
+    IDX=$(( IDX + 1 ))
+    if : | fm_wa_publish_stdin "$FM_WA_SENT" "$DIGEST.$IDX.sent" 2>/dev/null; then
+      MARKERS="$MARKERS $(marker_for "$IDX")"
+    fi
+  done
 fi
+drop_markers() {
+  local marker
+  for marker in $MARKERS; do
+    rm -f -- "$marker" 2>/dev/null || true
+  done
+  MARKERS=
+}
+# Only ever drop a marker THIS send created. An identical reply still inside the
+# echo window already owns its markers, and removing one of those would spend
+# the guard belonging to a message that really did go out.
+drop_marker() {
+  local marker=$1 kept=
+  for kept in $MARKERS; do
+    if [ "$kept" = "$marker" ]; then
+      rm -f -- "$marker" 2>/dev/null || true
+      MARKERS=$(printf '%s' "$MARKERS" | tr ' ' '\n' | grep -vxF "$marker" | tr '\n' ' ')
+      return 0
+    fi
+  done
+  return 0
+}
 
 if [ -n "$FM_WA_DRY_RUN" ]; then
   STAMP=$(date +%s)
@@ -119,9 +156,9 @@ if [ -n "$FM_WA_DRY_RUN" ]; then
     echo "dry-run: recorded state/wa-outbox/$BASE (nothing sent)"
     exit 0
   fi
-  # Nothing was ever going to be sent, so the echo marker has nothing to guard
+  # Nothing was ever going to be sent, so the echo markers have nothing to guard
   # against and must not sit there swallowing those words from the captain.
-  [ -z "$MARKER" ] || rm -f -- "$MARKER" 2>/dev/null || true
+  drop_markers
   echo "error: cannot record the dry-run reply" >&2
   exit 1
 fi
@@ -138,7 +175,9 @@ SEND_OUT=$(mktemp "${TMPDIR:-/tmp}/fm-wa-send.XXXXXX" 2>/dev/null) || SEND_OUT=
 STATUS=0
 DELIVERED=
 FAILED=
+IDX=0
 for RECIPIENT in $RECIPIENTS; do
+  IDX=$(( IDX + 1 ))
   if [ -n "$SEND_OUT" ]; then
     mudslide send -- "$RECIPIENT" "$TEXT" >> "$SEND_OUT" 2>&1
     ONE=$?
@@ -151,6 +190,11 @@ for RECIPIENT in $RECIPIENTS; do
   else
     FAILED="$FAILED $RECIPIENT"
     STATUS=$ONE
+    # This phone never got the message, so nothing will echo back from it and
+    # its marker would only sit there swallowing those words from the captain.
+    if ONE_MARKER=$(marker_for "$IDX"); then
+      drop_marker "$ONE_MARKER"
+    fi
   fi
 done
 DELIVERED=${DELIVERED# }
@@ -159,8 +203,8 @@ FAILED=${FAILED# }
 # A send that reached one phone but not another is not a success, because the
 # missed one is silence the captain cannot distinguish from being ignored. It is
 # reported as the partial failure it is, naming which number missed it - but the
-# echo marker is KEPT, because the message really did go out somewhere and will
-# echo back from the phones that got it.
+# markers of the phones that DID get it are KEPT, because the message really did
+# go out to them and will echo back from each of them.
 if [ -n "$DELIVERED" ] && [ -n "$FAILED" ]; then
   [ -z "$SEND_OUT" ] || rm -f -- "$SEND_OUT" 2>/dev/null || true
   echo "sent to $DELIVERED"
@@ -172,9 +216,9 @@ if [ "$STATUS" -eq 0 ]; then
   [ -z "$SEND_OUT" ] || rm -f -- "$SEND_OUT" 2>/dev/null || true
   echo "sent to $DELIVERED"
 else
-  # Nothing went out, so nothing can echo back: drop the marker rather than
-  # leaving it to suppress the captain saying those same words himself.
-  [ -z "$MARKER" ] || rm -f -- "$MARKER" 2>/dev/null || true
+  # Nothing went out, so nothing can echo back: drop the markers rather than
+  # leaving them to suppress the captain saying those same words himself.
+  drop_markers
   echo "error: mudslide could not send the reply" >&2
   if [ -n "$SEND_OUT" ] && [ -s "$SEND_OUT" ]; then
     echo "mudslide said:" >&2

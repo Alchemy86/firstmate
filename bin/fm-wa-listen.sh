@@ -257,7 +257,13 @@ cmd_pair() {
   case "$rounds" in
     ''|*[!0-9]*) rounds=1 ;;
   esac
-  number=${number:-$FM_WA_CAPTAIN}
+  # Pairing links ONE account, so it takes ONE number. FM_WA_CAPTAIN is a list
+  # when the captain carries more than one phone, and handing the whole list to
+  # the pairer strips the separator and asks WhatsApp for a code for the two
+  # numbers run together - a value that matches no phone but is long enough to
+  # look like one. The listener is a linked device on his first number; the
+  # others reach it as ordinary inbound messages and need no device of their own.
+  number=${number:-${FM_WA_CAPTAIN%% *}}
   if fm_wa_paired; then
     echo "already paired; run 'unpair' first to link a fresh device" >&2
     return 1

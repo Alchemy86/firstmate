@@ -1276,8 +1276,21 @@ test_config_is_read_as_data() {
 
 # --- the listener's accept and reject rules ---------------------------------
 
+# The listener only ever runs paired, and its OWN credentials are what tell it
+# which chat is its own chat with itself as opposed to a conversation with
+# somebody else. A fixture home without them is not a listener any real message
+# ever reaches, so every fixture below drives a paired one.
+pair_fixture_home() {
+  local home=$1
+  mkdir -p "$home/state/wa-auth"
+  chmod 700 "$home/state/wa-auth" 2>/dev/null || true
+  printf '{"registered":true,"me":{"id":"%s:0@s.whatsapp.net"}}\n' "$CAPTAIN" \
+    > "$home/state/wa-auth/creds.json"
+}
+
 fixture() {
   local home=$1 body=$2
+  pair_fixture_home "$home"
   printf '%s' "$body" | FM_WA_STATE="$home/state" FM_WA_AUTH_DIR="$home/state/wa-auth" \
     FM_WA_CAPTAIN="$CAPTAIN" FM_WA_ALLOW_DEVICES=0 \
     node "$LISTENER" handle-fixture 2>/dev/null
@@ -1595,9 +1608,11 @@ test_the_real_echo_consumes_its_own_marker() {
 # own account is the result. The durable per-message marker is the second
 # mechanism, and it outlives the digest by thirty days.
 wildcard_fixture() {
+  # wildcard_fixture <home> <body> [<captain-config>]
   local home=$1 body=$2
+  pair_fixture_home "$home"
   printf '%s' "$body" | FM_WA_STATE="$home/state" FM_WA_AUTH_DIR="$home/state/wa-auth" \
-    FM_WA_CAPTAIN="$CAPTAIN" FM_WA_ALLOW_DEVICES='*' \
+    FM_WA_CAPTAIN="${3:-$CAPTAIN}" FM_WA_ALLOW_DEVICES='*' \
     node "$LISTENER" handle-fixture 2>/dev/null
 }
 
@@ -1774,6 +1789,7 @@ CAPTAIN_LID=100000000000001
 
 lid_fixture() {
   local home=$1 body=$2
+  pair_fixture_home "$home"
   printf '%s' "$body" | FM_WA_STATE="$home/state" FM_WA_AUTH_DIR="$home/state/wa-auth" \
     FM_WA_CAPTAIN="$CAPTAIN" FM_WA_ALLOW_DEVICES=0 FM_WA_SELF_LID="$CAPTAIN_LID" \
     node "$LISTENER" handle-fixture 2>/dev/null
@@ -1918,18 +1934,57 @@ CAPTAIN2_LID=100000000000002
 STRANGER_LID=100000000000003
 
 lid_pn_msg() {
-  # lid_pn_msg <id> <chat-lid> <sender-pn|-> <inner-json>
+  # lid_pn_msg <id> <chat-lid> <sender-pn|-> <inner-json> [<from-me>]
   local pn_field=''
   [ "$3" = '-' ] || pn_field=$(printf ',"senderPn":"%s@s.whatsapp.net"' "$3")
-  printf '{"stanza_from":"%s:0@lid","message":{"key":{"id":"%s","remoteJid":"%s@lid","fromMe":true%s},"messageTimestamp":%s,"message":%s}}' \
-    "$2" "$1" "$2" "$pn_field" "$(next_ts)" "$4"
+  printf '{"stanza_from":"%s:0@lid","message":{"key":{"id":"%s","remoteJid":"%s@lid","fromMe":%s%s},"messageTimestamp":%s,"message":%s}}' \
+    "$2" "$1" "$2" "${5:-false}" "$pn_field" "$(next_ts)" "$4"
 }
 
-lid_pn_fixture() {
-  # lid_pn_fixture <home> <captain-config> <body>
+# Like fixture(), but with the configured captain list spelled out, because the
+# cases below turn on which numbers this home knows about.
+configured_fixture() {
+  # configured_fixture <home> <captain-config> <body>
+  pair_fixture_home "$1"
   printf '%s' "$3" | FM_WA_STATE="$1/state" FM_WA_AUTH_DIR="$1/state/wa-auth" \
     FM_WA_CAPTAIN="$2" FM_WA_ALLOW_DEVICES=0 \
     node "$LISTENER" handle-fixture 2>/dev/null
+}
+
+test_a_second_phone_reaches_us_by_messaging_in() {
+  command -v node >/dev/null 2>&1 || { pass "second phone skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/secondphone"
+  new_home "$home"
+
+  # A second phone is its own WhatsApp account, so its message to us arrives
+  # INBOUND - fromMe is false and the chat is addressed by its own number.
+  out=$(configured_fixture "$home" "$CAPTAIN,$CAPTAIN2" \
+    "$(msg PN2MSG 0 "$CAPTAIN2@s.whatsapp.net" false '{"conversation":"from the other phone"}')")
+  assert_contains "$out" 'ACCEPTED' \
+    "an inbound message from the configured second number was refused"
+  assert_grep '"sender": "'"$CAPTAIN2"'"' "$home/state/wa-inbox/PN2MSG.json" \
+    "the stashed record named the wrong phone as the sender"
+  assert_grep '"from_me": false' "$home/state/wa-inbox/PN2MSG.json" \
+    "the stashed record claimed an inbound message came from our own account"
+
+  # The same phone on a LID-addressed chat, resolved by the number the server
+  # supplies rather than by the opaque identity.
+  out=$(configured_fixture "$home" "$CAPTAIN,$CAPTAIN2" \
+    "$(lid_pn_msg LID2MSG "$CAPTAIN2_LID" "$CAPTAIN2" '{"conversation":"and on a LID chat"}')")
+  assert_contains "$out" 'ACCEPTED' \
+    "an inbound LID chat from the configured second number was refused"
+  assert_grep '"sender": "'"$CAPTAIN2"'"' "$home/state/wa-inbox/LID2MSG.json" \
+    "a LID-addressed record named the wrong phone as the sender"
+
+  # And the self-chat, which is the primary path, still works alongside it.
+  out=$(configured_fixture "$home" "$CAPTAIN,$CAPTAIN2" \
+    "$(msg SELFSTILL 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"and from my own phone"}')")
+  assert_contains "$out" 'ACCEPTED' "the captain's own self-chat regressed"
+  assert_grep '"sender": "'"$CAPTAIN"'"' "$home/state/wa-inbox/SELFSTILL.json" \
+    "the self-chat record lost the captain's own number"
+
+  pass "a configured second phone reaches firstmate by messaging in, on either identity form"
 }
 
 test_a_lid_chat_is_admitted_by_its_resolved_number() {
@@ -1938,15 +1993,15 @@ test_a_lid_chat_is_admitted_by_its_resolved_number() {
   home="$TMP_ROOT/lidpn"
   new_home "$home"
 
-  # The primary phone, on a LID chat that is not our own self-chat. No
-  # FM_WA_SELF_LID is pinned: the server-supplied number is the whole proof.
-  out=$(lid_pn_fixture "$home" "$CAPTAIN" \
+  # The primary phone, messaging in on a LID chat that is not our own self-chat.
+  # No FM_WA_SELF_LID is pinned: the server-supplied number is the whole proof.
+  out=$(configured_fixture "$home" "$CAPTAIN" \
     "$(lid_pn_msg LIDPN1 "$CAPTAIN_LID" "$CAPTAIN" '{"conversation":"from the primary phone"}')")
   assert_contains "$out" 'ACCEPTED' \
     "a LID chat resolving to the captain's own number was refused, so his messages are still dropped"
 
   # The second phone, which has its own LID our credentials can never prove.
-  out=$(lid_pn_fixture "$home" "$CAPTAIN,$CAPTAIN2" \
+  out=$(configured_fixture "$home" "$CAPTAIN,$CAPTAIN2" \
     "$(lid_pn_msg LIDPN2 "$CAPTAIN2_LID" "$CAPTAIN2" '{"conversation":"from the second phone"}')")
   assert_contains "$out" 'ACCEPTED' \
     "the second captain number was refused on a LID chat, so his other phone cannot reach firstmate"
@@ -1961,18 +2016,51 @@ test_a_lid_chat_is_never_trusted_on_its_own() {
   new_home "$home"
 
   # A stranger's LID, whatever number it claims to be, is not a configured one.
-  out=$(lid_pn_fixture "$home" "$CAPTAIN,$CAPTAIN2" \
+  out=$(configured_fixture "$home" "$CAPTAIN,$CAPTAIN2" \
     "$(lid_pn_msg LIDPNX "$STRANGER_LID" 447700900999 '{"conversation":"not the captain"}')")
   assert_contains "$out" 'REJECTED' "a stranger's LID chat was accepted"
 
   # A second number that is NOT configured must not get in just because some
   # other number is. This is the security property the list must not weaken.
-  out=$(lid_pn_fixture "$home" "$CAPTAIN" \
+  out=$(configured_fixture "$home" "$CAPTAIN" \
     "$(lid_pn_msg LIDPNY "$CAPTAIN2_LID" "$CAPTAIN2" '{"conversation":"an unconfigured second phone"}')")
   assert_contains "$out" 'REJECTED' \
     "a number absent from the configuration was admitted on a LID chat"
 
   pass "a LID chat is never trusted on its own, only on a number we configured"
+}
+
+# The regression that made every LID-addressed chat the captain has into an
+# instruction channel. `sender_pn` names the SENDER, so on a message HE sent it
+# is always his own number - matching the configured list in a stranger's chat
+# just as surely as in his own. Checking it without also requiring the message
+# to be inbound meant firstmate read his private conversations with third
+# parties, acted on them, and replied inside them.
+#
+# The earlier LID tests all passed because every one of them put a STRANGER's
+# number in sender_pn, which is the case that never happens on an outgoing
+# message.
+test_our_own_outgoing_words_are_never_an_instruction() {
+  command -v node >/dev/null 2>&1 || { pass "outgoing LID guard skipped: node is unavailable"; return 0; }
+  local home out
+  home="$TMP_ROOT/lidpn-outgoing"
+  new_home "$home"
+
+  out=$(configured_fixture "$home" "$CAPTAIN,$CAPTAIN2" \
+    "$(lid_pn_msg LIDOUT "$STRANGER_LID" "$CAPTAIN" '{"conversation":"see you at six"}' true)")
+  assert_contains "$out" 'REJECTED' \
+    "a message the captain sent to a stranger was ingested as an instruction to firstmate"
+  assert_absent "$home/state/wa-inbox/LIDOUT.json" \
+    "a private message to a third party was stashed for firstmate to act on"
+
+  # Same shape on a phone-number chat: our own words to his second phone are his
+  # conversation, not an instruction, even though that number IS configured.
+  out=$(configured_fixture "$home" "$CAPTAIN,$CAPTAIN2" \
+    "$(msg PNOUT 0 "$CAPTAIN2@s.whatsapp.net" true '{"conversation":"see you at six"}')")
+  assert_contains "$out" 'REJECTED' \
+    "our own outgoing message to the second number was ingested as an instruction"
+
+  pass "our own outgoing words in someone else's chat are never read as an instruction"
 }
 
 test_an_unresolvable_lid_is_refused_and_said_out_loud() {
@@ -1985,7 +2073,7 @@ test_an_unresolvable_lid_is_refused_and_said_out_loud() {
   # is the one refusal that can hide a real message from the captain, so it has
   # to be distinguishable in the log from ordinary stranger traffic rather than
   # looking like routine noise.
-  out=$(lid_pn_fixture "$home" "$CAPTAIN" \
+  out=$(configured_fixture "$home" "$CAPTAIN" \
     "$(lid_pn_msg LIDPNQ "$CAPTAIN_LID" - '{"conversation":"no number to check"}')")
   assert_contains "$out" 'REJECTED' "an unresolvable LID chat was accepted"
   assert_contains "$out" 'no phone number' \
@@ -2084,6 +2172,130 @@ SH
   assert_contains "$out" "$CAPTAIN2" "the partial failure did not name the number that missed it"
 
   pass "a reply reaches every captain number, and a partial delivery is not called success"
+}
+
+# Pairing links ONE account and therefore takes ONE number. Defaulting it to the
+# whole configured list handed the pairer the two numbers run together, which is
+# long enough to pass every "is this a number" check and matches no phone on
+# earth, so the documented setup step would ask WhatsApp for a code that could
+# never arrive.
+test_pairing_uses_one_number_not_the_whole_list() {
+  local home fakebin argv out
+  home="$TMP_ROOT/pairone"
+  new_home "$home"
+  printf 'FM_WA_CAPTAIN=%s,%s\n' "$CAPTAIN" "$CAPTAIN2" > "$home/config/whatsapp.env"
+
+  fakebin=$(fm_fakebin "$TMP_ROOT/pairone-bin")
+  argv="$TMP_ROOT/pairone.argv"
+  cat > "$fakebin/node" <<'SH'
+#!/bin/sh
+# Stands in for the listener: record what the pairer was asked to pair.
+printf '%s\n' "$@" > "$PAIR_ARGV"
+exit 0
+SH
+  chmod +x "$fakebin/node"
+
+  out=$(PATH="$fakebin:$PATH" PAIR_ARGV="$argv" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$LISTEN_SH" pair 2>&1) || fail "pairing failed: $out"
+  [ -f "$argv" ] || fail "the pair command never reached the listener"
+  grep -qx "$CAPTAIN" "$argv" \
+    || fail "pairing was not asked for the first configured number: $(tr '\n' ' ' < "$argv")"
+  grep -q "$CAPTAIN$CAPTAIN2" "$argv" \
+    && fail "pairing was asked for the two numbers run together"
+  assert_contains "$out" "+$CAPTAIN" "the captain was told the wrong number was being paired"
+  case "$out" in
+    *"$CAPTAIN2"*) fail "the pairing prompt named a number it was not pairing" ;;
+  esac
+
+  pass "pairing asks for one account, never the whole captain list"
+}
+
+# One reply, several phones, several echoes. The listener consumes exactly one
+# digest marker per echo, so a send that writes a single marker leaves every
+# echo after the first with no digest to be caught by - and on a
+# FM_WA_ALLOW_DEVICES=* home there is no device filter behind it either, so
+# firstmate reads its own reply back as a fresh instruction and answers it.
+test_every_delivery_of_one_reply_has_its_own_echo_marker() {
+  command -v node >/dev/null 2>&1 || { pass "fan-out echo guard skipped: node is unavailable"; return 0; }
+  local home fakebin out markers
+  home="$TMP_ROOT/echofanout"
+  new_home "$home"
+  printf 'FM_WA_CAPTAIN=%s,%s\nFM_WA_ALLOW_DEVICES=*\n' "$CAPTAIN" "$CAPTAIN2" \
+    > "$home/config/whatsapp.env"
+  printf 'Captain, both phones have this.\n' > "$TMP_ROOT/echofanout-reply.txt"
+
+  fakebin=$(fm_fakebin "$TMP_ROOT/echofanout-bin")
+  fm_fake_exit0 "$fakebin" mudslide
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/echofanout-reply.txt" 2>&1) \
+    || fail "sending to both numbers failed: $out"
+  markers=$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$markers" -eq 2 ] \
+    || fail "a reply that went to two phones recorded $markers echo markers, not one each"
+
+  # Each delivery echoes back separately: one into the chat with the second
+  # phone, one into the self-chat. Nothing orders those two arrivals, so the
+  # adverse interleaving is the one to drive - the delivery that CANNOT be
+  # ingested arriving first and spending a marker the self-chat echo then needs.
+  out=$(wildcard_fixture "$home" \
+    "$(msg FANECHO1 2 "$CAPTAIN2@s.whatsapp.net" true '{"conversation":"Captain, both phones have this."}')" \
+    "$CAPTAIN,$CAPTAIN2")
+  assert_contains "$out" 'REJECTED' "our own reply to the second phone came back as an instruction"
+
+  out=$(wildcard_fixture "$home" \
+    "$(msg FANECHO2 2 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, both phones have this."}')" \
+    "$CAPTAIN,$CAPTAIN2")
+  assert_refused "$out" 'matches firstmate outbound' \
+    "the self-chat echo of a fanned-out reply came back as a fresh captain instruction"
+  assert_absent "$home/state/wa-inbox/FANECHO2.json" \
+    "firstmate stashed its own reply as an instruction to answer"
+
+  # Every marker was spent by the delivery it was written for, including the one
+  # whose delivery could never have been ingested anyway. A marker no echo
+  # consumes outlives the reply as a trap for the captain typing those same
+  # words himself, so the ledger has to balance.
+  [ -z "$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null)" ] \
+    || fail "an echo marker outlived the echoes it was written for"
+  out=$(wildcard_fixture "$home" \
+    "$(msg FANCAP 0 "$CAPTAIN@s.whatsapp.net" true '{"conversation":"Captain, both phones have this."}')" \
+    "$CAPTAIN,$CAPTAIN2")
+  assert_contains "$out" 'ACCEPTED' \
+    "the captain repeating firstmate's own words was swallowed as an echo"
+
+  pass "every delivery of a fanned-out reply has an echo marker of its own"
+}
+
+# A phone that never got the message will never echo it back, so its marker is
+# only a trap for the captain typing those same words himself.
+test_a_phone_that_missed_the_reply_drops_its_own_marker() {
+  local home fakebin out markers
+  home="$TMP_ROOT/echopartial"
+  new_home "$home"
+  printf 'FM_WA_CAPTAIN=%s,%s\n' "$CAPTAIN" "$CAPTAIN2" > "$home/config/whatsapp.env"
+  printf 'Captain, only one phone got this.\n' > "$TMP_ROOT/echopartial-reply.txt"
+
+  fakebin=$(fm_fakebin "$TMP_ROOT/echopartial-bin")
+  cat > "$fakebin/mudslide" <<'SH'
+#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    [0-9][0-9]*) [ "$a" = "${FAIL_FOR:-}" ] && { echo "refused $a" >&2; exit 1; }
+      break ;;
+  esac
+done
+exit 0
+SH
+  chmod +x "$fakebin/mudslide"
+
+  out=$(PATH="$fakebin:$PATH" FAIL_FOR="$CAPTAIN2" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$SEND" --text-file "$TMP_ROOT/echopartial-reply.txt" 2>&1) \
+    && fail "a reply that missed one phone was reported as sent: $out"
+  markers=$(find "$home/state/wa-sent" -name '*.sent' -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$markers" -eq 1 ] \
+    || fail "a partial delivery left $markers echo markers, not one per phone that got it"
+
+  pass "a phone that missed the reply drops its own echo marker and no one else's"
 }
 
 test_off_by_default
@@ -2775,8 +2987,13 @@ test_a_send_without_mudslide_leaves_no_echo_trap
 test_one_captain_number_parses_exactly_as_before
 test_two_captain_numbers_parse_as_a_list
 test_a_configuration_naming_no_number_is_still_refused
+test_a_second_phone_reaches_us_by_messaging_in
 test_a_lid_chat_is_admitted_by_its_resolved_number
 test_a_lid_chat_is_never_trusted_on_its_own
+test_our_own_outgoing_words_are_never_an_instruction
 test_an_unresolvable_lid_is_refused_and_said_out_loud
 test_a_recycled_pid_is_a_stale_record_not_an_outage
 test_a_reply_reaches_every_captain_number
+test_pairing_uses_one_number_not_the_whole_list
+test_every_delivery_of_one_reply_has_its_own_echo_marker
+test_a_phone_that_missed_the_reply_drops_its_own_marker

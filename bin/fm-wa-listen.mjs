@@ -282,19 +282,32 @@ function pruneStaleEchoes() {
 // is firstmate's own words coming back and is dropped. The echo consuming its
 // own marker is what keeps the captain free to repeat those same words
 // seconds later rather than for the rest of the TTL.
+//
+// One reply now goes to every configured number, and each delivery echoes back
+// separately under its own message id, so the send records ONE MARKER PER
+// DELIVERY and each echo consumes one of them. A single marker would be spent
+// by the first echo and leave the rest unguarded, which under
+// FM_WA_ALLOW_DEVICES=* is firstmate reading its own reply as a fresh
+// instruction and answering it - the unattended self-reply loop this exists to
+// prevent.
 async function consumeOwnEcho(text) {
   const normalized = normalizeText(text)
   if (normalized === '') return false
   pruneStaleEchoes()
   const { createHash } = await import('node:crypto')
   const digest = createHash('sha256').update(normalized, 'utf8').digest('hex')
-  const marker = path.join(SENT, `${digest}.sent`)
-  try {
-    fs.unlinkSync(marker)
-    return true
-  } catch {
-    return false
+  let entries = []
+  try { entries = fs.readdirSync(SENT) } catch { return false }
+  // `<digest>.sent` and `<digest>.<n>.sent` both match, so a marker written by
+  // an older send is still consumed by the echo it belongs to.
+  const prefix = `${digest}.`
+  for (const entry of entries.filter((e) => e.startsWith(prefix) && e.endsWith('.sent')).sort()) {
+    try {
+      fs.unlinkSync(path.join(SENT, entry))
+      return true
+    } catch { /* raced with another sweep */ }
   }
+  return false
 }
 
 // -------------------------------------------------------- message reading ---
@@ -384,39 +397,66 @@ function loadSelfIdentityFromCreds() {
 // Groups, broadcasts, status and newsletters can never match: they carry their
 // own server suffixes.
 //
-// The two branches prove the same thing by different evidence.
+// Two shapes reach firstmate, and they prove themselves by opposite evidence.
 //
-// A `@s.whatsapp.net` chat is addressed by phone number, so the number is the
-// evidence and it must be one this home was configured with.
+// The first is our OWN chat with ourselves, the "Message yourself" chat the
+// mudslide device is linked to. It is recognised by this listener's own
+// credentials - the chat's user is our own phone number on a
+// `@s.whatsapp.net` delivery, or our own LID on a `@lid` one - and it is
+// necessarily `fromMe`, so the sender-device filter is what keeps discriminating
+// there between the captain's phone and firstmate's own replies coming back.
 //
-// A `@lid` chat is addressed by an opaque identity that carries no number, so
-// something else has to supply one. `creds.me.lid` cannot: that is OUR OWN
-// account's LID, and comparing a chat's user against it only ever matches a
-// literal self-chat, which is why every real LID-addressed chat was refused.
-// WhatsApp itself supplies the mapping - baileys 6.7.23 lifts the stanza's
-// `sender_pn` attribute onto the message key - so the LID is resolved to a
-// phone number by the server and then checked against the configured numbers
-// exactly as the other branch does. The LID is never trusted on its own.
+// The second is any OTHER chat, which is a conversation with a second person.
+// The counterparty has to be a number this home was configured with AND the
+// message has to have come FROM them, never from us. Requiring `fromMe === false`
+// is the whole point: `sender_pn` names the SENDER, so on one of our own
+// outgoing messages it is always our own number and would match the configured
+// list in every chat the captain has, turning his private conversations with
+// third parties into firstmate instructions. Direction is therefore structural
+// here rather than a check bolted on afterwards.
+//
+// For a `@s.whatsapp.net` chat the counterparty is the chat's own user. For a
+// `@lid` chat the address is opaque and carries no number, so the server has to
+// supply one: baileys 6.7.23 lifts the stanza's `sender_pn` attribute onto the
+// message key, and that is valid evidence of the counterparty only on an
+// inbound message. The LID is never trusted on its own.
 //
 // Fail closed when nothing supplies a number: an unresolvable LID is refused
-// rather than assumed, and the caller reports it so a refusal is visible
-// instead of silent.
+// rather than assumed, and the caller reports it apart from an ordinary
+// stranger so that refusal is visible instead of silent.
+//
+// The verdict carries the number it resolved, so a caller can record who the
+// message actually came from rather than guessing at the configured list.
 function captainChatVerdict(remoteJid, key) {
   const user = jidUser(remoteJid)
   if (!user) return { ok: false }
-  if (remoteJid.endsWith('@s.whatsapp.net')) {
-    if (CAPTAINS.length === 0) return { ok: user === SELF.pn }
-    return { ok: CAPTAINS.includes(user) }
+  const phoneChat = remoteJid.endsWith('@s.whatsapp.net')
+  const lidChat = remoteJid.endsWith('@lid')
+  if (!phoneChat && !lidChat) return { ok: false }
+
+  const fromMe = key?.fromMe === true
+
+  // Our own chat with ourselves, under whichever of our own identities this
+  // delivery was addressed to. Each identity is only ever compared within its
+  // own namespace, so a LID can never be mistaken for a phone number.
+  const ownChat = phoneChat
+    ? (SELF.pn !== null && user === SELF.pn)
+    : (SELF.lid !== null && user === SELF.lid)
+  if (ownChat) {
+    if (!fromMe) return { ok: false }
+    return { ok: true, number: SELF.pn || CAPTAIN || null }
   }
-  if (!remoteJid.endsWith('@lid')) return { ok: false }
 
-  // Our own self-chat, addressed by our own LID, needs no server mapping.
-  if (SELF.lid !== null && user === SELF.lid) return { ok: true }
+  // Someone else's chat. Only a message the captain sent INTO it can be an
+  // instruction; one we sent is his own conversation and is never ours to read.
+  if (fromMe) return { ok: false, outgoing: true }
 
-  const pn = jidUser(key?.senderPn ?? key?.participantPn ?? null)
-  if (!pn) return { ok: false, unresolved: true }
-  if (CAPTAINS.length === 0) return { ok: pn === SELF.pn }
-  return { ok: CAPTAINS.includes(pn) }
+  const counterparty = phoneChat
+    ? user
+    : jidUser(key?.senderPn ?? key?.participantPn ?? null)
+  if (!counterparty) return { ok: false, unresolved: true }
+  if (!CAPTAINS.includes(counterparty)) return { ok: false }
+  return { ok: true, number: counterparty }
 }
 
 function jidUser(jid) {
@@ -619,10 +659,11 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
     return reject('older than the history watermark', id)
   }
 
-  // The channel is the captain's own chat with himself: his phone writes it,
-  // firstmate's linked device reads it. He reaches it under either of his two
-  // identities, so both are accepted and everything else - groups, broadcasts,
-  // status, newsletters, another user - is refused.
+  // The channel is the captain's own chat with himself - his phone writes it,
+  // firstmate's linked device reads it - plus a message a second configured
+  // phone sends in. He reaches either under both of his identity forms, and
+  // everything else - groups, broadcasts, status, newsletters, another user,
+  // and our own outgoing words in somebody else's chat - is refused.
   const verdict = captainChatVerdict(remoteJid, key)
   if (!verdict.ok) {
     // An unresolvable LID is reported apart from an ordinary stranger: it is the
@@ -631,9 +672,21 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
     if (verdict.unresolved) {
       return reject('LID chat carries no phone number to check against the configured captains', remoteJid)
     }
+    // Equally distinct: this is us talking, in a chat that is not our own, so
+    // no configured number can make it an instruction.
+    //
+    // It may still be one delivery of a reply that fanned out to several
+    // phones, coming back. Its digest marker is consumed here even though the
+    // message is refused anyway, because a marker no echo ever consumes
+    // outlives the reply as a trap: the first time the captain himself typed
+    // those words inside the echo window, his instruction would be swallowed.
+    // One marker per delivery, one delivery consuming each.
+    if (verdict.outgoing) {
+      await consumeOwnEcho(extractText(unwrap(msg.message)))
+      return reject('our own outgoing message in a chat that is not the captain\'s own', remoteJid)
+    }
     return reject('not the captain\'s direct chat', remoteJid)
   }
-  if (key.fromMe !== true) return reject('not from the captain account', remoteJid)
 
   const body = unwrap(msg.message)
   if (!body) return reject('no readable message body', id)
@@ -690,12 +743,14 @@ async function handleMessage(msg, deviceById, getWatermark, setWatermark) {
     schema: 'fm-wa-inbox-v1',
     id,
     chat_jid: remoteJid,
-    // Always his phone number, so a consumer never has to know which identity
-    // WhatsApp happened to address this delivery to.
-    sender: CAPTAIN || SELF.pn || jidUser(remoteJid),
+    // The number the chat actually resolved to, so a record from his second
+    // phone names that phone rather than whichever number happens to be listed
+    // first, and a consumer never has to know which identity WhatsApp addressed
+    // this delivery to.
+    sender: verdict.number || CAPTAIN || SELF.pn || jidUser(remoteJid),
     chat_identity: remoteJid.endsWith('@lid') ? 'lid' : 'phone-number',
     sender_device: device,
-    from_me: true,
+    from_me: key.fromMe === true,
     timestamp,
     received_at: Math.floor(Date.now() / 1000),
     push_name: msg.pushName ?? null,
