@@ -349,15 +349,19 @@ test_undownloadable_media_still_surfaces() {
 # --- the unsurfaced-retirement notice is not swallowed ----------------------
 
 test_unsurfaced_retirement_is_recorded() {
-  local home env inbox old_ts
+  local home env inbox fresh_ts
 
   home="$TMP_ROOT/notice-home"
   mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
   env=$(fm_tg_env "$home")
   inbox="$home/state/tg-inbox"
-  old_ts=$(( $(date +%s) - 120 ))
+  # Under the corrected archive-window semantics (docs/telegram.md, "No message
+  # is answered twice"), only a FRESH (<10s) never-surfaced record is eligible
+  # for the same-turn-race retirement this notice covers; an old one now stays
+  # pending instead (see test_archive_never_surfaced_old_stays_pending).
+  fresh_ts=$(date +%s)
 
-  printf '{"update_id": 60, "chat_id": 999, "ts": %s, "text": "old and unsurfaced"}' "$old_ts" > "$inbox/60.json"
+  printf '{"update_id": 60, "chat_id": 999, "ts": %s, "text": "fresh and unsurfaced"}' "$fresh_ts" > "$inbox/60.json"
 
   # Sent through fm-tg-send.sh, exactly as in production - where the archive
   # run's stdout used to go straight to /dev/null, making the one outcome that
