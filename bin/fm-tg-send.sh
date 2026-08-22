@@ -212,10 +212,11 @@ fi
 # blip - "ok":false in the reply) is never retried, since retrying it cannot
 # help.
 send_part() {
-  local body=$1 attempt=1 resp rc
+  local body=$1 attempt=1 resp curl_rc rc
   while [ "$attempt" -le 3 ]; do
     resp=$(fm_run_timed 60 curl -s --max-time 60 -X POST "$API/sendMessage" \
         -d "chat_id=$TG_CHAT_ID" --data-urlencode "text=$body")
+    curl_rc=$?
     if [ -n "$resp" ]; then
       printf '%s' "$resp" | check && return 0
       rc=$?
@@ -223,7 +224,20 @@ send_part() {
         *'"ok":false'*) return "$rc" ;;   # rejected, not transient
       esac
     fi
-    [ "$attempt" -lt 3 ] && { echo "telegram: attempt $attempt failed, retrying" >&2; sleep 2; }
+    if [ "$attempt" -lt 3 ]; then
+      # Distinguished only for the retry-notice wording (docs/telegram.md "No
+      # message is answered twice"): a nonzero curl exit is a definite
+      # non-send (connection refused, DNS failure - curl never reached
+      # Telegram), while an empty reply from a curl that itself exited 0 is
+      # ambiguous - Telegram may have already accepted and answered the send
+      # too slowly for --max-time to see the reply. Both retry the same way.
+      if [ "$curl_rc" -ne 0 ]; then
+        echo "telegram: attempt $attempt failed (curl exit $curl_rc, definite non-send), retrying" >&2
+      else
+        echo "telegram: attempt $attempt failed (empty reply, ambiguous - may have already sent), retrying" >&2
+      fi
+      sleep 2
+    fi
     attempt=$((attempt + 1))
   done
   return 1

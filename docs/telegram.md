@@ -172,6 +172,15 @@ Retirement is also bounded.
 A retired message moves into `state/tg-processed/` and its attachment stays in `state/tg-media/`, and nothing used to prune either, so every message the captain had ever sent and every image accumulated for the life of the home - the one artifact here with no cap, next to a size-capped log and a recent-history-capped backlog.
 `bin/fm-tg-archive.py` keeps the newest 500 retired records and deletes the rest, and deletes a media file once nothing references it - neither a pending inbox record nor a kept retired one - and it is more than a day old, so a download whose record has not been updated with its path yet is never swept.
 
+**Known, accepted tradeoff: the send retry can rarely deliver a duplicate.**
+`bin/fm-tg-send.sh`'s auto-retry (see "Other defects" below) resends a part whenever a `sendMessage` call comes back empty, on the theory that an empty reply means the request never got through.
+That is true when `curl` itself failed - connection refused, DNS failure, a nonzero exit - a definite non-send, safe to retry.
+It is not always true when `curl` exits `0` with an empty body: Telegram may have already accepted and sent the message, just too slowly for `--max-time 60` to see the reply before curl gave up.
+Only that second, ambiguous case can produce a duplicate; `bin/fm-tg-send.sh` logs which of the two occurred on every retry attempt (`"definite non-send"` vs `"empty reply, ambiguous - may have already sent"`) so the rare case is diagnosable after the fact.
+Telegram's Bot API has no idempotency key for `sendMessage`, so there is no way to close this from the client side without giving up retrying the ambiguous case too - which would bring back the exact "FAILED mid-send, no retry" failure amendment 5 was written to fix.
+The captain's own call on this tradeoff: a rare duplicate costs him nothing to notice and ignore; a dropped message costs him the answer.
+Retry stays, unconditionally, for both cases.
+
 ### The `...` acknowledgement is not a reply
 
 **Defect risk.** Without an explicit signal, the instant `...` acknowledgement firstmate sends the moment a message arrives could itself satisfy "a reply was sent" and let a message be marked answered - and therefore stop re-surfacing - without ever actually being answered.

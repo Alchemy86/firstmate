@@ -43,7 +43,12 @@ cat > "$FAKEBIN/curl" <<'SH'
 #                        FAKE_CURL_REJECT=1 (a genuine bad request, never retried)
 #                        or nothing for the first N calls, then success, when
 #                        FAKE_CURL_FAIL_COUNTER points at a file holding N
-#                        (simulates N transient network blips then recovery)
+#                        (simulates N transient AMBIGUOUS blips - curl itself
+#                        exits 0 with an empty body - then recovery)
+#                        or a nonzero curl exit for the first N calls, then
+#                        success, when FAKE_CURL_HARD_FAIL_COUNTER points at a
+#                        file holding N (simulates N DEFINITE non-sends -
+#                        connection refused/DNS failure - then recovery)
 #   ...getUpdates...  -> content of $FAKE_TG_GETUPDATES_FILE if set and
 #                        present, else an empty result
 # Every invocation's argv is appended to $FAKE_CURL_LOG when set, so a test
@@ -57,6 +62,13 @@ case "$args" in
     if [ -n "${FAKE_CURL_REJECT:-}" ]; then
       printf '{"ok":false,"description":"Bad Request: fake rejection","error_code":400}'
       exit 0
+    fi
+    if [ -n "${FAKE_CURL_HARD_FAIL_COUNTER:-}" ] && [ -f "$FAKE_CURL_HARD_FAIL_COUNTER" ]; then
+      remaining=$(cat "$FAKE_CURL_HARD_FAIL_COUNTER")
+      if [ "$remaining" -gt 0 ]; then
+        echo $(( remaining - 1 )) > "$FAKE_CURL_HARD_FAIL_COUNTER"
+        exit 7   # curl's own "connection refused" exit code
+      fi
     fi
     if [ -n "${FAKE_CURL_FAIL_COUNTER:-}" ] && [ -f "$FAKE_CURL_FAIL_COUNTER" ]; then
       remaining=$(cat "$FAKE_CURL_FAIL_COUNTER")
@@ -1144,6 +1156,41 @@ test_send_gives_up_after_3_transient_failures() {
   pass "telegram: fm-tg-send.sh gives up after exactly 3 attempts on a persistent transient failure"
 }
 
+# --- distinguishing a definite non-send from an ambiguous one (the retry's --
+# --- documented duplicate-delivery tradeoff, docs/telegram.md) -------------
+
+test_send_retry_labels_definite_non_send() {
+  local home env counter out
+  home="$TMP_ROOT/retry-hardfail-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  counter="$TMP_ROOT/retry-counter-hardfail"
+  printf '1' > "$counter"   # curl itself fails once (connection refused), then succeeds
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_HARD_FAIL_COUNTER="$counter" \
+    "$ROOT/bin/fm-tg-send.sh" 'curl itself refuses once' 2>&1)
+  expect_code 0 "$?" "fm-tg-send.sh must still succeed once curl recovers: $out"
+  assert_contains "$out" "definite non-send" "a nonzero curl exit must be logged as a definite non-send, not an ambiguous one"
+  assert_not_contains "$out" "ambiguous" "a definite non-send must not be mislabeled as the ambiguous (may-have-sent) case"
+  pass "telegram: a nonzero curl exit (connection refused/DNS failure) is logged as a definite non-send"
+}
+
+test_send_retry_labels_ambiguous_empty_reply() {
+  local home env counter out
+  home="$TMP_ROOT/retry-ambiguous-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  counter="$TMP_ROOT/retry-counter-ambiguous"
+  printf '1' > "$counter"   # curl exits 0 with an empty body once (the duplicate-risk case), then succeeds
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_FAIL_COUNTER="$counter" \
+    "$ROOT/bin/fm-tg-send.sh" 'curl succeeds but the reply is empty once' 2>&1)
+  expect_code 0 "$?" "fm-tg-send.sh must still succeed once the reply arrives: $out"
+  assert_contains "$out" "ambiguous - may have already sent" "an empty reply from a curl that itself exited 0 must be logged as the ambiguous (may-have-sent) case"
+  assert_not_contains "$out" "definite non-send" "an ambiguous empty reply must not be mislabeled as a definite non-send"
+  pass "telegram: an empty reply from a curl that itself exited 0 is logged as the ambiguous, may-have-already-sent case"
+}
+
 # --- end-to-end: the actual watcher check-cycle artifact ---------------------
 
 test_poll_sh_end_to_end() {
@@ -1418,6 +1465,8 @@ test_upload_timeout_explicit_message
 test_send_retries_transient_failure_then_succeeds
 test_send_does_not_retry_a_real_rejection
 test_send_gives_up_after_3_transient_failures
+test_send_retry_labels_definite_non_send
+test_send_retry_labels_ambiguous_empty_reply
 test_poll_sh_end_to_end
 test_poll_reports_a_refusal_once
 test_poll_without_a_timeout_binary
