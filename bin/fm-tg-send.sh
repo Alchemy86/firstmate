@@ -36,19 +36,32 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # (docs/telegram.md) rather than in the user's global settings, which fixes
 # the same class of problem at the hook layer; this guard stays as defense
 # in depth for direct/manual invocation.
+#
+# A crew worktree is identified by git's own linked-worktree shape
+# (fm_dir_is_child_worktree, bin/fm-primary-scope-lib.sh), not by where it
+# happens to live: an earlier version only recognised $HOME/.treehouse/*, so
+# every task worktree created anywhere else walked straight past it. The
+# literal treehouse path is still refused on top of that, because a leased
+# directory is a crew location whether or not git reports it as a worktree.
+# shellcheck source=bin/fm-primary-scope-lib.sh
+. "$SCRIPT_DIR/fm-primary-scope-lib.sh"
+_fmtg_refuse_crew() {
+  echo "fm-tg-send: REFUSED - crewmates must not contact the captain." >&2
+  echo "  You are in a crew worktree. Report through your status file:" >&2
+  echo "    echo 'done: <one line>' >> $STATE/<your-task-id>.status" >&2
+  echo "  firstmate relays everything to the captain." >&2
+  exit 3
+}
 if [ -n "${FM_TG_FORCE:-}" ]; then
   :
 else
   _fmtg_cwd=$(pwd -P 2>/dev/null || echo "")
   case "$_fmtg_cwd" in
-    "$HOME"/.treehouse/*)
-      echo "fm-tg-send: REFUSED - crewmates must not contact the captain." >&2
-      echo "  You are in a crew worktree. Report through your status file:" >&2
-      echo "    echo 'done: <one line>' >> $STATE/<your-task-id>.status" >&2
-      echo "  firstmate relays everything to the captain." >&2
-      exit 3
-      ;;
+    "$HOME"/.treehouse/*) _fmtg_refuse_crew ;;
   esac
+  if [ -n "$_fmtg_cwd" ] && fm_dir_is_child_worktree "$_fmtg_cwd"; then
+    _fmtg_refuse_crew
+  fi
 fi
 # ------------------------------------------------------------------------
 
@@ -80,16 +93,22 @@ if not d.get("ok"):
 
 # A real reply: stamp it, and retire the inbox messages it answers. FM_TG_ACK=1
 # (the instant "..." acknowledgement) skips this entirely - it is not a reply.
+# The archive run's own output is the only record that a message was retired
+# without ever having been surfaced (bin/fm-tg-archive.py). It used to go to
+# /dev/null, which made that retirement completely invisible; it now lands in
+# state/.tg-archive.log, which fm-tg-archive.py also appends to directly, so
+# the notice survives an ack subprocess that discards both streams.
 mark_sent() {
   if [ -z "${FM_TG_ACK:-}" ]; then
     touch "$STATE/.tg-last-sent"
-    python3 "$SCRIPT_DIR/fm-tg-archive.py" "$STATE/tg-inbox" "$STATE/tg-processed" >/dev/null 2>&1 || true
+    python3 "$SCRIPT_DIR/fm-tg-archive.py" "$STATE/tg-inbox" "$STATE/tg-processed" \
+      >> "$STATE/.tg-archive.log" 2>&1 || true
   fi
 }
 
 if [ "${1:-}" = "--file" ]; then
   f=${2:?path required}; cap=${3:-}
-  sz0=$(stat -c %s "$f" 2>/dev/null || echo 0)
+  sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
   case "${f##*.}" in
     png|jpg|jpeg|webp)
       # Telegram's sendPhoto re-encodes and rejects large or very large-
@@ -97,7 +116,7 @@ if [ "${1:-}" = "--file" ]; then
       # atlas failed outright and a 3MB scaled copy timed out, both reported
       # only as "unparseable reply". Anything over 1MB goes as a DOCUMENT,
       # which preserves the original bytes and has a far higher ceiling.
-      if [ "$sz0" -gt 1000000 ]; then
+      if [ "$sz" -gt 1000000 ]; then
         meth=sendDocument; field=document
       else
         meth=sendPhoto; field=photo
@@ -107,19 +126,18 @@ if [ "${1:-}" = "--file" ]; then
     mp3|ogg|wav|m4a)       meth=sendAudio;    field=audio ;;
     *)                     meth=sendDocument; field=document ;;
   esac
-  sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
   if [ "$sz" -gt 49000000 ]; then
     echo "file is $((sz/1048576))MB, over the 50MB Telegram limit" >&2; exit 1
   fi
   # Scale the timeout with the payload: a flat 180s was not enough for a few
   # MB on a slow connection, and the failure surfaced as an empty,
   # "unparseable reply" rather than anything actionable.
-  tmo=$(( 180 + sz0 / 20000 ))
+  tmo=$(( 180 + sz / 20000 ))
   [ "$tmo" -gt 900 ] && tmo=900
   resp=$(timeout "$tmo" curl -s --max-time "$tmo" -X POST "$API/$meth" \
       -F "chat_id=$TG_CHAT_ID" -F "$field=@$f" -F "caption=${cap:0:1000}")
   if [ -z "$resp" ]; then
-    echo "telegram: no reply after ${tmo}s uploading $((sz0/1048576))MB via $meth - upload timed out" >&2
+    echo "telegram: no reply after ${tmo}s uploading $((sz/1048576))MB via $meth - upload timed out" >&2
     exit 1
   fi
   printf '%s' "$resp" | check || exit 1
@@ -130,7 +148,17 @@ fi
 
 TEXT=${1:?text required}
 # Split into <=LIMIT chunks on the nicest boundary available.
-mapfile -d '' -t PARTS < <(FM_TG_TEXT="$TEXT" python3 - "$LIMIT" <<'PY'
+# `mapfile -d ''` would be shorter but needs bash >= 4.4; macOS still ships
+# /bin/bash 3.2, where it does not exist at all and the split silently
+# produced no parts. Read the NUL-delimited chunks explicitly instead, and
+# count them as they arrive rather than through ${#PARTS[@]}, which is itself
+# an unbound-variable error for an empty array on those older shells.
+PARTS=()
+n=0
+while IFS= read -r -d '' _part; do
+  PARTS[n]=$_part
+  n=$((n + 1))
+done < <(FM_TG_TEXT="$TEXT" python3 - "$LIMIT" <<'PY'
 import os, sys
 limit = int(sys.argv[1])
 text = os.environ["FM_TG_TEXT"]
@@ -152,8 +180,14 @@ for i, c in enumerate(chunks):
     sys.stdout.write(tag + c + "\0")
 PY
 )
-n=${#PARTS[@]}
-for p in "${PARTS[@]}"; do
+if [ "$n" -eq 0 ]; then
+  echo "telegram: could not split the message text into any sendable part" >&2
+  exit 1
+fi
+i=0
+while [ "$i" -lt "$n" ]; do
+  p=${PARTS[i]}
+  i=$((i + 1))
   [ -n "$p" ] || continue
   timeout 60 curl -s -X POST "$API/sendMessage" -d "chat_id=$TG_CHAT_ID" \
       --data-urlencode "text=$p" | check || { echo "FAILED mid-send" >&2; exit 1; }

@@ -21,21 +21,36 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
+# shellcheck source=bin/fm-tg-hook-lib.sh
+. "$SCRIPT_DIR/fm-tg-hook-lib.sh"
+
 "$SCRIPT_DIR/fm-tg-isfirstmate.sh" || exit 0
 
 IN="$STATE/tg-inbox"
 DONE="$STATE/tg-processed"
+BUDGET_FILE="$STATE/.turnend-tg-hook-blocks"
 mkdir -p "$IN" "$DONE"
 
-if pending=$(python3 "$SCRIPT_DIR/fm-tg-drain.py" "$IN" "$DONE"); then
-  printf '%s\n' "$pending" >&2
+# Bounded, but keyed on WHICH messages are pending, so a new or newly-answered
+# message always gets a full budget and only an unchanged, unanswerable set
+# ever runs out (bin/fm-tg-hook-lib.sh).
+block_pending() {  # <surfaced-output>
+  if ! fm_tg_budget_ok "$BUDGET_FILE" "$(fm_tg_pending_key "$IN")"; then
+    echo "fm-tg-hook: the same captain message(s) are still pending after repeatedly holding the turn for them; standing down so the session is not wedged. They stay in $IN and surface again once anything changes." >&2
+    exit 0
+  fi
+  printf '%s\n' "$1" >&2
   exit 2
+}
+
+if pending=$(python3 "$SCRIPT_DIR/fm-tg-drain.py" "$IN" "$DONE"); then
+  block_pending "$pending"
 fi
+fm_tg_budget_clear "$BUDGET_FILE"
 
 out=$(FM_TG_WAIT_MAX=${FM_TG_HOOK_MAX:-1800} "$SCRIPT_DIR/fm-tg-wait.sh" 2>/dev/null)
 case "$out" in
   *CAPTAIN:*)
-    echo "$out" >&2
     # DELIBERATELY NOT marking these as surfaced beyond what fm-tg-wait.sh's
     # own delegation to fm-tg-drain.py already did. An earlier version called
     # a separate mark step here on the assumption that the waiter's own print
@@ -43,7 +58,7 @@ case "$out" in
     # counted once and the next drain retired it - so three of the captain's
     # messages were archived on 2026-08-21 without ever being seen. Seeing a
     # message an extra time is a trivial cost; losing one is not.
-    exit 2
+    block_pending "$out"
     ;;
 esac
 exit 0

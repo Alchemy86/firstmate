@@ -911,6 +911,13 @@ X mode is active, so the emitted block's cadence instruction applies.
 This script never starts supervision itself.
 
 EOF
+elif [ -f "$CONFIG/tg-mode.env" ]; then
+  cat <<EOF
+Follow the supervision operating instructions block above for harness '$PRIMARY_HARNESS'.
+Telegram captain-comms is active, so the emitted block's cadence instruction applies.
+This script never starts supervision itself.
+
+EOF
 else
 cat <<EOF
 Follow the supervision operating instructions block above for harness '$PRIMARY_HARNESS'.

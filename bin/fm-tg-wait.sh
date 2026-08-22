@@ -49,7 +49,13 @@ while :; do
   # long poll: returns as soon as a message arrives, else after 50s
   resp=$(timeout 70 curl -s "https://api.telegram.org/bot$TG_TOKEN/getUpdates?offset=$offset&timeout=50" 2>/dev/null) || continue
   [ -n "$resp" ] || continue
-  out=$(printf '%s' "$resp" | python3 "$SCRIPT_DIR/fm-tg-fetch.py" wait "$IN" "$OFF" "$SCRIPT_DIR/fm-tg-send.sh")
+  # Bound the fetch by what is left of this waiter's own lifetime, so a slow
+  # media download cannot outlive the Stop hook that is waiting on it.
+  budget=$(( MAX - ( $(date +%s) - start ) ))
+  [ "$budget" -gt 180 ] && budget=180
+  [ "$budget" -gt 0 ] || continue
+  out=$(printf '%s' "$resp" \
+    | FM_TG_FETCH_BUDGET="$budget" python3 "$SCRIPT_DIR/fm-tg-fetch.py" wait "$IN" "$OFF" "$SCRIPT_DIR/fm-tg-send.sh")
   if [ -n "$out" ]; then
     printf '%s\n' "$out"
     exit 0

@@ -43,9 +43,10 @@ Never commit this file or its values anywhere. `bin/fm-tg-send.sh` and friends r
 | `bin/fm-tg-archive.py` | Retires a message once a real reply has actually been sent (`bin/fm-tg-send.sh` calls it after every non-ack send) - either because it was surfaced, or because it is over 60s old (closes the reply/surface race - see "No message is answered twice" below). |
 | `bin/fm-tg-guard.sh` | Stop hook. Refuses to end a turn that surfaced a captain message without a reply having gone out since. |
 | `bin/fm-tg-hook.sh` | Stop hook. Drains pending messages; if none, long-polls via `fm-tg-wait.sh`. |
+| `bin/fm-tg-hook-lib.sh` | The two Stop hooks' shared block budget - see "A hook can never wedge the session" below. |
 | `bin/fm-tg-isfirstmate.sh` | Identity check; exits non-zero for a crewmate session. Defense in depth - see "Only firstmate talks to the captain" below. |
 
-Runtime state - `state/tg-inbox/`, `state/tg-processed/`, `state/tg-media/`, `state/.tg-last-sent`, `state/.tg-last-surfaced`, `state/.tg-offset`, the generated `state/tg-watch.check.sh` - lives in gitignored `state/`, same as every other task and watcher artifact.
+Runtime state - `state/tg-inbox/`, `state/tg-processed/`, `state/tg-media/`, `state/.tg-last-sent`, `state/.tg-last-surfaced`, `state/.tg-offset`, `state/.tg-archive.log`, the two `state/.turnend-tg-*-blocks` budget records, and the generated `state/tg-watch.check.sh` with its `state/tg-watch.check-trust` binding - lives in gitignored `state/`, same as every other task and watcher artifact.
 Nothing under this feature is ever tracked in git except the `bin/fm-tg-*` scripts themselves and the two Stop hook registrations in `.claude/settings.json`.
 
 ### Bootstrap and the watcher
@@ -54,10 +55,17 @@ Nothing under this feature is ever tracked in git except the `bin/fm-tg-*` scrip
 When both `TG_TOKEN` and `TG_CHAT_ID` are set and `curl`/`python3` are available, it writes two idempotent, gitignored artifacts and prints `TELEGRAM: on (chat configured) - ...`:
 
 - `state/tg-watch.check.sh` - a generated shim that `exec`s `bin/fm-tg-poll.sh`; the watcher's own `*.check.sh` sweep (`AGENTS.md` section 8) picks it up with no changes to the watcher itself.
+- `state/tg-watch.check-trust` - the shim's byte binding, written by `bin/fm-check-register.sh`. The watcher runs a custom state check only against a current binding; an unregistered shim is never executed at all and is reported as an unauthenticated check on every single cycle instead, so arming and registering are one step (the same contract `bin/fm-tool-update-check.sh arm` follows).
 - `config/tg-mode.env` - exports `FM_CHECK_INTERVAL=30`. The default watcher cadence is 300s, which used to leave a captain message unfetched for up to five minutes; source this before arming so a Telegram-configured instance polls every 30s instead, exactly as `config/x-mode.env` does for X mode.
 
-On opt-out (config removed, or either value cleared) bootstrap removes both artifacts and reports `TELEGRAM: off - ...` only when it actually removed something.
+The cadence is wired the same way X mode's is, so it actually takes effect: the Stop-owned auto-arm (`bin/fm-claude-stop-autoarm.sh`) and the Cursor park (`bin/fm-turnend-guard-cursor.sh`) source it before arming, the emitted supervision block names it in its arm command and repair line (`bin/fm-supervision-instructions.sh`), and the arm command policy (`bin/fm-arm-command-policy.mjs`) accepts `source config/tg-mode.env` ahead of an arm as an approved setup node.
+
+On opt-out (config removed, or either value cleared) bootstrap removes all three artifacts and reports `TELEGRAM: off - ...` only when it actually removed something.
 If both X mode and Telegram are configured at once, both cadence files export the same `FM_CHECK_INTERVAL=30`, so sourcing both before arming is harmless regardless of order.
+
+The poll also has to finish inside the watcher's per-check bound (`FM_CHECK_TIMEOUT`, default 30s), because a check killed part way through has written neither the inbox record nor the offset and would refetch and re-acknowledge the same update on every following cycle.
+`bin/fm-tg-poll.sh` therefore bounds its own `getUpdates` call and hands `bin/fm-tg-fetch.py` an explicit wall-clock budget for the rest; the fetch writes the inbox record and the offset before it acknowledges anything or downloads any media, and skips a media download that no longer fits rather than starting one.
+A message whose attachment could not be pulled down in time is still recorded and still surfaces, carrying its Telegram file id.
 
 ### Stop hook registration
 
@@ -76,8 +84,10 @@ That is the direct cause of the captain receiving replies from crewmates, of dup
 
 **Fix.** The hooks now live in this repo's tracked, project-scoped `.claude/settings.json`, so only a Claude Code session actually running with this repo as its project loads them at all - a crewmate working on some other project never does.
 `bin/fm-tg-isfirstmate.sh` stays in place as defense in depth for the one case project-scoping cannot rule out on its own: a crewmate sent to work on firstmate's own repo checks out this same tracked `.claude/settings.json` inside its own worktree.
-It walks process ancestry for the crewmate brief marker and checks whether the working directory sits under `~/.treehouse/` (where every crew worktree lives), and defaults to *allow* when neither test fires, because a false "not firstmate" would silently lose the captain's messages, which is the worse failure.
-`bin/fm-tg-send.sh` independently refuses any direct invocation from a crew worktree, so a brief that wrongly tells a crewmate to call it directly still cannot reach the captain.
+It uses the repo's own shared scoping predicate, `fm_primary_scope_matches` in `bin/fm-primary-scope-lib.sh` - the same test `bin/fm-turnend-guard.sh` and `bin/fm-claude-stop-autoarm.sh` scope themselves with - so a linked task worktree is condemned wherever it lives.
+An earlier version hand-rolled a process-ancestry grep plus a hardcoded `~/.treehouse/` path test, which declared every worktree outside that one directory (this repo's own validation worktrees included) to be firstmate.
+A secondmate home passes the shared predicate but is condemned here too: there is one captain and one bot per machine, and a secondmate reports through the main firstmate rather than to the captain directly.
+`bin/fm-tg-send.sh` independently refuses any direct invocation whose working directory is a crew worktree - identified by git's own linked-worktree shape, not by location - so a brief that wrongly tells a crewmate to call it directly still cannot reach the captain.
 
 ### No message is lost
 
@@ -97,8 +107,9 @@ A message surfaces exactly as many times as it takes to get answered, no more an
 **Defect (2026-08-22, seen live) - the reply/surface race.** Tying retirement to "surfaced AND replied" has its own race: a reply sent within seconds of a surfacing could find the record still flagged unsurfaced (the drain that sets `surfaced` and the send that triggers `bin/fm-tg-archive.py` run close together), so it was not retired and re-surfaced right afterwards - indistinguishable, to the captain, from the duplicate-reply bug this file exists to end.
 
 **Fix.** `bin/fm-tg-archive.py` retires a message when it has been surfaced, OR when it arrived more than 60 seconds before the reply went out.
-A message that old has had every chance to be seen, so the reply is taken to cover it even if `surfaced` never got set in time; that unsurfaced retirement is printed so it is never invisible.
+A message that old has had every chance to be seen, so the reply is taken to cover it even if `surfaced` never got set in time; that unsurfaced retirement is recorded so it is never invisible.
 A message newer than 60 seconds and never surfaced stays pending rather than being silently eaten.
+The notice is appended to `state/.tg-archive.log` as well as printed, because the only caller runs the archive as a subprocess whose output an ack path discards - printing alone made the one outcome that can cost the captain an answer completely silent in practice.
 
 ### The `...` acknowledgement is not a reply
 
@@ -115,6 +126,19 @@ During a long turn the captain got silence the whole time and then the `...` arr
 **Fix.** The ack now fires inside `bin/fm-tg-fetch.py`, the moment a message is written to the inbox - whichever of the poller or the long-poll waiter wins the race to fetch it (see "poller/waiter race" below).
 The record is marked `acked: 1`; `bin/fm-tg-drain.py` only re-sends the ack as a fallback when that flag is absent, which covers a failed arrival-time send without ever double-acking a healthy one.
 
+### A hook can never wedge the session
+
+**Defect risk.** Both Stop hooks refuse a turn end with a blocking exit until their condition clears - a reply was sent, or nothing is pending.
+When the condition *cannot* clear (Telegram unreachable, a revoked token, no network) the model has no way to satisfy either one, so every turn end would re-block for ever.
+
+**Fix.** `bin/fm-tg-hook-lib.sh` gives both hooks the same bounded block budget `bin/fm-turnend-guard.sh` already uses, with one difference that is load-bearing: the budget is keyed on the *condition*, not on the session.
+Each block records exactly what it is blocking about - which messages are pending, or which surfacing is unanswered - and any change to that key is progress and resets the count.
+A new or newly-answered message therefore always gets a full budget, and only the same unchanged, unanswerable condition ever runs out.
+Exhaustion is not permanent silence either: the record is left untouched at that point, so `FM_TG_TURNEND_BLOCK_TTL` (default 3600s) after the last block the same condition may speak up again.
+`FM_TG_TURNEND_BLOCK_BUDGET` (default 3) sets the count.
+
+Deliberately not a `stop_hook_active` one-shot allow: `bin/fm-tg-hook.sh` is registered with `asyncRewake`, and Claude Code marks every stop after any stop-hook-driven continuation `stop_hook_active=true` (the incident recorded in [docs/turnend-guard.md](turnend-guard.md)), so honouring that field here would disable both hooks permanently after their first block instead of bounding them.
+
 ## Other defects worth knowing about
 
 These do not each map to one of the guarantees above, but explain choices in the code that would otherwise look arbitrary.
@@ -129,6 +153,9 @@ These do not each map to one of the guarantees above, but explain choices in the
 - **Poller/waiter race (2026-08-22).** Two things poll Telegram: the watcher's `state/tg-watch.check.sh` shim, and `bin/fm-tg-wait.sh`'s own long-poll when a Stop hook blocks on it.
   Telegram hands an update to whichever asks first; if the poll shim wins, the message is filed into `state/tg-inbox` and the blocked waiter - the only one of the two that can actually wake the model - keeps waiting for something that has already been taken, for up to `FM_TG_WAIT_MAX` seconds.
   `bin/fm-tg-wait.sh` therefore checks the inbox via `bin/fm-tg-drain.py` on every loop pass, not just the network, so a message filed by the other side is picked up within one pass instead of after a timeout.
+- **`mapfile -d` and bash 3.2.** The outbound text splitter read its NUL-delimited chunks with `mapfile -d ''`, which needs bash >= 4.4.
+  macOS still ships `/bin/bash` 3.2, where `mapfile` does not exist at all, so the array stayed unset and the very next line aborted under `set -u` - every text send would have failed there.
+  It now reads the chunks with a portable `while IFS= read -r -d ''` loop and counts them as they arrive, because `${#PARTS[@]}` on an empty array is itself an unbound-variable error on those shells.
 - **Single-quoted embedded Python.** Earlier versions of the poller and waiter each embedded a near-identical parsing block as a `python3 -c '...'` single-quoted shell string.
   An apostrophe anywhere in that block - in a code comment, in captain text reflected back into it - broke the enclosing shell script.
   That logic is now the one real file `bin/fm-tg-fetch.py`, imported by argv rather than interpolated into a shell string, shared by both callers.
@@ -138,8 +165,16 @@ These do not each map to one of the guarantees above, but explain choices in the
 
 ## Upload sizing (`bin/fm-tg-send.sh --file`)
 
-- PNG/JPEG/WebP over 1MB, and every video/audio/animation/other file regardless of size, upload via `sendDocument` (original bytes preserved, ~2GB Telegram-side ceiling for a bot, though this script still enforces its own 50MB cap below).
-- PNG/JPEG/WebP at or under 1MB upload via `sendPhoto` (Telegram-side inline preview, but re-encoded and dimension-limited).
+Routing is by extension first, then by size:
+
+| Extension | Method |
+| --- | --- |
+| `png` `jpg` `jpeg` `webp` at or under 1MB | `sendPhoto` (Telegram-side inline preview, but re-encoded and dimension-limited) |
+| `png` `jpg` `jpeg` `webp` over 1MB | `sendDocument` (original bytes preserved, no re-encoding, a far higher ceiling) |
+| `mp4` `mov` `m4v` `webm` | `sendVideo` |
+| `gif` | `sendAnimation` |
+| `mp3` `ogg` `wav` `m4a` | `sendAudio` |
+| anything else | `sendDocument` |
 - Anything over 50MB is refused before ever calling `curl`, with the file's size reported.
 - The upload timeout scales with payload size (`180 + size/20000` seconds, capped at 900s / 15 minutes) instead of a flat value that was too short for a multi-MB upload on a slow connection.
 

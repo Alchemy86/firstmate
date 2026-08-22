@@ -854,10 +854,20 @@ function analyzeProgram(command, context, depth = 0) {
   return { error: "", protectedFound, directProtected, nestedProtected, broadKill: broadKillFound, pgrepWatcher, watcherPids: activeContext.watcherPids, program, nodeInfos };
 }
 
-function xModePathAllowed(value, home) {
-  if (value === "config/x-mode.env" || value === "./config/x-mode.env") return true;
+// The generated watcher cadence configs. Both export exactly
+// FM_CHECK_INTERVAL=30 and are written by bin/fm-bootstrap.sh, so sourcing
+// either one before an arm is an approved setup node; nothing else is.
+const CADENCE_ENV_RELATIVE_PATHS = ["config/x-mode.env", "config/tg-mode.env"];
+
+function cadenceEnvPathAllowed(value, home) {
+  for (const relative of CADENCE_ENV_RELATIVE_PATHS) {
+    if (value === relative || value === `./${relative}`) return true;
+  }
   if (!path.isAbsolute(value)) return false;
-  return path.normalize(value) === path.join(path.normalize(home), "config/x-mode.env");
+  const normalized = path.normalize(value);
+  return CADENCE_ENV_RELATIVE_PATHS.some(
+    (relative) => normalized === path.join(path.normalize(home), relative),
+  );
 }
 
 function ordinaryWordsOnly(tokens) {
@@ -870,8 +880,8 @@ function setupKind(info, context) {
   const values = position.words.map((word) => word.value);
   if (values[0] === "cd" && values.length === 2) return "cd";
   if (values[0] === "export" && values.length === 2 && isAssignment(values[1])) return "export";
-  if ((values[0] === "source" || values[0] === ".") && values.length === 2 && xModePathAllowed(values[1], context.home)) return "source";
-  if (values[0] === "[" && values[1] === "-f" && values[3] === "]" && values.length === 4 && xModePathAllowed(values[2], context.home)) return "test-source";
+  if ((values[0] === "source" || values[0] === ".") && values.length === 2 && cadenceEnvPathAllowed(values[1], context.home)) return "source";
+  if (values[0] === "[" && values[1] === "-f" && values[3] === "]" && values.length === 4 && cadenceEnvPathAllowed(values[2], context.home)) return "test-source";
   return "";
 }
 

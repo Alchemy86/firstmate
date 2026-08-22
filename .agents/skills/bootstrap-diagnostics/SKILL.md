@@ -60,3 +60,10 @@ When any diagnostic needs captain attention, report the plain consequence and re
   Inspect the reason, keep the pending marker under `state/.secondmate-nudge-pending/` intact, and rerun session start after the endpoint or metadata issue is fixed so bootstrap can retry the exact same marked send on the same local or remote route.
 - `FMX: X mode on ...` / `FMX: X mode off ...` - bootstrap confirmed or removed the local Relay poll artifacts (`docs/configuration.md` "Relay (.env)"); the emitted line still carries Relay's former `X mode` wording.
   Only when a running watcher needs the cadence transition applied immediately, restart the home-scoped watcher through the emitted harness supervision protocol; bootstrap deliberately never restarts the watcher itself.
+- `TELEGRAM: on (chat configured) - ...` / `TELEGRAM: off - removed ...` - bootstrap confirmed or removed this machine's Telegram captain-comms poll artifacts (`docs/telegram.md`).
+  Both are completed facts and need no action beyond the same optional cadence restart as the Relay line above.
+- `TELEGRAM: off - missing poll dependencies ...` - `curl` or `python3` is absent, so bootstrap disarmed the Telegram poll and printed the matching `MISSING:` line.
+  Handle the `MISSING:` line by the rule at the top of this skill; the poll rearms itself on the next bootstrap once the tool is installed.
+- `TELEGRAM: off - failed to arm ...` / `TELEGRAM: off - failed to remove ...` - bootstrap could not write, register, or clear the poll shim, its byte binding, or the cadence config, so the captain's Telegram channel is NOT being polled.
+  Inspect `state/tg-watch.check.sh`, `state/tg-watch.check-trust`, and `config/tg-mode.env` for a symlink, a wrong mode, or an unwritable parent, repair whatever is wrong, and rerun bootstrap; a `stale artifacts remain` variant means the leftovers are still on disk and must be cleared before the rearm can succeed.
+  Tell the captain his Telegram channel is down while this is unresolved, since he cannot tell the difference between a broken channel and firstmate having nothing to say.

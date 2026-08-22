@@ -178,10 +178,14 @@ write_epoch() {  # <outcome>
 
 write_epoch arming
 
-# X mode cadence: source the generated config so an X instance polls at its
-# 30s cadence (fm-bootstrap.sh x_mode_setup contract).
+# Fast poll cadence: source whichever generated cadence configs this home has
+# so an opted-in instance polls at its 30s cadence rather than the 300s default
+# (fm-bootstrap.sh poll_mode_* contract). Both files export the same
+# FM_CHECK_INTERVAL, so sourcing both is harmless in either order.
 # shellcheck source=/dev/null
 [ -f "$CONFIG/x-mode.env" ] && . "$CONFIG/x-mode.env"
+# shellcheck source=/dev/null
+[ -f "$CONFIG/tg-mode.env" ] && . "$CONFIG/tg-mode.env"
 
 # --- foreground the real arm wrapper ------------------------------------------
 # NO shell &: this hook process tree is the harness-owned lifecycle. The arm

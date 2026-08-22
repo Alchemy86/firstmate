@@ -76,7 +76,7 @@ export PATH="$FAKEBIN:$PATH"
 fm_tg_scratch_bin() {
   local dir=$1 sbin="$1/bin" f
   mkdir -p "$sbin"
-  for f in "$ROOT"/bin/fm-tg-*.sh "$ROOT"/bin/fm-tg-*.py; do
+  for f in "$ROOT"/bin/fm-tg-*.sh "$ROOT"/bin/fm-tg-*.py "$ROOT"/bin/fm-primary-scope-lib.sh; do
     cp "$f" "$sbin/$(basename "$f")"
   done
   cat > "$sbin/fm-tg-isfirstmate.sh" <<'SH'
@@ -104,6 +104,197 @@ fm_tg_getupdates_fixture() {
   export FAKE_TG_GETUPDATES_FILE="$f"
 }
 
+# --- bootstrap arms a shim the watcher will actually run --------------------
+
+test_bootstrap_registers_poll_shim() {
+  local home env
+
+  home="$TMP_ROOT/arm-home"
+  mkdir -p "$home/state" "$home/config"
+  env=$(fm_tg_env "$home")
+
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-bootstrap.sh" >"$TMP_ROOT/arm-out" 2>&1
+  assert_grep "TELEGRAM: on" "$TMP_ROOT/arm-out" "bootstrap did not arm Telegram for a configured home"
+  assert_present "$home/state/tg-watch.check.sh" "bootstrap did not write the poll shim"
+  assert_present "$home/config/tg-mode.env" "bootstrap did not write the cadence config"
+  assert_grep "export FM_CHECK_INTERVAL=30" "$home/config/tg-mode.env" "cadence must be 30s"
+
+  # The whole point: an unregistered shim is never executed by the watcher and
+  # is reported as an unauthenticated check on every single cycle instead.
+  # This is exactly the predicate bin/fm-watch.sh dispatches on.
+  ( . "$ROOT/bin/fm-pr-lib.sh"; . "$ROOT/bin/fm-check-lib.sh"
+    fm_custom_check_registered "$home/state" tg-watch ) \
+    || fail "the armed poll shim is not byte-registered, so the watcher would refuse to run it"
+
+  # The shim must carry an ABSOLUTE FM_HOME: it runs from the watcher's cwd.
+  assert_grep "export FM_HOME=/" "$home/state/tg-watch.check.sh" "the shim's FM_HOME must be absolute"
+
+  # Opt-out clears the binding as well as the shim, so nothing stale is left
+  # authorising an execution.
+  printf 'TG_TOKEN=\nTG_CHAT_ID=\n' > "$env"
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-bootstrap.sh" >"$TMP_ROOT/disarm-out" 2>&1
+  assert_grep "TELEGRAM: off" "$TMP_ROOT/disarm-out" "bootstrap did not report the disarm"
+  assert_absent "$home/state/tg-watch.check.sh" "opt-out must remove the poll shim"
+  assert_absent "$home/state/tg-watch.check-trust" "opt-out must remove the shim's byte binding"
+  assert_absent "$home/config/tg-mode.env" "opt-out must remove the cadence config"
+  rm -f "$TMP_ROOT/arm-out" "$TMP_ROOT/disarm-out"
+  pass "telegram: bootstrap arms AND registers state/tg-watch.check.sh, and opt-out clears the binding too"
+}
+
+test_cadence_config_is_actually_usable() {
+  local home out
+
+  # Sourcing the generated cadence ahead of an arm has to be an APPROVED setup
+  # node, or the documented "source it before arming" instruction is denied by
+  # the repo's own arm policy and the home silently stays on the 300s cadence.
+  out=$("$ROOT/bin/fm-arm-pretool-check.sh" \
+    --command 'source config/tg-mode.env; bin/fm-watch-arm.sh' --claude 2>&1 || true)
+  assert_not_contains "$out" '"permissionDecision":"deny"' \
+    "the arm policy must allow sourcing config/tg-mode.env before an arm"
+
+  out=$("$ROOT/bin/fm-arm-pretool-check.sh" \
+    --command "source '/tmp/not-this-home/config/tg-mode.env'; bin/fm-watch-arm.sh" --claude 2>&1 || true)
+  assert_contains "$out" '"permissionDecision":"deny"' \
+    "a cadence path outside the active home must still be denied"
+
+  # And the emitted supervision block must name it, so the cadence is inherited
+  # by whatever actually starts the watcher.
+  home="$TMP_ROOT/cadence-home"
+  mkdir -p "$home/state" "$home/config"
+  : > "$home/config/tg-mode.env"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-supervision-instructions.sh" --harness claude --repair-line)
+  assert_contains "$out" "source '$home/config/tg-mode.env' first" \
+    "the repair line must source the Telegram cadence config"
+  pass "telegram: config/tg-mode.env is sourceable under the arm policy and named by the supervision block"
+}
+
+# --- neither Stop hook can wedge the session --------------------------------
+
+test_guard_block_budget_bounded() {
+  local home env sbin rc i blocked=0
+
+  home="$TMP_ROOT/wedge-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  sbin=$(fm_tg_scratch_bin "$home/scratch")
+  export FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env"
+
+  # A message was surfaced and no reply has gone out - and, as when Telegram is
+  # unreachable, none ever will. The guard must hold the turn a bounded number
+  # of times and then stand down rather than blocking for ever.
+  touch "$home/state/.tg-last-surfaced"
+  i=0
+  while [ "$i" -lt 6 ]; do
+    rc=0
+    "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/wedge-out" 2>&1 || rc=$?
+    [ "$rc" -eq 2 ] && blocked=$((blocked + 1))
+    i=$((i + 1))
+  done
+  [ "$blocked" -eq 3 ] || fail "guard blocked $blocked times for one unanswered surfacing; expected the default budget of 3"
+  assert_contains "$(cat "$TMP_ROOT/wedge-out")" "standing down" "an exhausted guard must say why it stopped holding the turn"
+
+  # A NEW surfacing is new information and gets a full budget again, so a
+  # bounded guard never becomes a silently lost message.
+  sleep 1
+  touch "$home/state/.tg-last-surfaced"
+  rc=0
+  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/wedge-out" 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "a newly surfaced message must get a fresh budget, not inherit the exhausted one"
+
+  # And a real reply clears the record outright.
+  touch "$home/state/.tg-last-sent"
+  rc=0
+  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/wedge-out" 2>&1 || rc=$?
+  expect_code 0 "$rc" "guard must fall silent once a reply has gone out"
+  assert_absent "$home/state/.turnend-tg-guard-blocks" "a reply must clear the block record"
+
+  rm -f "$TMP_ROOT/wedge-out"
+  unset FM_HOME FM_TG_ENV_OVERRIDE
+  pass "telegram: an unanswerable surfacing holds the turn a bounded number of times, and a new one still gets a full budget"
+}
+
+# --- the poll stays inside the watcher's per-check bound ---------------------
+
+test_poll_records_before_slow_work() {
+  local home env inbox offset
+
+  home="$TMP_ROOT/budget-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  inbox="$home/state/tg-inbox"
+  offset="$home/state/.tg-offset"
+  mkdir -p "$inbox"
+
+  # An ack script that outlives the whole check budget stands in for a stalled
+  # Telegram: the record and the offset must ALREADY be on disk, because a
+  # check the watcher kills mid-flight would otherwise refetch and re-ack the
+  # same update on every following cycle and never record it.
+  cat > "$TMP_ROOT/slow-send.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 30
+SH
+  chmod +x "$TMP_ROOT/slow-send.sh"
+
+  printf '{"ok":true,"result":[{"update_id":70,"message":{"chat":{"id":999},"date":500,"text":"budget me"}}]}' \
+    | FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" TG_TOKEN=faketoken FM_TG_FETCH_BUDGET=3 \
+      python3 "$ROOT/bin/fm-tg-fetch.py" poll "$inbox" "$offset" "$TMP_ROOT/slow-send.sh" >/dev/null
+
+  assert_present "$inbox/70.json" "the inbox record must be written before the ack is attempted"
+  assert_present "$offset" "the offset must be advanced before the ack is attempted"
+  assert_grep "71" "$offset" "the offset must point past the recorded update"
+  assert_no_grep '"acked": 1' "$inbox/70.json" "an ack that could not complete must not be recorded as done"
+  pass "telegram: a poll records the message and advances the offset before any slow, budgeted work"
+}
+
+test_undownloadable_media_still_surfaces() {
+  local home inbox offset out
+
+  home="$TMP_ROOT/media-budget-home"
+  mkdir -p "$home/state"
+  inbox="$home/state/tg-inbox"
+  offset="$home/state/.tg-offset"
+  mkdir -p "$inbox"
+
+  # A captionless photo whose bytes cannot be fetched inside the budget. It
+  # must still be recorded and still surface - a message the captain sent must
+  # never go unmentioned just because its attachment is missing.
+  printf '{"ok":true,"result":[{"update_id":80,"message":{"chat":{"id":999},"date":600,"photo":[{"file_id":"AAA","file_size":10}]}}]}' \
+    | FM_TG_FETCH_BUDGET=1 python3 "$ROOT/bin/fm-tg-fetch.py" poll "$inbox" "$offset" /bin/true >/dev/null
+
+  assert_present "$inbox/80.json" "a captionless photo must be recorded even when its bytes cannot be fetched"
+  assert_grep '"media_id": "AAA"' "$inbox/80.json" "the record must keep the file id of the media it could not fetch"
+  out=$(python3 "$ROOT/bin/fm-tg-drain.py" "$inbox" "$home/state/tg-processed")
+  assert_contains "$out" "1 captain message(s) pending" "an undownloaded attachment must still surface as a pending message"
+  assert_contains "$out" "AAA" "the surfaced line must name the media it could not download"
+  pass "telegram: a message whose attachment could not be fetched in budget is still recorded and still surfaces"
+}
+
+# --- the unsurfaced-retirement notice is not swallowed ----------------------
+
+test_unsurfaced_retirement_is_recorded() {
+  local home env inbox old_ts
+
+  home="$TMP_ROOT/notice-home"
+  mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
+  env=$(fm_tg_env "$home")
+  inbox="$home/state/tg-inbox"
+  old_ts=$(( $(date +%s) - 120 ))
+
+  printf '{"update_id": 60, "chat_id": 999, "ts": %s, "text": "old and unsurfaced"}' "$old_ts" > "$inbox/60.json"
+
+  # Sent through fm-tg-send.sh, exactly as in production - where the archive
+  # run's stdout used to go straight to /dev/null, making the one outcome that
+  # can cost the captain an answer completely invisible.
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'a reply' >"$TMP_ROOT/notice-out" 2>&1
+  expect_code 0 "$?" "fm-tg-send.sh failed: $(cat "$TMP_ROOT/notice-out")"
+  rm -f "$TMP_ROOT/notice-out"
+
+  assert_present "$home/state/.tg-archive.log" "an unsurfaced retirement must be recorded somewhere durable"
+  assert_grep "retired unsurfaced" "$home/state/.tg-archive.log" "the retirement notice must name what happened"
+  assert_grep "60.json" "$home/state/.tg-archive.log" "the retirement notice must name the message it retired"
+  pass "telegram: an unsurfaced retirement is recorded in state/.tg-archive.log instead of being swallowed"
+}
+
 # --- config absent: everything stays silent ---------------------------------
 
 test_config_absent_hooks_silent() {
@@ -111,22 +302,22 @@ test_config_absent_hooks_silent() {
   home="$TMP_ROOT/absent-home"
   mkdir -p "$home/state"
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/does-not-exist.env" \
-    "$ROOT/bin/fm-tg-guard.sh" >/tmp/absent-guard-out 2>&1
+    "$ROOT/bin/fm-tg-guard.sh" >"$TMP_ROOT/absent-guard-out" 2>&1
   expect_code 0 "$?" "fm-tg-guard.sh with no config"
-  [ ! -s /tmp/absent-guard-out ] || fail "fm-tg-guard.sh printed output with no config: $(cat /tmp/absent-guard-out)"
+  [ ! -s "$TMP_ROOT/absent-guard-out" ] || fail "fm-tg-guard.sh printed output with no config: $(cat "$TMP_ROOT/absent-guard-out")"
 
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/does-not-exist.env" FM_TG_WAIT_MAX=1 \
-    "$ROOT/bin/fm-tg-hook.sh" >/tmp/absent-hook-out 2>&1
+    "$ROOT/bin/fm-tg-hook.sh" >"$TMP_ROOT/absent-hook-out" 2>&1
   expect_code 0 "$?" "fm-tg-hook.sh with no config"
-  [ ! -s /tmp/absent-hook-out ] || fail "fm-tg-hook.sh printed output with no config: $(cat /tmp/absent-hook-out)"
+  [ ! -s "$TMP_ROOT/absent-hook-out" ] || fail "fm-tg-hook.sh printed output with no config: $(cat "$TMP_ROOT/absent-hook-out")"
 
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/does-not-exist.env" \
-    "$ROOT/bin/fm-tg-poll.sh" >/tmp/absent-poll-out 2>&1
+    "$ROOT/bin/fm-tg-poll.sh" >"$TMP_ROOT/absent-poll-out" 2>&1
   expect_code 0 "$?" "fm-tg-poll.sh with no config"
-  [ ! -s /tmp/absent-poll-out ] || fail "fm-tg-poll.sh printed output with no config: $(cat /tmp/absent-poll-out)"
+  [ ! -s "$TMP_ROOT/absent-poll-out" ] || fail "fm-tg-poll.sh printed output with no config: $(cat "$TMP_ROOT/absent-poll-out")"
 
   assert_absent "$home/state/tg-inbox" "no config must never create state/tg-inbox"
-  rm -f /tmp/absent-guard-out /tmp/absent-hook-out /tmp/absent-poll-out
+  rm -f "$TMP_ROOT/absent-guard-out" "$TMP_ROOT/absent-hook-out" "$TMP_ROOT/absent-poll-out"
   pass "telegram: absent config -> guard, hook, and poll all exit 0 silently, nothing created"
 }
 
@@ -150,36 +341,72 @@ test_crew_worktree_refuses() {
   [ "$rc" -ne 0 ] || fail "fm-tg-send.sh did not refuse from a crew worktree"
   assert_contains "$out" "REFUSED" "fm-tg-send.sh crew refusal missing REFUSED message"
   assert_absent "$home/state/.tg-last-sent" "crew send must never stamp .tg-last-sent"
-  pass "telegram: fm-tg-send.sh refuses from a crew worktree (\$HOME/.treehouse/*)"
+
+  # A task worktree that does NOT live under $HOME/.treehouse must be refused
+  # just the same: the predicate is git's linked-worktree shape, not a path.
+  fm_git_worktree "$TMP_ROOT/crew-repo" "$TMP_ROOT/crew-elsewhere" fm/crew
+  out=$(cd "$TMP_ROOT/crew-elsewhere" && FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/tg.env" \
+    "$ROOT/bin/fm-tg-send.sh" 'hello captain' 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-tg-send.sh did not refuse from a task worktree outside \$HOME/.treehouse"
+  assert_contains "$out" "REFUSED" "fm-tg-send.sh worktree refusal missing REFUSED message"
+  assert_absent "$home/state/.tg-last-sent" "crew send must never stamp .tg-last-sent"
+  pass "telegram: fm-tg-send.sh refuses from a crew worktree, in \$HOME/.treehouse or anywhere else"
+}
+
+# fm_tg_fake_home <dir> [marker-id]: a directory shaped like a firstmate home
+# (AGENTS.md + bin/ + state/) holding the real identity check and the shared
+# scope lib it uses, so fm-tg-isfirstmate.sh can be run against it directly.
+fm_tg_fake_home() {
+  local dir=$1 marker=${2:-}
+  mkdir -p "$dir/bin" "$dir/state"
+  : > "$dir/AGENTS.md"
+  cp "$ROOT/bin/fm-tg-isfirstmate.sh" "$ROOT/bin/fm-primary-scope-lib.sh" "$dir/bin/"
+  chmod +x "$dir/bin/fm-tg-isfirstmate.sh"
+  [ -z "$marker" ] || printf '%s\n' "$marker" > "$dir/.fm-secondmate-home"
 }
 
 test_isfirstmate_direct() {
-  local crewdir rc ambient_rc
+  local base plain wt rc
 
-  # The whole suite's cwd is already TMP_ROOT (see top of file), which is
-  # never under $HOME/.treehouse/*. But fm-tg-isfirstmate.sh's OTHER signal is
-  # process ancestry: if this suite is itself run from inside a live crewmate
-  # session (dogfooding this very task), that ancestry genuinely, correctly
-  # carries the crewmate brief marker, and the script is RIGHT to condemn it
-  # regardless of cwd. Detect that ambient condition instead of asserting a
-  # fixed verdict, so this test is meaningful in both a clean CI shell and a
-  # live crewmate dev loop without being flaky in either.
-  ambient_rc=0
-  "$ROOT/bin/fm-tg-isfirstmate.sh" || ambient_rc=$?
-  if [ "$ambient_rc" -ne 0 ]; then
-    pass "telegram: fm-tg-isfirstmate.sh (ambient ancestry already carries the crewmate marker in this dev session - cwd-allow branch not independently observable here, but see the cwd-condemn assertion below)"
-  else
-    expect_code 0 "$ambient_rc" "fm-tg-isfirstmate.sh: a normal (non-crew) cwd must be allowed"
-    pass "telegram: fm-tg-isfirstmate.sh allows a normal, non-treehouse, non-crew-ancestry cwd"
-  fi
+  # A plain checkout of a firstmate-shaped home is the one thing that IS
+  # firstmate. Everything below is a variation that must be condemned.
+  base="$TMP_ROOT/identity"
+  plain="$base/primary"
+  fm_git_init_commit "$plain"
+  fm_tg_fake_home "$plain"
+  git -C "$plain" add -A >/dev/null 2>&1
+  git -C "$plain" -c user.name=t -c user.email=t@example.invalid commit -qm home
+  rc=0
+  (cd "$plain" && "$plain/bin/fm-tg-isfirstmate.sh") || rc=$?
+  expect_code 0 "$rc" "a plain firstmate checkout must be recognised as the primary"
 
-  crewdir="$HOME/.treehouse/fm-telegram-test-$$"
-  mkdir -p "$crewdir"
-  (cd "$crewdir" && "$ROOT/bin/fm-tg-isfirstmate.sh")
-  rc=$?
-  rm -rf "$crewdir"
-  [ "$rc" -ne 0 ] || fail "fm-tg-isfirstmate.sh: a \$HOME/.treehouse/* cwd must be condemned as crew"
-  pass "telegram: fm-tg-isfirstmate.sh condemns a treehouse worktree cwd"
+  # A LINKED worktree of that same repo - a crewmate or scout task worktree, or
+  # one of this repo's own validation worktrees. The predecessor of this check
+  # only looked for $HOME/.treehouse/*, so every worktree living anywhere else
+  # was declared to be firstmate and drained the captain's inbox into a crew
+  # session. Location must not matter; git's linked-worktree shape must.
+  wt="$base/task-worktree"
+  git -C "$plain" worktree add --quiet -b fm/task "$wt"
+  mkdir -p "$wt/state"
+  rc=0
+  (cd "$wt" && "$wt/bin/fm-tg-isfirstmate.sh") || rc=$?
+  [ "$rc" -ne 0 ] || fail "a linked task worktree must be condemned as crew wherever it lives"
+
+  # ...and the primary's own copy, invoked while the working directory is that
+  # task worktree, is condemned too.
+  rc=0
+  (cd "$wt" && "$plain/bin/fm-tg-isfirstmate.sh") || rc=$?
+  [ "$rc" -ne 0 ] || fail "a crew cwd must be condemned even when the primary's own copy is invoked"
+
+  # A secondmate home passes the shared primary predicate, but it is not the
+  # home that talks to the captain: one captain, one bot per machine.
+  fm_tg_fake_home "$base/secondmate" fm-second
+  rc=0
+  (cd "$base/secondmate" && "$base/secondmate/bin/fm-tg-isfirstmate.sh") || rc=$?
+  [ "$rc" -ne 0 ] || fail "a secondmate home must not address the captain directly"
+
+  pass "telegram: fm-tg-isfirstmate.sh allows only a plain primary checkout - linked worktrees (anywhere) and secondmate homes are condemned"
 }
 
 # --- full simulated pipeline: arrival -> ack -> guard -> reply -> silent ----
@@ -227,21 +454,21 @@ test_arrival_ack_guard_reply_pipeline() {
   assert_contains "$out" "what is an epoch?" "drain did not surface the message text"
 
   # 3. Guard: only an ack was ever sent, never a real reply -> must demand one.
-  "$sbin/fm-tg-guard.sh" >/tmp/guard1-out 2>&1
+  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/guard1-out" 2>&1
   rc=$?
-  [ "$rc" -eq 2 ] || fail "guard did not block after ack-only (got exit $rc): $(cat /tmp/guard1-out)"
-  assert_contains "$(cat /tmp/guard1-out)" "UNANSWERED CAPTAIN MESSAGE" "guard reason missing"
-  rm -f /tmp/guard1-out
+  [ "$rc" -eq 2 ] || fail "guard did not block after ack-only (got exit $rc): $(cat "$TMP_ROOT/guard1-out")"
+  assert_contains "$(cat "$TMP_ROOT/guard1-out")" "UNANSWERED CAPTAIN MESSAGE" "guard reason missing"
+  rm -f "$TMP_ROOT/guard1-out"
 
   # 4. Still unanswered -> re-surfaces (no loss) rather than being dropped.
   out=$(python3 "$sbin/fm-tg-drain.py" "$inbox" "$home/state/tg-processed")
   assert_contains "$out" "what is an epoch?" "unanswered message failed to re-surface"
 
   # 5. A real reply goes out (fake curl, no live traffic).
-  "$sbin/fm-tg-send.sh" 'an epoch is a fixed point in time' >/tmp/send-out 2>&1
+  "$sbin/fm-tg-send.sh" 'an epoch is a fixed point in time' >"$TMP_ROOT/send-out" 2>&1
   rc=$?
-  expect_code 0 "$rc" "fm-tg-send.sh real reply failed: $(cat /tmp/send-out)"
-  rm -f /tmp/send-out
+  expect_code 0 "$rc" "fm-tg-send.sh real reply failed: $(cat "$TMP_ROOT/send-out")"
+  rm -f "$TMP_ROOT/send-out"
   assert_present "$home/state/.tg-last-sent" "real reply did not stamp .tg-last-sent"
 
   # 6. Archived: the message is gone from the inbox and drain has nothing left.
@@ -252,10 +479,10 @@ test_arrival_ack_guard_reply_pipeline() {
   [ "$rc" -eq 1 ] || fail "drain still reports something pending after the real reply landed"
 
   # 7. Guard: a real reply since the last surface -> silent, turn may end.
-  "$sbin/fm-tg-guard.sh" >/tmp/guard2-out 2>&1
+  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/guard2-out" 2>&1
   rc=$?
-  expect_code 0 "$rc" "guard still blocking after a real reply was sent: $(cat /tmp/guard2-out)"
-  rm -f /tmp/guard2-out
+  expect_code 0 "$rc" "guard still blocking after a real reply was sent: $(cat "$TMP_ROOT/guard2-out")"
+  rm -f "$TMP_ROOT/guard2-out"
 
   unset FM_HOME FM_TG_ENV_OVERRIDE TG_TOKEN
   pass "telegram: arrival acks once, guard demands a real reply, unanswered re-surfaces, real reply silences the guard and archives"
@@ -274,9 +501,9 @@ test_archive_race_fresh_unsurfaced_stays_pending() {
   # A message that just arrived (well under 60s old) and was never surfaced.
   printf '{"update_id": 50, "chat_id": 999, "ts": %s, "text": "brand new"}' "$now" > "$inbox/50.json"
 
-  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'unrelated reply' >/tmp/race-fresh-out 2>&1
-  expect_code 0 "$?" "fm-tg-send.sh failed: $(cat /tmp/race-fresh-out)"
-  rm -f /tmp/race-fresh-out
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'unrelated reply' >"$TMP_ROOT/race-fresh-out" 2>&1
+  expect_code 0 "$?" "fm-tg-send.sh failed: $(cat "$TMP_ROOT/race-fresh-out")"
+  rm -f "$TMP_ROOT/race-fresh-out"
 
   assert_present "$inbox/50.json" \
     "a fresh (<60s), never-surfaced message must NOT be swept up by an unrelated reply"
@@ -389,9 +616,9 @@ test_large_png_uses_senddocument() {
   log="$TMP_ROOT/curl-large.log"
 
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" \
-    "$ROOT/bin/fm-tg-send.sh" --file "$f" >/tmp/large-png-out 2>&1
-  expect_code 0 "$?" "sending a >1MB png failed: $(cat /tmp/large-png-out)"
-  rm -f /tmp/large-png-out
+    "$ROOT/bin/fm-tg-send.sh" --file "$f" >"$TMP_ROOT/large-png-out" 2>&1
+  expect_code 0 "$?" "sending a >1MB png failed: $(cat "$TMP_ROOT/large-png-out")"
+  rm -f "$TMP_ROOT/large-png-out"
 
   assert_grep "sendDocument" "$log" "a >1MB png must upload via sendDocument, not sendPhoto"
   assert_grep "-F document=" "$log" "a >1MB png must use the document field, not photo"
@@ -409,9 +636,9 @@ test_small_png_uses_sendphoto() {
   log="$TMP_ROOT/curl-small.log"
 
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" \
-    "$ROOT/bin/fm-tg-send.sh" --file "$f" >/tmp/small-png-out 2>&1
-  expect_code 0 "$?" "sending a small png failed: $(cat /tmp/small-png-out)"
-  rm -f /tmp/small-png-out
+    "$ROOT/bin/fm-tg-send.sh" --file "$f" >"$TMP_ROOT/small-png-out" 2>&1
+  expect_code 0 "$?" "sending a small png failed: $(cat "$TMP_ROOT/small-png-out")"
+  rm -f "$TMP_ROOT/small-png-out"
 
   assert_grep "sendPhoto" "$log" "a small png should still upload via sendPhoto"
   pass "telegram: a PNG at or under 1MB still uploads via sendPhoto"
@@ -459,6 +686,12 @@ test_poll_sh_end_to_end() {
   pass "telegram: bin/fm-tg-poll.sh (the state/tg-watch.check.sh watcher artifact) fetches, records, and acks end-to-end"
 }
 
+test_bootstrap_registers_poll_shim
+test_cadence_config_is_actually_usable
+test_guard_block_budget_bounded
+test_poll_records_before_slow_work
+test_undownloadable_media_still_surfaces
+test_unsurfaced_retirement_is_recorded
 test_config_absent_hooks_silent
 test_crew_worktree_refuses
 test_isfirstmate_direct

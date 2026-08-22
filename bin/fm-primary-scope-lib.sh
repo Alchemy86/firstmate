@@ -31,3 +31,18 @@ fm_primary_scope_matches() {
   [ -d "$root/bin" ] || return 1
   [ -d "$state" ] || return 1
 }
+
+# Return 0 when $1 sits inside a linked git worktree that carries no valid
+# secondmate marker - a crewmate or scout task worktree. Location-independent:
+# a task worktree is identified by git's own linked-worktree shape, not by
+# living under any particular parent directory.
+fm_dir_is_child_worktree() {
+  local dir=$1 top git_dir git_common_dir
+  [ -d "$dir" ] || return 1
+  git_dir=$(git -C "$dir" rev-parse --git-dir 2>/dev/null) || return 1
+  git_common_dir=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 1
+  [ "$git_dir" != "$git_common_dir" ] || return 1
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 0
+  fm_root_is_secondmate_home "$top" && return 1
+  return 0
+}

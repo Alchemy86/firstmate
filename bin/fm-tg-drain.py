@@ -52,6 +52,12 @@ for _ts, path, rec in rows:
         line = text.replace("\n", " ")[:4000]
     elif media:
         line = "[image] %s" % media
+    elif rec.get("media_id"):
+        # The captain sent media whose bytes could not be pulled down inside
+        # the poll's budget (see bin/fm-tg-fetch.py). Surface it anyway: a
+        # message he sent must never go unmentioned just because the
+        # attachment is missing.
+        line = "[media received; bytes not downloaded - file id %s]" % rec.get("media_id")
     else:
         line = None
     if line:

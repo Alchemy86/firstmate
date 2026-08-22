@@ -10,6 +10,14 @@
 # the moment they arrive, here - not at firstmate's turn end. See
 # bin/fm-tg-fetch.py for why arrival time is the only correct moment.
 # Completely inert with no ~/.config/fm-telegram.env or an empty TG_TOKEN.
+#
+# Everything here has to finish inside the watcher's own per-check bound: the
+# watcher kills a check's whole process group at FM_CHECK_TIMEOUT (default 30s,
+# read from this check's own environment because the watcher runs it as a
+# direct child), and a killed run has written neither the inbox record nor the
+# offset, so it would refetch and re-acknowledge the same update on every
+# following cycle. The fetch is therefore given an explicit wall-clock budget
+# built from what this script has not already spent.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,8 +38,23 @@ OFF="$STATE/.tg-offset"
 mkdir -p "$IN"
 offset=$(cat "$OFF" 2>/dev/null || echo 0)
 
-resp=$(timeout 20 curl -s "https://api.telegram.org/bot$TG_TOKEN/getUpdates?offset=$offset&timeout=0" 2>/dev/null) || exit 0
+CHECK_BUDGET=${FM_CHECK_TIMEOUT:-30}
+case "$CHECK_BUDGET" in ''|*[!0-9]*|0) CHECK_BUDGET=30 ;; esac
+# Reserve the tail of the budget so the fetch is never still running when the
+# watcher's kill lands.
+MARGIN=3
+GETUPDATES_TMO=$(( CHECK_BUDGET / 4 ))
+[ "$GETUPDATES_TMO" -lt 3 ] && GETUPDATES_TMO=3
+[ "$GETUPDATES_TMO" -gt 10 ] && GETUPDATES_TMO=10
+
+started=$(date +%s)
+resp=$(timeout "$GETUPDATES_TMO" curl -s --max-time "$GETUPDATES_TMO" \
+  "https://api.telegram.org/bot$TG_TOKEN/getUpdates?offset=$offset&timeout=0" 2>/dev/null) || exit 0
 [ -n "$resp" ] || exit 0
 
-printf '%s' "$resp" | python3 "$SCRIPT_DIR/fm-tg-fetch.py" poll "$IN" "$OFF" "$SCRIPT_DIR/fm-tg-send.sh"
+FETCH_BUDGET=$(( CHECK_BUDGET - ( $(date +%s) - started ) - MARGIN ))
+[ "$FETCH_BUDGET" -gt 0 ] || exit 0
+
+printf '%s' "$resp" \
+  | FM_TG_FETCH_BUDGET="$FETCH_BUDGET" python3 "$SCRIPT_DIR/fm-tg-fetch.py" poll "$IN" "$OFF" "$SCRIPT_DIR/fm-tg-send.sh"
 exit 0

@@ -21,6 +21,12 @@ be seen, so the reply is taken to cover it even if "surfaced" never got set;
 retire it too, printing that unsurfaced retirement so it is never invisible.
 Anything newer than that stays pending rather than being silently eaten.
 
+An unsurfaced retirement is the one outcome here that can cost the captain an
+answer, so it is recorded rather than merely printed: this script's stdout used
+to be sent straight to /dev/null by its only caller, which made that notice
+invisible in practice. Every notice is appended to <state>/.tg-archive.log,
+next to the inbox, in addition to being printed.
+
 Usage: fm-tg-archive.py <inbox-dir> <processed-dir>
 """
 import glob
@@ -31,6 +37,19 @@ import time
 
 inbox, done = sys.argv[1], sys.argv[2]
 os.makedirs(done, exist_ok=True)
+log_path = os.path.join(os.path.dirname(os.path.normpath(inbox)), ".tg-archive.log")
+
+
+def notice(line):
+    """Print, and durably record, something an operator must be able to find."""
+    print(line)
+    try:
+        with open(log_path, "a") as fh:
+            fh.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), line))
+    except Exception:
+        pass
+
+
 n = 0
 for path in glob.glob(os.path.join(inbox, "*.json")):
     try:
@@ -43,6 +62,6 @@ for path in glob.glob(os.path.join(inbox, "*.json")):
         os.replace(path, os.path.join(done, os.path.basename(path)))
         n += 1
         if not seen:
-            print("retired unsurfaced (arrived %ds before reply): %s"
-                  % (time.time() - float(rec.get("ts") or 0), os.path.basename(path)))
+            notice("retired unsurfaced (arrived %ds before reply): %s"
+                   % (time.time() - float(rec.get("ts") or 0), os.path.basename(path)))
 print("archived %d" % n)

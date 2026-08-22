@@ -268,9 +268,12 @@ if ! fm_supervision_needed "$STATE" "$GRACE"; then
   exit 0
 fi
 
-# X mode cadence: an opted-in home polls Relay at its generated cadence.
+# Fast poll cadence: an opted-in home polls Relay, or Telegram, at its
+# generated cadence. Both configs export the same FM_CHECK_INTERVAL.
 # shellcheck source=/dev/null
 [ -f "$CONFIG/x-mode.env" ] && . "$CONFIG/x-mode.env"
+# shellcheck source=/dev/null
+[ -f "$CONFIG/tg-mode.env" ] && . "$CONFIG/tg-mode.env"
 
 # --- the park ----------------------------------------------------------------
 # The arm runs as a tracked child of THIS hook process, which stays alive and

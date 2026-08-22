@@ -91,6 +91,9 @@ checkpoint_seconds=${FM_CODEX_WATCH_CHECKPOINT:-180}
 pi_ext="$FM_ROOT/.pi/extensions/fm-primary-pi-watch.ts"
 pi_turnend_ext="$FM_ROOT/.pi/extensions/fm-primary-turnend-guard.ts"
 x_mode_env="$CONFIG/x-mode.env"
+tg_mode_env="$CONFIG/tg-mode.env"
+TG_MODE=0
+[ -f "$tg_mode_env" ] && TG_MODE=1
 
 shell_quote() {
   printf "'"
@@ -98,11 +101,23 @@ shell_quote() {
   printf "'"
 }
 
-x_mode_env_sh=$(shell_quote "$x_mode_env")
-
 if [ "$X_MODE" -eq 0 ] && [ -f "$x_mode_env" ]; then
   X_MODE=1
 fi
+
+# One cadence path is rendered into the arm command and the repair line. Both
+# generated configs export exactly FM_CHECK_INTERVAL=30, so sourcing whichever
+# one this home has is enough; X mode wins when a home has both, and a home
+# with neither keeps rendering the X path so the emitted arm command is
+# unchanged for every existing instance.
+cadence_env=$x_mode_env
+if [ ! -f "$x_mode_env" ] && [ "$TG_MODE" -eq 1 ]; then
+  cadence_env=$tg_mode_env
+fi
+FAST_CADENCE=0
+{ [ "$X_MODE" -eq 1 ] || [ "$TG_MODE" -eq 1 ]; } && FAST_CADENCE=1
+
+x_mode_env_sh=$(shell_quote "$cadence_env")
 
 render_snippet() {
   local line
@@ -110,7 +125,7 @@ render_snippet() {
     line=${line//__FM_PI_EXT__/$pi_ext}
     line=${line//__FM_PI_TURNEND_EXT__/$pi_turnend_ext}
     line=${line//__FM_X_MODE_ENV_SH__/$x_mode_env_sh}
-    line=${line//__FM_X_MODE_ENV__/$x_mode_env}
+    line=${line//__FM_X_MODE_ENV__/$cadence_env}
     printf '%s\n' "$line"
   done < "$SNIPPET"
 }
@@ -129,7 +144,7 @@ repair_line() {
   if [ "$QUEUE_PENDING" -eq 1 ]; then
     prefix='After draining queued wakes, '
   fi
-  if [ "$X_MODE" -eq 1 ]; then
+  if [ "$FAST_CADENCE" -eq 1 ]; then
     prefix="${prefix}source ${x_mode_env_sh} first, then "
   fi
 
@@ -205,9 +220,12 @@ else
   printf '%s\n' '- Away mode: inactive.'
 fi
 if [ "$X_MODE" -eq 1 ]; then
-  printf '%s%s%s\n' '- X mode: active; source ' "$x_mode_env" ' before launching any watcher process so the 30s cadence is inherited.'
+  printf '%s%s%s\n' '- X mode: active; source ' "$cadence_env" ' before launching any watcher process so the 30s cadence is inherited.'
 else
   printf '%s\n' '- X mode: inactive; use the default watcher cadence.'
+fi
+if [ "$TG_MODE" -eq 1 ]; then
+  printf '%s%s%s\n' '- Telegram captain-comms: active; source ' "$cadence_env" ' before launching any watcher process so the 30s cadence is inherited.'
 fi
 ordinary_wake_line
 printf '\n'

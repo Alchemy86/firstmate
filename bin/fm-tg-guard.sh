@@ -24,17 +24,32 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
+# shellcheck source=bin/fm-tg-hook-lib.sh
+. "$SCRIPT_DIR/fm-tg-hook-lib.sh"
+
 "$SCRIPT_DIR/fm-tg-isfirstmate.sh" || exit 0
 
 SENT="$STATE/.tg-last-sent"
 SURF="$STATE/.tg-last-surfaced"
+BUDGET_FILE="$STATE/.turnend-tg-guard-blocks"
 
 [ -f "$SURF" ] || exit 0
 s=$(stat -c %Y "$SURF" 2>/dev/null || echo 0)
 r=$(stat -c %Y "$SENT" 2>/dev/null || echo 0)
 
-if [ "$s" -gt "$r" ]; then
-  cat >&2 <<MSG
+if [ "$s" -le "$r" ]; then
+  fm_tg_budget_clear "$BUDGET_FILE"
+  exit 0
+fi
+
+# Bounded: the same unanswered surfacing may hold the turn only so many times,
+# so an unreachable Telegram cannot wedge the session (bin/fm-tg-hook-lib.sh).
+if ! fm_tg_budget_ok "$BUDGET_FILE" "surfaced:$s"; then
+  echo "fm-tg-guard: no reply has gone out for the message surfaced at $s and the turn has already been held for it; standing down so the session is not wedged. Send it with $SCRIPT_DIR/fm-tg-send.sh once Telegram is reachable." >&2
+  exit 0
+fi
+
+cat >&2 <<MSG
 UNANSWERED CAPTAIN MESSAGE — you surfaced a message from the captain and have
 not sent a reply to Telegram since. He reads Telegram, not this terminal; an
 answer written here did not reach him.
@@ -44,6 +59,4 @@ Send it now:  $SCRIPT_DIR/fm-tg-send.sh 'your answer'
 If it repeats a question you already answered, SEND IT ANYWAY and say it may be
 a duplicate. A duplicate costs him nothing; silence costs him the answer.
 MSG
-  exit 2
-fi
-exit 0
+exit 2
