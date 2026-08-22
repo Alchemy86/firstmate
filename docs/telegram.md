@@ -52,7 +52,7 @@ A host where other local users are not trusted should not hold `~/.config/fm-tel
 | `bin/fm-tg-wait.sh` | Long-poll used by the Stop hook when nothing is already pending; blocks up to `FM_TG_WAIT_MAX` seconds (default 3600, or `FM_TG_HOOK_MAX` when invoked from the hook) for the next message. |
 | `bin/fm-tg-fetch.py` | Shared parsing core for the poller and the waiter: turns one Telegram `getUpdates` response into inbox records, fetches media, and fires the arrival-time acknowledgement. One owner of that logic - see "Defect: single-quoted embedded Python" below. |
 | `bin/fm-tg-drain.py` | Surfaces every pending message on a Stop hook firing; re-surfaces an unanswered one on every subsequent firing instead of losing it. Fires the `...` ack only as a fallback, when the arrival-time ack did not land. |
-| `bin/fm-tg-archive.py` | Retires a message once a real reply has actually been sent (`bin/fm-tg-send.sh` calls it after every non-ack send) - either because it was surfaced, or because it had already arrived (and is over 10s old) when the reply went out (closes the reply/surface race - see "No message is answered twice" below). |
+| `bin/fm-tg-archive.py` | Retires a message once a real reply has actually been sent (`bin/fm-tg-send.sh` calls it after every non-ack send) - always if it has been surfaced (keyed on when it was first shown, however much later), or only within a 10s same-turn window of arrival if it never has been (closes the reply/surface race - see "No message is answered twice" below). |
 | `bin/fm-tg-guard.sh` | Stop hook. Refuses to end a turn that surfaced a captain message without a reply having gone out since. |
 | `bin/fm-tg-hook.sh` | Stop hook. Drains pending messages; if none, long-polls via `fm-tg-wait.sh`. |
 | `bin/fm-tg-hook-lib.sh` | The two Stop hooks' shared block budget - see "A hook can never wedge the session" below. |
@@ -112,6 +112,14 @@ An earlier version hand-rolled a process-ancestry grep plus a hardcoded `~/.tree
 A secondmate home passes the shared predicate but is condemned here too: there is one captain and one bot per machine, and a secondmate reports through the main firstmate rather than to the captain directly.
 `bin/fm-tg-send.sh` independently refuses any direct invocation whose working directory is a crew worktree - identified by git's own linked-worktree shape, not by location - so a brief that wrongly tells a crewmate to call it directly still cannot reach the captain.
 
+### Only the captain can talk to firstmate as the captain
+
+**Defect (a `no-mistakes` review finding on this branch, before ship - never actually exploited).** Inbound Telegram updates were never checked against the configured `TG_CHAT_ID`.
+Telegram bots accept a direct message from anyone who knows the bot's public username, so a third party could message the bot, have it recorded and surfaced to firstmate as `CAPTAIN: <text>`, get the instant `...` acknowledgement back, and force a blocking turn-end demanding a reply - which lands in the real captain's chat.
+
+**Fix.** `bin/fm-tg-fetch.py` drops any update whose chat id does not match `TG_CHAT_ID`, before it is ever recorded, with a visible (never silent) line to stderr naming both the offending and the configured chat id so a legitimately wrong-chat message from the captain himself is diagnosable rather than a silent mystery.
+The accepted cost: the captain must message from the chat he originally paired with the bot.
+
 ### No message is lost
 
 **Defect (2026-08-21).** An earlier version archived a captain message the moment it was first printed to the model.
@@ -119,6 +127,7 @@ If the harness did not actually surface that print - which happened repeatedly -
 
 **Fix.** `bin/fm-tg-archive.py` retires a message ONLY after a real reply has actually been sent (`bin/fm-tg-send.sh` calls it on every send that is not an ack).
 An unanswered message re-surfaces on every subsequent Stop hook firing via `bin/fm-tg-drain.py` instead of disappearing, so a wake the model missed simply tries again next turn.
+A later, subtler version of this same guarantee - a proactive/unrelated send must never sweep up a message that was never actually shown to the model - is covered under "No message is answered twice" below, since the fix for both lives in the same file.
 
 Every write to a record is also all-or-nothing, through `bin/fm_tg_records.py`.
 A record is the only copy of what the captain sent, and a plain truncating write leaves invalid JSON behind if the process dies mid-write - which every reader then skips for ever, while the offset file has already advanced past that update id, so it is never refetched either.

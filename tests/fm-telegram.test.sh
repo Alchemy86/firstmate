@@ -604,9 +604,24 @@ test_arrival_ack_guard_reply_pipeline() {
   pass "telegram: arrival acks once, guard demands a real reply, unanswered re-surfaces, real reply silences the guard and archives"
 }
 
-# --- amendment 3: the reply/surface race in fm-tg-archive.py ---------------
+# --- the reply/surface race in fm-tg-archive.py, and its own review-caught -
+# --- bug: any window keyed on arrival time let an unrelated/proactive send -
+# --- sweep up an old message that was never actually shown to the model. --
+#
+# Final, captain-approved semantics (a no-mistakes review finding on this
+# branch, captain's own design calls for both parts):
+#   - SURFACED at least once (bin/fm-tg-drain.py stamps surfaced_ts on first
+#     surfacing): ALWAYS retire on any real reply, however much later.
+#   - NEVER surfaced: retire ONLY within a short (10s) window of arrival - the
+#     genuine same-turn race, where a message that will imminently be shown
+#     has not yet had a surfacing pass run. Older than that and still never
+#     surfaced: stays pending, no matter what unrelated reply goes out - this
+#     is the actual "no message is lost" fix; a proactive/unrelated send must
+#     never retire a message the model has not genuinely had a chance to see.
+#   - A missing or malformed ts is "unknown", never "infinitely old": it must
+#     never be swept up by the never-surfaced window.
 
-test_archive_race_fresh_unsurfaced_stays_pending() {
+test_archive_never_surfaced_same_turn_retires() {
   local home env inbox now
   home="$TMP_ROOT/race-fresh-home"
   mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
@@ -614,19 +629,20 @@ test_archive_race_fresh_unsurfaced_stays_pending() {
   inbox="$home/state/tg-inbox"
   now=$(date +%s)
 
-  # A message that just arrived (well under 10s old) and was never surfaced.
+  # A message that just arrived (well under 10s old) and was never surfaced -
+  # the genuine same-turn race the window exists to cover.
   printf '{"update_id": 50, "chat_id": 999, "ts": %s, "text": "brand new"}' "$now" > "$inbox/50.json"
 
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'unrelated reply' >"$TMP_ROOT/race-fresh-out" 2>&1
   expect_code 0 "$?" "fm-tg-send.sh failed: $(cat "$TMP_ROOT/race-fresh-out")"
   rm -f "$TMP_ROOT/race-fresh-out"
 
-  assert_present "$inbox/50.json" \
-    "a fresh (<10s), never-surfaced message must NOT be swept up by an unrelated reply"
-  pass "telegram: a fresh, never-surfaced message stays pending through a reply (no over-eager archival)"
+  assert_absent "$inbox/50.json" \
+    "a fresh (<10s), never-surfaced message must retire as the same-turn-race courtesy the window exists for"
+  pass "telegram: a fresh (<10s), never-surfaced message is swept in by any reply - the intended same-turn-race coverage"
 }
 
-test_archive_race_old_unsurfaced_still_retires() {
+test_archive_never_surfaced_old_stays_pending() {
   local home env inbox old_ts out
   home="$TMP_ROOT/race-old-home"
   mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
@@ -634,43 +650,126 @@ test_archive_race_old_unsurfaced_still_retires() {
   inbox="$home/state/tg-inbox"
   old_ts=$(( $(date +%s) - 120 ))
 
-  # A message that arrived over a minute ago and was never marked surfaced -
-  # the exact race the amendment closes: it had every chance to be seen.
+  # A message that arrived over a minute ago and was never marked surfaced.
+  # This is the exact review finding: an unrelated/proactive send must NOT
+  # sweep up a message the model has genuinely never had a chance to see.
   printf '{"update_id": 51, "chat_id": 999, "ts": %s, "text": "old and unsurfaced"}' "$old_ts" > "$inbox/51.json"
 
-  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" python3 "$ROOT/bin/fm-tg-archive.py" "$inbox" "$home/state/tg-processed")
-  assert_contains "$out" "retired unsurfaced" "an old, never-surfaced message must be retired with an explicit notice"
-  assert_absent "$inbox/51.json" "an old, never-surfaced message must be retired out of the inbox"
-  assert_present "$home/state/tg-processed/51.json" "an old, never-surfaced message must land in tg-processed"
-  pass "telegram: an old message is retired even if never surfaced, with a visible notice (closes the reply/surface race)"
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'unrelated proactive update' >/tmp/race-old-out 2>&1
+  expect_code 0 "$?" "fm-tg-send.sh failed: $(cat /tmp/race-old-out)"
+  rm -f /tmp/race-old-out
+
+  assert_present "$inbox/51.json" \
+    "an old (>10s), never-surfaced message must NOT be retired by an unrelated reply - this is the 'no message lost' fix"
+  pass "telegram: an old, never-surfaced message survives an unrelated reply (closes the review-caught proactive-send-sweep bug)"
 }
 
-# --- amendment 5: the archive window was wrong (60s, invented) - the real -
-# --- rule is "arrived before the reply was sent", carved out under 10s ----
-
-test_archive_window_30s_retires_2s_survives() {
-  local home ts30 ts2
-  home="$TMP_ROOT/archive-window-home"
+test_archive_never_surfaced_boundary() {
+  local home ts_in ts_out out
+  home="$TMP_ROOT/archive-boundary-home"
   mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
-  ts30=$(( $(date +%s) - 30 ))
-  ts2=$(( $(date +%s) - 2 ))
+  ts_in=$(( $(date +%s) - 9 ))    # just inside the 10s same-turn window
+  ts_out=$(( $(date +%s) - 11 ))  # just outside it
 
-  # The exact pair the amendment verified live: a reply covers everything
-  # already in the inbox when it went out, except a message so fresh (<10s)
-  # it genuinely cannot have been read yet. The OLD 60s window would have
-  # wrongly kept the 30s-old message pending (a real, seen 2026-08-22 recurrence
-  # of the duplicate-reply bug); the correct window retires it.
-  printf '{"update_id": 60, "chat_id": 999, "ts": %s, "text": "thirty seconds old"}' "$ts30" > "$home/state/tg-inbox/60.json"
-  printf '{"update_id": 61, "chat_id": 999, "ts": %s, "text": "two seconds old"}' "$ts2" > "$home/state/tg-inbox/61.json"
+  printf '{"update_id": 62, "chat_id": 999, "ts": %s, "text": "nine seconds old"}' "$ts_in" > "$home/state/tg-inbox/62.json"
+  printf '{"update_id": 63, "chat_id": 999, "ts": %s, "text": "eleven seconds old"}' "$ts_out" > "$home/state/tg-inbox/63.json"
+
+  out=$(python3 "$ROOT/bin/fm-tg-archive.py" "$home/state/tg-inbox" "$home/state/tg-processed")
+
+  assert_absent "$home/state/tg-inbox/62.json" "a 9s-old never-surfaced message (inside the window) must retire"
+  assert_contains "$out" "retired unsurfaced" "the same-turn retirement must print a visible notice"
+  assert_present "$home/state/tg-inbox/63.json" "an 11s-old never-surfaced message (outside the window) must stay pending"
+  pass "telegram: the never-surfaced window's boundary is exactly 10s - 9s retires, 11s stays pending"
+}
+
+test_archive_surfaced_always_retires_regardless_of_age() {
+  local home old_ts
+  home="$TMP_ROOT/archive-surfaced-home"
+  mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
+  old_ts=$(( $(date +%s) - 3600 ))   # arrived an hour ago
+
+  # Surfaced (drain already ran on it), but the reply happens to come a long
+  # time after that surfacing. "Keyed on first-surfaced time" means this
+  # always retires - there is no window for a record the model has genuinely
+  # already been shown.
+  printf '{"update_id": 64, "chat_id": 999, "ts": %s, "text": "old but surfaced", "surfaced": 1, "surfaced_ts": %s}' \
+    "$old_ts" "$old_ts" > "$home/state/tg-inbox/64.json"
 
   python3 "$ROOT/bin/fm-tg-archive.py" "$home/state/tg-inbox" "$home/state/tg-processed" >/dev/null
+  assert_absent "$home/state/tg-inbox/64.json" "a surfaced record must always retire on a real reply, however much later"
+  assert_present "$home/state/tg-processed/64.json" "a surfaced-and-answered record must land in tg-processed"
+  pass "telegram: a surfaced record retires unconditionally, regardless of how long ago it arrived or was surfaced"
+}
 
-  assert_absent "$home/state/tg-inbox/60.json" \
-    "a 30s-old unsurfaced message must retire under the corrected (10s) window - the 60s window wrongly kept this pending"
-  assert_present "$home/state/tg-processed/60.json" "the 30s-old message must land in tg-processed"
-  assert_present "$home/state/tg-inbox/61.json" \
-    "a 2s-old unsurfaced message must still survive - it genuinely cannot have been read yet"
-  pass "telegram: the corrected archive window retires a 30s-old unsurfaced message and keeps a 2s-old one pending"
+test_archive_missing_ts_never_retired() {
+  local home out
+  home="$TMP_ROOT/archive-missing-ts-home"
+  mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
+
+  # No "ts" field at all: must be treated as unknown/brand-new, never as
+  # infinitely old (the review-caught bug: float(None or 0) == 0.0, which
+  # made a missing ts look ancient and retired the record on the very first
+  # send, sight unseen).
+  printf '{"update_id": 65, "chat_id": 999, "text": "no timestamp at all"}' > "$home/state/tg-inbox/65.json"
+
+  out=$(python3 "$ROOT/bin/fm-tg-archive.py" "$home/state/tg-inbox" "$home/state/tg-processed")
+  assert_present "$home/state/tg-inbox/65.json" "a record with a missing ts must never be treated as infinitely old and retired"
+  assert_contains "$out" "archived 0" "nothing should have been archived"
+  pass "telegram: a record with a missing/malformed ts is never retired via the never-surfaced window"
+}
+
+# --- chat_id filter (a no-mistakes review finding, captain-approved fix) ---
+# --- drop any update whose chat is not the configured TG_CHAT_ID, before ---
+# --- it is ever recorded - otherwise anyone who finds the bot's public   ---
+# --- username can message it and be treated as the captain.             ---
+
+test_fetch_drops_mismatched_chat_id() {
+  local home env inbox offset send out err
+  home="$TMP_ROOT/chatfilter-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")   # TG_CHAT_ID=999
+  inbox="$home/state/tg-inbox"
+  offset="$home/state/.tg-offset"
+  send="$ROOT/bin/fm-tg-send.sh"
+  mkdir -p "$inbox"
+
+  set -a
+  # shellcheck source=/dev/null
+  . "$env"
+  set +a
+
+  out=$(printf '{"ok":true,"result":[{"update_id":70,"message":{"chat":{"id":424242},"date":%s,"text":"i am not the captain"}}]}' "$(date +%s)" \
+    | python3 "$ROOT/bin/fm-tg-fetch.py" poll "$inbox" "$offset" "$send" 2>/tmp/chatfilter-err)
+  err=$(cat /tmp/chatfilter-err); rm -f /tmp/chatfilter-err
+
+  assert_absent "$inbox/70.json" "an update from a mismatched chat_id must never be recorded as a captain message"
+  [ -z "$out" ] || fail "a dropped update must not report a new message: $out"
+  assert_contains "$err" "dropped update" "a dropped update must be visible (never silent)"
+  assert_contains "$err" "424242" "the drop notice must name the offending chat_id"
+  assert_contains "$err" "999" "the drop notice must name the configured chat_id for comparison"
+  [ "$(cat "$offset")" = "71" ] || fail "the offset must still advance past a dropped update, or it refetches forever: got $(cat "$offset" 2>/dev/null)"
+
+  unset TG_TOKEN TG_CHAT_ID
+  pass "telegram: an update from a chat_id other than TG_CHAT_ID is dropped before recording, with a visible (non-silent) log line"
+}
+
+test_fetch_accepts_matching_chat_id() {
+  local home env inbox offset send out
+  home="$TMP_ROOT/chatfilter-match-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")   # TG_CHAT_ID=999
+  inbox="$home/state/tg-inbox"
+  offset="$home/state/.tg-offset"
+  send="$ROOT/bin/fm-tg-send.sh"
+  mkdir -p "$inbox"
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" TG_TOKEN=faketoken TG_CHAT_ID=999 bash -c '
+    printf "{\"ok\":true,\"result\":[{\"update_id\":71,\"message\":{\"chat\":{\"id\":999},\"date\":%s,\"text\":\"the real captain\"}}]}" "$(date +%s)" \
+      | python3 "'"$ROOT"'/bin/fm-tg-fetch.py" poll "'"$inbox"'" "'"$offset"'" "'"$send"'"
+  ')
+  assert_present "$inbox/71.json" "a matching chat_id must still be recorded normally"
+  assert_contains "$out" "telegram: 1 message(s)" "a matching chat_id must still report as a new message"
+  pass "telegram: an update whose chat_id matches TG_CHAT_ID is recorded normally (the filter is not over-broad)"
 }
 
 # --- several messages, one arriving mid-turn: all surface, in order --------
@@ -1184,9 +1283,13 @@ test_config_absent_hooks_silent
 test_crew_worktree_refuses
 test_isfirstmate_direct
 test_arrival_ack_guard_reply_pipeline
-test_archive_race_fresh_unsurfaced_stays_pending
-test_archive_race_old_unsurfaced_still_retires
-test_archive_window_30s_retires_2s_survives
+test_archive_never_surfaced_same_turn_retires
+test_archive_never_surfaced_old_stays_pending
+test_archive_never_surfaced_boundary
+test_archive_surfaced_always_retires_regardless_of_age
+test_archive_missing_ts_never_retired
+test_fetch_drops_mismatched_chat_id
+test_fetch_accepts_matching_chat_id
 test_multiple_messages_mid_turn_none_swallowed
 test_drain_retries_failed_ack
 test_large_png_uses_senddocument
