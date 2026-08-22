@@ -53,6 +53,19 @@ with no delay at all, spinning that loop at ~16 calls a second for the whole
 Stop-hook window. An unusable response also names itself on stderr, so
 bin/fm-tg-poll.sh can report WHY the channel refused rather than leaving a
 revoked token indistinguishable from a captain who has not written.
+
+CHAT-ID FILTER (2026-08-22, a no-mistakes review finding, captain-approved).
+Telegram bots accept a direct message from ANYONE who knows the bot's public
+username - inbound updates were never checked against the configured
+TG_CHAT_ID. Without this, a third party could message the bot and have it
+recorded as a captain message, surfaced to firstmate as "CAPTAIN: <text>",
+acknowledged, and used to force a blocking turn-end demanding a reply that
+lands in the REAL captain's chat - a captain-impersonation hole. Every update
+whose chat id does not match TG_CHAT_ID is now dropped before it is ever
+recorded, with a visible line on stderr (never silent) so a legitimately
+wrong-chat message from the captain himself is diagnosable rather than a
+mystery. The cost, accepted deliberately: the captain must message from the
+chat he originally paired.
 """
 import json
 import os
@@ -244,11 +257,19 @@ def main():
 
     media_dir = os.path.join(os.path.dirname(os.path.normpath(inbox)), "tg-media")
     tok = os.environ.get("TG_TOKEN") or ""
+    configured_chat_id = os.environ.get("TG_CHAT_ID") or ""
 
     new_texts = []
     for update in results:
         uid = update.get("update_id")
         message = update.get("message") or update.get("edited_message") or {}
+        msg_chat_id = (message.get("chat") or {}).get("id")
+        if configured_chat_id and str(msg_chat_id) != str(configured_chat_id):
+            sys.stderr.write(
+                "telegram: dropped update %s from chat_id=%s (configured chat is %s)\n"
+                % (uid, msg_chat_id, configured_chat_id))
+            write_offset(offset_file, uid)
+            continue
         text = message.get("text") or message.get("caption") or ""
         # An image with no caption used to be dropped here, so every photo the
         # captain sent was silently discarded. Media presence is decided from

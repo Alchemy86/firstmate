@@ -39,15 +39,32 @@ cat > "$FAKEBIN/curl" <<'SH'
 #   -X POST ...       -> canned {"ok":true} reply (sendMessage/sendPhoto/etc.),
 #                        or nothing at all when FAKE_CURL_EMPTY_REPLY=1
 #                        (simulates a stalled/timed-out upload)
+#                        or a canned {"ok":false,...} REJECTION when
+#                        FAKE_CURL_REJECT=1 (a genuine bad request, never retried)
+#                        or nothing for the first N calls, then success, when
+#                        FAKE_CURL_FAIL_COUNTER points at a file holding N
+#                        (simulates N transient network blips then recovery)
 #   ...getUpdates...  -> content of $FAKE_TG_GETUPDATES_FILE if set and
 #                        present, else an empty result
 # Every invocation's argv is appended to $FAKE_CURL_LOG when set, so a test
-# can inspect which Telegram method/field an upload actually used.
+# can inspect which Telegram method/field an upload actually used, or count
+# retry attempts.
 [ -n "${FAKE_CURL_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_CURL_LOG"
 args="$*"
 case "$args" in
   *-X\ POST*)
     [ -n "${FAKE_CURL_EMPTY_REPLY:-}" ] && exit 0
+    if [ -n "${FAKE_CURL_REJECT:-}" ]; then
+      printf '{"ok":false,"description":"Bad Request: fake rejection","error_code":400}'
+      exit 0
+    fi
+    if [ -n "${FAKE_CURL_FAIL_COUNTER:-}" ] && [ -f "$FAKE_CURL_FAIL_COUNTER" ]; then
+      remaining=$(cat "$FAKE_CURL_FAIL_COUNTER")
+      if [ "$remaining" -gt 0 ]; then
+        echo $(( remaining - 1 )) > "$FAKE_CURL_FAIL_COUNTER"
+        exit 0
+      fi
+    fi
     printf '{"ok":true,"result":{"message_id":1}}' ;;
   *getUpdates*)
     if [ -n "${FAKE_TG_GETUPDATES_FILE:-}" ] && [ -f "$FAKE_TG_GETUPDATES_FILE" ]; then
@@ -379,6 +396,8 @@ test_config_absent_hooks_silent() {
     "$sbin/fm-tg-hook.sh" >"$TMP_ROOT/absent-hook-out" 2>&1 </dev/null
   expect_code 0 "$?" "fm-tg-hook.sh with no config"
   [ ! -s "$TMP_ROOT/absent-hook-out" ] || fail "fm-tg-hook.sh printed output with no config: $(cat "$TMP_ROOT/absent-hook-out")"
+  assert_absent "$home/state/tg-inbox" "fm-tg-hook.sh must not create state/tg-inbox before checking config"
+  assert_absent "$home/state/tg-processed" "fm-tg-hook.sh must not create state/tg-processed before checking config"
 
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/does-not-exist.env" \
     "$sbin/fm-tg-poll.sh" >"$TMP_ROOT/absent-poll-out" 2>&1
@@ -396,7 +415,7 @@ test_config_absent_hooks_silent() {
   assert_absent "$home/state/tg-inbox" "no config must never create state/tg-inbox"
   assert_absent "$home/state/tg-processed" "no config must never create state/tg-processed"
   rm -f "$TMP_ROOT/absent-guard-out" "$TMP_ROOT/absent-hook-out" "$TMP_ROOT/absent-poll-out"
-  pass "telegram: absent or half config -> guard, hook, and poll all exit 0 silently, nothing created"
+  pass "telegram: absent or half config -> guard, hook, and poll all exit 0 silently, nothing created (identity-neutralized, so the config-absent path is actually exercised)"
 }
 
 # --- crew worktree: send refuses, hooks no-op -------------------------------
@@ -431,7 +450,24 @@ test_crew_worktree_refuses() {
   [ "$rc" -ne 0 ] || fail "fm-tg-send.sh did not refuse from a task worktree outside \$HOME/.treehouse"
   assert_contains "$out" "REFUSED" "fm-tg-send.sh worktree refusal missing REFUSED message"
   assert_absent "$home/state/.tg-last-sent" "crew send must never stamp .tg-last-sent"
-  pass "telegram: fm-tg-send.sh refuses from a crew worktree, in \$HOME/.treehouse or anywhere else"
+
+  # Both Stop hooks must also no-op from a crew worktree cwd - this uses the
+  # REAL (non-scratch) fm-tg-isfirstmate.sh, which is fine here: "must
+  # condemn" holds regardless of whether the cwd signal, ambient ancestry, or
+  # both are what actually trips it (isfirstmate.sh's own contract is "either
+  # signal condemns").
+  (cd "$crewdir" && HOME="$fakehome" FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/tg.env" \
+    "$ROOT/bin/fm-tg-guard.sh" >"$TMP_ROOT/crew-guard-out" 2>&1 </dev/null)
+  expect_code 0 "$?" "fm-tg-guard.sh must no-op (exit 0) from a crew worktree"
+  [ ! -s "$TMP_ROOT/crew-guard-out" ] || fail "fm-tg-guard.sh printed output from a crew worktree: $(cat "$TMP_ROOT/crew-guard-out")"
+
+  (cd "$crewdir" && HOME="$fakehome" FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/tg.env" FM_TG_WAIT_MAX=1 \
+    "$ROOT/bin/fm-tg-hook.sh" >"$TMP_ROOT/crew-hook-out" 2>&1 </dev/null)
+  expect_code 0 "$?" "fm-tg-hook.sh must no-op (exit 0) from a crew worktree"
+  [ ! -s "$TMP_ROOT/crew-hook-out" ] || fail "fm-tg-hook.sh printed output from a crew worktree: $(cat "$TMP_ROOT/crew-hook-out")"
+
+  rm -f "$TMP_ROOT/crew-guard-out" "$TMP_ROOT/crew-hook-out"
+  pass "telegram: fm-tg-send.sh refuses from a crew worktree, in \$HOME/.treehouse or anywhere else, and both Stop hooks no-op"
 }
 
 # fm_tg_fake_home <dir> [marker-id]: a directory shaped like a firstmate home
@@ -578,7 +614,7 @@ test_archive_race_fresh_unsurfaced_stays_pending() {
   inbox="$home/state/tg-inbox"
   now=$(date +%s)
 
-  # A message that just arrived (well under 60s old) and was never surfaced.
+  # A message that just arrived (well under 10s old) and was never surfaced.
   printf '{"update_id": 50, "chat_id": 999, "ts": %s, "text": "brand new"}' "$now" > "$inbox/50.json"
 
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'unrelated reply' >"$TMP_ROOT/race-fresh-out" 2>&1
@@ -586,7 +622,7 @@ test_archive_race_fresh_unsurfaced_stays_pending() {
   rm -f "$TMP_ROOT/race-fresh-out"
 
   assert_present "$inbox/50.json" \
-    "a fresh (<60s), never-surfaced message must NOT be swept up by an unrelated reply"
+    "a fresh (<10s), never-surfaced message must NOT be swept up by an unrelated reply"
   pass "telegram: a fresh, never-surfaced message stays pending through a reply (no over-eager archival)"
 }
 
@@ -606,7 +642,35 @@ test_archive_race_old_unsurfaced_still_retires() {
   assert_contains "$out" "retired unsurfaced" "an old, never-surfaced message must be retired with an explicit notice"
   assert_absent "$inbox/51.json" "an old, never-surfaced message must be retired out of the inbox"
   assert_present "$home/state/tg-processed/51.json" "an old, never-surfaced message must land in tg-processed"
-  pass "telegram: a message over 60s old is retired even if never surfaced, with a visible notice (closes the reply/surface race)"
+  pass "telegram: an old message is retired even if never surfaced, with a visible notice (closes the reply/surface race)"
+}
+
+# --- amendment 5: the archive window was wrong (60s, invented) - the real -
+# --- rule is "arrived before the reply was sent", carved out under 10s ----
+
+test_archive_window_30s_retires_2s_survives() {
+  local home ts30 ts2
+  home="$TMP_ROOT/archive-window-home"
+  mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
+  ts30=$(( $(date +%s) - 30 ))
+  ts2=$(( $(date +%s) - 2 ))
+
+  # The exact pair the amendment verified live: a reply covers everything
+  # already in the inbox when it went out, except a message so fresh (<10s)
+  # it genuinely cannot have been read yet. The OLD 60s window would have
+  # wrongly kept the 30s-old message pending (a real, seen 2026-08-22 recurrence
+  # of the duplicate-reply bug); the correct window retires it.
+  printf '{"update_id": 60, "chat_id": 999, "ts": %s, "text": "thirty seconds old"}' "$ts30" > "$home/state/tg-inbox/60.json"
+  printf '{"update_id": 61, "chat_id": 999, "ts": %s, "text": "two seconds old"}' "$ts2" > "$home/state/tg-inbox/61.json"
+
+  python3 "$ROOT/bin/fm-tg-archive.py" "$home/state/tg-inbox" "$home/state/tg-processed" >/dev/null
+
+  assert_absent "$home/state/tg-inbox/60.json" \
+    "a 30s-old unsurfaced message must retire under the corrected (10s) window - the 60s window wrongly kept this pending"
+  assert_present "$home/state/tg-processed/60.json" "the 30s-old message must land in tg-processed"
+  assert_present "$home/state/tg-inbox/61.json" \
+    "a 2s-old unsurfaced message must still survive - it genuinely cannot have been read yet"
+  pass "telegram: the corrected archive window retires a 30s-old unsurfaced message and keeps a 2s-old one pending"
 }
 
 # --- several messages, one arriving mid-turn: all surface, in order --------
@@ -803,6 +867,64 @@ test_records_are_private_and_left_whole() {
   [ "$stray" = 0 ] || fail "a staged write was left behind in state/ ($stray file(s))"
 
   pass "telegram: records and the offset are owner-only, and every update is swapped into place whole"
+}
+
+# --- amendment 5: fm-tg-send.sh auto-retries a transient text-send failure --
+
+test_send_retries_transient_failure_then_succeeds() {
+  local home env counter out log
+  home="$TMP_ROOT/retry-succeed-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  counter="$TMP_ROOT/retry-counter-succeed"
+  log="$TMP_ROOT/retry-succeed.log"
+  printf '2' > "$counter"   # first two attempts return empty (transient), third succeeds
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" \
+    FAKE_CURL_FAIL_COUNTER="$counter" FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-tg-send.sh" 'will succeed on the third attempt' 2>&1)
+  expect_code 0 "$?" "fm-tg-send.sh must succeed once a retry lands, not surface the earlier transient failures: $out"
+  assert_contains "$out" "sent" "a message that succeeds on retry must still report sent"
+  [ "$(grep -c 'sendMessage' "$log")" -eq 3 ] || fail "expected exactly 3 curl attempts (2 transient failures + 1 success), got: $(grep -c sendMessage "$log")"
+  assert_present "$home/state/.tg-last-sent" "a message that eventually succeeds must still count as a real reply"
+  pass "telegram: fm-tg-send.sh retries a transient failure automatically and succeeds without the caller noticing"
+}
+
+test_send_does_not_retry_a_real_rejection() {
+  local home env log out rc
+  home="$TMP_ROOT/retry-reject-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  log="$TMP_ROOT/retry-reject.log"
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_REJECT=1 FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-tg-send.sh" 'this will be rejected' 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "a genuine Telegram rejection must still fail, not be swallowed by the retry loop"
+  assert_contains "$out" "REJECTED" "a rejection must still be reported loudly"
+  [ "$(grep -c 'sendMessage' "$log")" -eq 1 ] || fail "a genuine rejection must NOT be retried (retrying a bad request cannot help); expected 1 curl attempt, got: $(grep -c sendMessage "$log")"
+  assert_absent "$home/state/.tg-last-sent" "a rejected send must never count as a real reply"
+  pass "telegram: fm-tg-send.sh never retries a genuine Telegram rejection (only transient failures)"
+}
+
+test_send_gives_up_after_3_transient_failures() {
+  local home env counter log out rc
+  home="$TMP_ROOT/retry-giveup-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  counter="$TMP_ROOT/retry-counter-giveup"
+  log="$TMP_ROOT/retry-giveup.log"
+  printf '99' > "$counter"   # persistently transient - never recovers
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" \
+    FAKE_CURL_FAIL_COUNTER="$counter" FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-tg-send.sh" 'this will never get through' 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "a persistently failing send must eventually give up and fail, not hang or succeed"
+  assert_contains "$out" "FAILED mid-send after 3 attempts" "a persistent transient failure must report the exact give-up message"
+  [ "$(grep -c 'sendMessage' "$log")" -eq 3 ] || fail "must attempt exactly 3 times before giving up, got: $(grep -c sendMessage "$log")"
+  assert_absent "$home/state/.tg-last-sent" "a send that never got through must never count as a real reply"
+  pass "telegram: fm-tg-send.sh gives up after exactly 3 attempts on a persistent transient failure"
 }
 
 # --- end-to-end: the actual watcher check-cycle artifact ---------------------
@@ -1064,11 +1186,15 @@ test_isfirstmate_direct
 test_arrival_ack_guard_reply_pipeline
 test_archive_race_fresh_unsurfaced_stays_pending
 test_archive_race_old_unsurfaced_still_retires
+test_archive_window_30s_retires_2s_survives
 test_multiple_messages_mid_turn_none_swallowed
 test_drain_retries_failed_ack
 test_large_png_uses_senddocument
 test_small_png_uses_sendphoto
 test_upload_timeout_explicit_message
+test_send_retries_transient_failure_then_succeeds
+test_send_does_not_retry_a_real_rejection
+test_send_gives_up_after_3_transient_failures
 test_poll_sh_end_to_end
 test_poll_reports_a_refusal_once
 test_poll_without_a_timeout_binary

@@ -204,14 +204,36 @@ if [ "$n" -eq 0 ]; then
   echo "telegram: could not split the message text into any sendable part" >&2
   exit 1
 fi
+# Retry a failed part automatically. Transient blips used to print "FAILED
+# mid-send" and rely on firstmate NOTICING and re-running the whole command by
+# hand - exactly the remembering-game the captain asked to be engineered out
+# (2026-08-22). Three attempts with a short backoff; only a genuine, repeated
+# failure is reported. A Telegram REJECTION (a bad request, not a network
+# blip - "ok":false in the reply) is never retried, since retrying it cannot
+# help.
+send_part() {
+  local body=$1 attempt=1 resp rc
+  while [ "$attempt" -le 3 ]; do
+    resp=$(fm_run_timed 60 curl -s --max-time 60 -X POST "$API/sendMessage" \
+        -d "chat_id=$TG_CHAT_ID" --data-urlencode "text=$body")
+    if [ -n "$resp" ]; then
+      printf '%s' "$resp" | check && return 0
+      rc=$?
+      case "$resp" in
+        *'"ok":false'*) return "$rc" ;;   # rejected, not transient
+      esac
+    fi
+    [ "$attempt" -lt 3 ] && { echo "telegram: attempt $attempt failed, retrying" >&2; sleep 2; }
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
 i=0
 while [ "$i" -lt "$n" ]; do
   p=${PARTS[i]}
   i=$((i + 1))
   [ -n "$p" ] || continue
-  fm_run_timed 60 curl -s --max-time 60 -X POST "$API/sendMessage" \
-      -d "chat_id=$TG_CHAT_ID" --data-urlencode "text=$p" \
-      | check || { echo "FAILED mid-send" >&2; exit 1; }
+  send_part "$p" || { echo "FAILED mid-send after 3 attempts" >&2; exit 1; }
 done
 mark_sent
 echo "sent ($n part(s))"

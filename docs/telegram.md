@@ -47,12 +47,12 @@ A host where other local users are not trusted should not hold `~/.config/fm-tel
 
 | File | Role |
 | --- | --- |
-| `bin/fm-tg-send.sh` | Outbound. Auto-splits text over ~3900 chars into a numbered thread; `--file <path> [caption]` sends media. Parses Telegram's JSON reply so a rejection is loud and non-zero instead of a silently-swallowed `curl` success. Refuses when run from a crew worktree. |
+| `bin/fm-tg-send.sh` | Outbound. Auto-splits text over ~3900 chars into a numbered thread; `--file <path> [caption]` sends media. Parses Telegram's JSON reply so a rejection is loud and non-zero instead of a silently-swallowed `curl` success. Automatically retries a text part up to 3 times on a transient failure (empty/unparseable reply), never on a genuine rejection (`"ok":false`). Refuses when run from a crew worktree. |
 | `bin/fm-tg-poll.sh` | Single fetch, run each watcher check cycle via the generated `state/tg-watch.check.sh` shim. Fetches new messages, records them to `state/tg-inbox/<id>.json`, and acknowledges each on arrival. |
 | `bin/fm-tg-wait.sh` | Long-poll used by the Stop hook when nothing is already pending; blocks up to `FM_TG_WAIT_MAX` seconds (default 3600, or `FM_TG_HOOK_MAX` when invoked from the hook) for the next message. |
 | `bin/fm-tg-fetch.py` | Shared parsing core for the poller and the waiter: turns one Telegram `getUpdates` response into inbox records, fetches media, and fires the arrival-time acknowledgement. One owner of that logic - see "Defect: single-quoted embedded Python" below. |
 | `bin/fm-tg-drain.py` | Surfaces every pending message on a Stop hook firing; re-surfaces an unanswered one on every subsequent firing instead of losing it. Fires the `...` ack only as a fallback, when the arrival-time ack did not land. |
-| `bin/fm-tg-archive.py` | Retires a message once a real reply has actually been sent (`bin/fm-tg-send.sh` calls it after every non-ack send) - either because it was surfaced, or because it is over 60s old (closes the reply/surface race - see "No message is answered twice" below). |
+| `bin/fm-tg-archive.py` | Retires a message once a real reply has actually been sent (`bin/fm-tg-send.sh` calls it after every non-ack send) - either because it was surfaced, or because it had already arrived (and is over 10s old) when the reply went out (closes the reply/surface race - see "No message is answered twice" below). |
 | `bin/fm-tg-guard.sh` | Stop hook. Refuses to end a turn that surfaced a captain message without a reply having gone out since. |
 | `bin/fm-tg-hook.sh` | Stop hook. Drains pending messages; if none, long-polls via `fm-tg-wait.sh`. |
 | `bin/fm-tg-hook-lib.sh` | The two Stop hooks' shared block budget - see "A hook can never wedge the session" below. |
@@ -134,9 +134,20 @@ A message surfaces exactly as many times as it takes to get answered, no more an
 
 **Defect (2026-08-22, seen live) - the reply/surface race.** Tying retirement to "surfaced AND replied" has its own race: a reply sent within seconds of a surfacing could find the record still flagged unsurfaced (the drain that sets `surfaced` and the send that triggers `bin/fm-tg-archive.py` run close together), so it was not retired and re-surfaced right afterwards - indistinguishable, to the captain, from the duplicate-reply bug this file exists to end.
 
-**Fix.** `bin/fm-tg-archive.py` retires a message when it has been surfaced, OR when it arrived more than 60 seconds before the reply went out.
+**Fix.** `bin/fm-tg-archive.py` retires a message when it has been surfaced, OR when it had already arrived by the time the reply went out.
 A message that old has had every chance to be seen, so the reply is taken to cover it even if `surfaced` never got set in time; that unsurfaced retirement is recorded so it is never invisible.
-A message newer than 60 seconds and never surfaced stays pending rather than being silently eaten.
+
+**Defect (2026-08-22, third recurrence) - the window itself was wrong.** A first version of the fix above used an invented 60-second window instead of the real semantic, and a ~50-second-old message still survived a reply and re-surfaced - the same bug the captain saw a third time.
+The next fix tried "arrived before the reply was sent, carved out under 10 seconds" as a blanket rule for every record.
+
+**Defect (a `no-mistakes` review finding on this branch, before ship) - a proactive send could sweep up an unrelated, never-shown message.** Because any non-ack send at all triggers `bin/fm-tg-archive.py`, the blanket rule above also retired a message that arrived mid-turn and had never been shown to the model, the moment firstmate sent some *unrelated* proactive update - a direct violation of "no message is lost".
+The same review also caught that a missing or malformed `ts` made a record look infinitely old (`float(None or 0) == 0.0`), retiring it on the very first send, sight unseen.
+
+**Fix (the captain's own design call, both parts).** The arrival-time window now applies ONLY to a record that has genuinely never been surfaced, and only within a short, conservative 10-second window of arrival - the one case it exists for: a message that arrived moments before a reply and has not yet had a surfacing pass run.
+A record that HAS been surfaced at least once retires unconditionally on any real reply, however much later - keyed on the fact that surfacing already happened in the past, no window needed.
+A record that has never been surfaced and is older than 10 seconds stays pending no matter what unrelated reply goes out; a missing or malformed `ts` is treated as brand new, never as infinitely old, so it is never swept up by the window either.
+Verified: a 9-second-old never-surfaced message retires (inside the window), an 11-second-old one stays pending (outside it), and a surfaced record retires even an hour after it arrived.
+
 The notice is appended to `state/.tg-archive.log` as well as printed, because the only caller runs the archive as a subprocess whose output it discards - printing alone made the one outcome that can cost the captain an answer completely silent in practice.
 Only notices go to that log; routing the archive run's whole stdout there instead recorded every retirement twice and appended a no-op line on every single reply.
 The log is trimmed to its last lines once it passes its byte cap, the same bound `state/.watch-triage.log` carries.
@@ -189,6 +200,8 @@ These do not each map to one of the guarantees above, but explain choices in the
 - **Poller/waiter race (2026-08-22).** Two things poll Telegram: the watcher's `state/tg-watch.check.sh` shim, and `bin/fm-tg-wait.sh`'s own long-poll when a Stop hook blocks on it.
   Telegram hands an update to whichever asks first; if the poll shim wins, the message is filed into `state/tg-inbox` and the blocked waiter - the only one of the two that can actually wake the model - keeps waiting for something that has already been taken, for up to `FM_TG_WAIT_MAX` seconds.
   `bin/fm-tg-wait.sh` therefore checks the inbox via `bin/fm-tg-drain.py` on every loop pass, not just the network, so a message filed by the other side is picked up within one pass instead of after a timeout.
+- **No send retry (2026-08-22).** A transient network blip on `sendMessage` printed `FAILED mid-send` and relied on firstmate noticing and re-running the command by hand - exactly the "remembering game" the captain asked to be engineered out.
+  `bin/fm-tg-send.sh` now retries a failed text part up to 3 times with a short backoff, and never retries a genuine Telegram rejection (`"ok":false` in the reply), since retrying a bad request cannot help.
 - **`mapfile -d` and bash 3.2.** The outbound text splitter read its NUL-delimited chunks with `mapfile -d ''`, which needs bash >= 4.4.
   macOS still ships `/bin/bash` 3.2, where `mapfile` does not exist at all, so the array stayed unset and the very next line aborted under `set -u` - every text send would have failed there.
   It now reads the chunks with a portable `while IFS= read -r -d ''` loop and counts them as they arrive, because `${#PARTS[@]}` on an empty array is itself an unbound-variable error on those shells.

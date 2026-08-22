@@ -16,10 +16,28 @@ a surfacing could find the record still flagged unsurfaced (the drain that set
 "surfaced" and the send that triggers this archive run close together), so it
 was not retired and re-surfaced right afterwards - indistinguishable, to the
 captain, from the duplicate-reply bug this file exists to end. A message that
-arrived more than a minute before the reply went out has had every chance to
-be seen, so the reply is taken to cover it even if "surfaced" never got set;
+had already arrived by the time the reply went out has had every chance to be
+seen, so the reply is taken to cover it even if "surfaced" never got set;
 retire it too, printing that unsurfaced retirement so it is never invisible.
-Anything newer than that stays pending rather than being silently eaten.
+
+THE WINDOW ITSELF WAS WRONG, TWICE (2026-08-22). A first fix used an invented
+60s window off arrival time, and still let a ~50s-old message survive a reply
+and come back. A second fix tried "arrived before the reply was sent, carved
+out under 10s" as a blanket rule for EVERY record - but a no-mistakes review
+caught that any non-ack send at all then retires every old record, including
+one that arrived mid-turn and was never shown to the model, from a merely
+PROACTIVE or unrelated send. That is a direct "no message is lost" violation.
+
+THE FIX THE CAPTAIN CHOSE (his own design call). The arrival-time window now
+applies ONLY to a record that has never been surfaced, and only within a
+short, conservative 10-second window of arrival - the one case it exists for:
+a message that arrived moments before a reply and has not yet had a surfacing
+pass run. A record that HAS been surfaced at least once retires unconditionally
+on any real reply, however much later - keyed on the fact that surfacing
+already happened in the past, no window needed. A record that has never been
+surfaced and is older than 10 seconds stays pending no matter what unrelated
+reply goes out; a missing or malformed "ts" is treated as brand new, never as
+infinitely old, so it is never swept up by the window either.
 
 An unsurfaced retirement is the one outcome here that can cost the captain an
 answer, so it is recorded rather than merely printed: this script's stdout is
@@ -127,6 +145,7 @@ def prune(inbox_dir, done_dir, media_dir):
             drop(path)
 
 
+now = time.time()
 n = 0
 for path in glob.glob(os.path.join(inbox, "*.json")):
     try:
@@ -134,12 +153,28 @@ for path in glob.glob(os.path.join(inbox, "*.json")):
     except Exception:
         continue
     seen = int(rec.get("surfaced") or 0) >= 1
-    old = float(rec.get("ts") or 0) < (time.time() - 60)
-    if seen or old:
+
+    ts_raw = rec.get("ts")
+    try:
+        ts = float(ts_raw) if ts_raw else None
+    except (TypeError, ValueError):
+        ts = None
+
+    if seen:
+        retire = True
+    else:
+        # Never surfaced: only the genuine same-turn race - arrived WITHIN
+        # the last 10s, off a real arrival timestamp. Anything older than
+        # that and still never surfaced is left alone; it is not part of the
+        # current exchange. No ts (or a malformed one) means "unknown, treat
+        # as brand new" - it must never be swept up as if it were ancient.
+        retire = ts is not None and ts >= (now - 10)
+
+    if retire:
         os.replace(path, os.path.join(done, os.path.basename(path)))
         n += 1
         if not seen:
             notice("retired unsurfaced (arrived %ds before reply): %s"
-                   % (time.time() - float(rec.get("ts") or 0), os.path.basename(path)))
+                   % (now - ts, os.path.basename(path)))
 prune(inbox, done, os.path.join(os.path.dirname(os.path.normpath(inbox)), "tg-media"))
 print("archived %d" % n)
