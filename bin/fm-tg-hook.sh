@@ -24,6 +24,12 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # shellcheck source=bin/fm-tg-hook-lib.sh
 . "$SCRIPT_DIR/fm-tg-hook-lib.sh"
 
+fm_tg_hook_foreign_host && exit 0
+# Nothing below may touch the filesystem on a machine with no Telegram config:
+# an unconfigured home must stay byte-for-byte unchanged (docs/telegram.md), and
+# an ungated mkdir here created state/tg-inbox and state/tg-processed on every
+# turn end of every firstmate primary that had never configured Telegram.
+fm_tg_configured || exit 0
 "$SCRIPT_DIR/fm-tg-isfirstmate.sh" || exit 0
 
 IN="$STATE/tg-inbox"

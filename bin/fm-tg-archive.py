@@ -22,10 +22,13 @@ retire it too, printing that unsurfaced retirement so it is never invisible.
 Anything newer than that stays pending rather than being silently eaten.
 
 An unsurfaced retirement is the one outcome here that can cost the captain an
-answer, so it is recorded rather than merely printed: this script's stdout used
-to be sent straight to /dev/null by its only caller, which made that notice
-invisible in practice. Every notice is appended to <state>/.tg-archive.log,
-next to the inbox, in addition to being printed.
+answer, so it is recorded rather than merely printed: this script's stdout is
+discarded by its only caller, which made that notice invisible in practice.
+Every notice is appended to <state>/.tg-archive.log, next to the inbox, in
+addition to being printed. ONLY notices go there - routing the whole stdout to
+that file logged each retirement twice and grew the file by a no-op line on
+every single reply - and the log is trimmed once it passes its byte cap, the
+same bound state/.watch-triage.log carries.
 
 Usage: fm-tg-archive.py <inbox-dir> <processed-dir>
 """
@@ -40,12 +43,23 @@ os.makedirs(done, exist_ok=True)
 log_path = os.path.join(os.path.dirname(os.path.normpath(inbox)), ".tg-archive.log")
 
 
+LOG_MAX_BYTES = 262144
+LOG_KEEP_LINES = 2000
+
+
 def notice(line):
     """Print, and durably record, something an operator must be able to find."""
     print(line)
     try:
         with open(log_path, "a") as fh:
             fh.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), line))
+        if os.path.getsize(log_path) >= LOG_MAX_BYTES:
+            with open(log_path) as fh:
+                kept = fh.readlines()[-LOG_KEEP_LINES:]
+            tmp = log_path + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.writelines(kept)
+            os.replace(tmp, log_path)
     except Exception:
         pass
 

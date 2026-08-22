@@ -76,7 +76,8 @@ export PATH="$FAKEBIN:$PATH"
 fm_tg_scratch_bin() {
   local dir=$1 sbin="$1/bin" f
   mkdir -p "$sbin"
-  for f in "$ROOT"/bin/fm-tg-*.sh "$ROOT"/bin/fm-tg-*.py "$ROOT"/bin/fm-primary-scope-lib.sh; do
+  for f in "$ROOT"/bin/fm-tg-*.sh "$ROOT"/bin/fm-tg-*.py "$ROOT"/bin/fm-primary-scope-lib.sh \
+    "$ROOT"/bin/fm-hook-host-lib.sh; do
     cp "$f" "$sbin/$(basename "$f")"
   done
   cat > "$sbin/fm-tg-isfirstmate.sh" <<'SH'
@@ -174,7 +175,7 @@ test_guard_block_budget_bounded() {
   local home env sbin rc i blocked=0
 
   home="$TMP_ROOT/wedge-home"
-  mkdir -p "$home/state"
+  mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
   env=$(fm_tg_env "$home")
   sbin=$(fm_tg_scratch_bin "$home/scratch")
   export FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env"
@@ -182,35 +183,57 @@ test_guard_block_budget_bounded() {
   # A message was surfaced and no reply has gone out - and, as when Telegram is
   # unreachable, none ever will. The guard must hold the turn a bounded number
   # of times and then stand down rather than blocking for ever.
+  printf '{"update_id": 1, "ts": 1, "text": "unanswerable", "acked": 1}' \
+    > "$home/state/tg-inbox/1.json"
   touch "$home/state/.tg-last-surfaced"
   i=0
   while [ "$i" -lt 6 ]; do
     rc=0
-    "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/wedge-out" 2>&1 || rc=$?
+    "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/wedge-out" 2>&1 </dev/null || rc=$?
     [ "$rc" -eq 2 ] && blocked=$((blocked + 1))
     i=$((i + 1))
   done
-  [ "$blocked" -eq 3 ] || fail "guard blocked $blocked times for one unanswered surfacing; expected the default budget of 3"
+  [ "$blocked" -eq 3 ] || fail "guard blocked $blocked times for one unanswered message; expected the default budget of 3"
   assert_contains "$(cat "$TMP_ROOT/wedge-out")" "standing down" "an exhausted guard must say why it stopped holding the turn"
 
-  # A NEW surfacing is new information and gets a full budget again, so a
+  # THE REGRESSION THIS PINS. The budget was originally keyed on the mtime of
+  # state/.tg-last-surfaced, which bin/fm-tg-drain.py - the sibling Stop hook,
+  # running on every single turn end - rewrites unconditionally. The key
+  # therefore changed every turn, the count reset to 1 every turn, and the
+  # guard blocked for ever on a message it could not send a reply for: the
+  # exact wedge the budget exists to prevent. Interleave the drain exactly as
+  # production does and the bound must still hold.
+  rm -f "$home/state/.turnend-tg-guard-blocks"
+  blocked=0
+  i=0
+  while [ "$i" -lt 6 ]; do
+    rc=0
+    python3 "$sbin/fm-tg-drain.py" "$home/state/tg-inbox" "$home/state/tg-processed" \
+      >/dev/null 2>&1 || true
+    "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/wedge-out" 2>&1 </dev/null || rc=$?
+    [ "$rc" -eq 2 ] && blocked=$((blocked + 1))
+    i=$((i + 1))
+  done
+  [ "$blocked" -eq 3 ] || fail "guard blocked $blocked times with the drain re-stamping the surfacing marker every turn; the budget must bound the MESSAGE, not the surfacing time"
+
+  # A NEW message is new information and gets a full budget again, so a
   # bounded guard never becomes a silently lost message.
-  sleep 1
-  touch "$home/state/.tg-last-surfaced"
+  printf '{"update_id": 2, "ts": 2, "text": "a second question", "acked": 1}' \
+    > "$home/state/tg-inbox/2.json"
   rc=0
-  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/wedge-out" 2>&1 || rc=$?
-  [ "$rc" -eq 2 ] || fail "a newly surfaced message must get a fresh budget, not inherit the exhausted one"
+  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/wedge-out" 2>&1 </dev/null || rc=$?
+  [ "$rc" -eq 2 ] || fail "a newly arrived message must get a fresh budget, not inherit the exhausted one"
 
   # And a real reply clears the record outright.
   touch "$home/state/.tg-last-sent"
   rc=0
-  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/wedge-out" 2>&1 || rc=$?
+  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/wedge-out" 2>&1 </dev/null || rc=$?
   expect_code 0 "$rc" "guard must fall silent once a reply has gone out"
   assert_absent "$home/state/.turnend-tg-guard-blocks" "a reply must clear the block record"
 
   rm -f "$TMP_ROOT/wedge-out"
   unset FM_HOME FM_TG_ENV_OVERRIDE
-  pass "telegram: an unanswerable surfacing holds the turn a bounded number of times, and a new one still gets a full budget"
+  pass "telegram: an unanswerable message holds the turn a bounded number of times even as the drain re-stamps every turn, and a new message still gets a full budget"
 }
 
 # --- the poll stays inside the watcher's per-check bound ---------------------
@@ -298,46 +321,66 @@ test_unsurfaced_retirement_is_recorded() {
 # --- config absent: everything stays silent ---------------------------------
 
 test_config_absent_hooks_silent() {
-  local home
+  local home sbin
   home="$TMP_ROOT/absent-home"
   mkdir -p "$home/state"
+  # The identity gate is stubbed to ALLOW here on purpose. These scripts also
+  # no-op for a crewmate, so running them through the real gate proved nothing
+  # about the config gate whenever the suite happened to run from a worktree -
+  # and it hid a real defect: the hook created state/tg-inbox and
+  # state/tg-processed on every turn end of an unconfigured firstmate primary.
+  # With identity allowed, absent config is the only thing left to keep this
+  # home byte-for-byte unchanged.
+  sbin=$(fm_tg_scratch_bin "$home/scratch")
+
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/does-not-exist.env" \
-    "$ROOT/bin/fm-tg-guard.sh" >"$TMP_ROOT/absent-guard-out" 2>&1
+    "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/absent-guard-out" 2>&1 </dev/null
   expect_code 0 "$?" "fm-tg-guard.sh with no config"
   [ ! -s "$TMP_ROOT/absent-guard-out" ] || fail "fm-tg-guard.sh printed output with no config: $(cat "$TMP_ROOT/absent-guard-out")"
 
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/does-not-exist.env" FM_TG_WAIT_MAX=1 \
-    "$ROOT/bin/fm-tg-hook.sh" >"$TMP_ROOT/absent-hook-out" 2>&1
+    "$sbin/fm-tg-hook.sh" >"$TMP_ROOT/absent-hook-out" 2>&1 </dev/null
   expect_code 0 "$?" "fm-tg-hook.sh with no config"
   [ ! -s "$TMP_ROOT/absent-hook-out" ] || fail "fm-tg-hook.sh printed output with no config: $(cat "$TMP_ROOT/absent-hook-out")"
 
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/does-not-exist.env" \
-    "$ROOT/bin/fm-tg-poll.sh" >"$TMP_ROOT/absent-poll-out" 2>&1
+    "$sbin/fm-tg-poll.sh" >"$TMP_ROOT/absent-poll-out" 2>&1
   expect_code 0 "$?" "fm-tg-poll.sh with no config"
   [ ! -s "$TMP_ROOT/absent-poll-out" ] || fail "fm-tg-poll.sh printed output with no config: $(cat "$TMP_ROOT/absent-poll-out")"
 
+  # A half-configured file is not configuration either: a token with no chat id
+  # cannot reach the captain, so it must stay just as inert.
+  printf 'TG_TOKEN=faketoken\n' > "$home/half.env"
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/half.env" FM_TG_WAIT_MAX=1 \
+    "$sbin/fm-tg-hook.sh" >"$TMP_ROOT/absent-hook-out" 2>&1 </dev/null
+  expect_code 0 "$?" "fm-tg-hook.sh with a chat-id-less config"
+  [ ! -s "$TMP_ROOT/absent-hook-out" ] || fail "fm-tg-hook.sh printed output with a half config: $(cat "$TMP_ROOT/absent-hook-out")"
+
   assert_absent "$home/state/tg-inbox" "no config must never create state/tg-inbox"
+  assert_absent "$home/state/tg-processed" "no config must never create state/tg-processed"
   rm -f "$TMP_ROOT/absent-guard-out" "$TMP_ROOT/absent-hook-out" "$TMP_ROOT/absent-poll-out"
-  pass "telegram: absent config -> guard, hook, and poll all exit 0 silently, nothing created"
+  pass "telegram: absent or half config -> guard, hook, and poll all exit 0 silently, nothing created"
 }
 
 # --- crew worktree: send refuses, hooks no-op -------------------------------
 
 test_crew_worktree_refuses() {
-  local home crewdir out rc
+  local home fakehome crewdir out rc
   home="$TMP_ROOT/crew-home"
   mkdir -p "$home/state"
   fm_tg_env "$home" >/dev/null
 
-  # bin/fm-tg-isfirstmate.sh hardcodes "$HOME"/.treehouse/* (real crew
-  # worktrees always live there); use a real, harmless scratch subdir of it.
-  crewdir="$HOME/.treehouse/fm-telegram-test-$$"
+  # bin/fm-tg-send.sh condemns a cwd under "$HOME"/.treehouse/* (real crew
+  # leases always live there). $HOME is read at runtime, so point it at scratch
+  # rather than building the path under the operator's real home, where the
+  # .treehouse parent would be left behind on a machine that has none.
+  fakehome="$TMP_ROOT/crew-fakehome"
+  crewdir="$fakehome/.treehouse/task"
   mkdir -p "$crewdir"
 
-  out=$(cd "$crewdir" && FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/tg.env" \
+  out=$(cd "$crewdir" && HOME="$fakehome" FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/tg.env" \
     "$ROOT/bin/fm-tg-send.sh" 'hello captain' 2>&1)
   rc=$?
-  rm -rf "$crewdir"
   [ "$rc" -ne 0 ] || fail "fm-tg-send.sh did not refuse from a crew worktree"
   assert_contains "$out" "REFUSED" "fm-tg-send.sh crew refusal missing REFUSED message"
   assert_absent "$home/state/.tg-last-sent" "crew send must never stamp .tg-last-sent"
@@ -454,7 +497,7 @@ test_arrival_ack_guard_reply_pipeline() {
   assert_contains "$out" "what is an epoch?" "drain did not surface the message text"
 
   # 3. Guard: only an ack was ever sent, never a real reply -> must demand one.
-  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/guard1-out" 2>&1
+  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/guard1-out" 2>&1 </dev/null
   rc=$?
   [ "$rc" -eq 2 ] || fail "guard did not block after ack-only (got exit $rc): $(cat "$TMP_ROOT/guard1-out")"
   assert_contains "$(cat "$TMP_ROOT/guard1-out")" "UNANSWERED CAPTAIN MESSAGE" "guard reason missing"
@@ -479,7 +522,7 @@ test_arrival_ack_guard_reply_pipeline() {
   [ "$rc" -eq 1 ] || fail "drain still reports something pending after the real reply landed"
 
   # 7. Guard: a real reply since the last surface -> silent, turn may end.
-  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/guard2-out" 2>&1
+  "$sbin/fm-tg-guard.sh" >"$TMP_ROOT/guard2-out" 2>&1 </dev/null
   rc=$?
   expect_code 0 "$rc" "guard still blocking after a real reply was sent: $(cat "$TMP_ROOT/guard2-out")"
   rm -f "$TMP_ROOT/guard2-out"

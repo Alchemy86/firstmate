@@ -233,6 +233,47 @@ SH
   pass "fm-sessionstart-run: inert on a Cursor payload, unchanged otherwise"
 }
 
+# The two Telegram Stop entries are tracked in .claude/settings.json too, and
+# Cursor loads that file. Cursor has no asyncRewake, so an unguarded
+# bin/fm-tg-hook.sh would run its long poll SYNCHRONOUSLY inside Cursor's stop
+# step and hold that turn for its whole FM_TG_HOOK_MAX, and the reply guard
+# would block a turn Cursor's own adapter already owns.
+test_telegram_stop_hooks_stand_down_on_cursor_payload() {
+  local dir out status f
+  dir=$(make_primary_dir "$TMP_ROOT/host-telegram")
+  for f in fm-tg-guard.sh fm-tg-hook.sh fm-tg-hook-lib.sh fm-tg-isfirstmate.sh \
+           fm-tg-send.sh fm-tg-wait.sh fm-tg-drain.py fm-tg-archive.py; do
+    cp "$ROOT/bin/$f" "$dir/bin/$f"
+  done
+  chmod +x "$dir"/bin/*.sh
+  printf 'TG_TOKEN=faketoken\nTG_CHAT_ID=999\n' > "$dir/tg.env"
+  mkdir -p "$dir/state/tg-inbox" "$dir/state/tg-processed"
+  printf '{"update_id": 1, "ts": 1, "text": "captain question", "acked": 1}' \
+    > "$dir/state/tg-inbox/1.json"
+  touch "$dir/state/.tg-last-surfaced"
+
+  # Both hooks WOULD block on this state, so a silent exit 0 can only come from
+  # the host stand-down. Run from the home itself: the identity check condemns
+  # a linked-worktree cwd, and this suite runs from one.
+  out=$(cd "$dir" && printf '%s' "$CURSOR_PAYLOAD" | FM_HOME="$dir" \
+    FM_TG_ENV_OVERRIDE="$dir/tg.env" bash "$dir/bin/fm-tg-guard.sh" 2>&1); status=$?
+  expect_code 0 "$status" "the Telegram reply guard must not block through the Claude-settings duplicate"
+  [ -z "$out" ] || fail "the Telegram reply guard produced output under Cursor: $out"
+
+  out=$(cd "$dir" && printf '%s' "$CURSOR_PAYLOAD" | FM_HOME="$dir" \
+    FM_TG_ENV_OVERRIDE="$dir/tg.env" FM_TG_HOOK_MAX=1 bash "$dir/bin/fm-tg-hook.sh" 2>&1); status=$?
+  expect_code 0 "$status" "the Telegram surface hook must not block through the Claude-settings duplicate"
+  [ -z "$out" ] || fail "the Telegram surface hook produced output under Cursor: $out"
+  grep -q surfaced "$dir/state/tg-inbox/1.json" \
+    && fail "the Telegram surface hook drained the captain's inbox under Cursor"
+
+  out=$(cd "$dir" && printf '%s' "$CLAUDE_STOP_PAYLOAD" | FM_HOME="$dir" \
+    FM_TG_ENV_OVERRIDE="$dir/tg.env" bash "$dir/bin/fm-tg-guard.sh" 2>&1); status=$?
+  expect_code 2 "$status" "the host guard must not disturb a genuine Claude Stop payload"
+  case "$out" in *'UNANSWERED CAPTAIN MESSAGE'*) ;; *) fail "expected the unanswered-reply banner, got: $out" ;; esac
+  pass "telegram Stop hooks: inert on a Cursor-delivered payload, unchanged under Claude"
+}
+
 test_pretool_guards_deduplicate_and_render_cursor_deny() {
   local dir payload out status decision
   dir=$(make_primary_dir "$TMP_ROOT/host-pretool")
@@ -642,6 +683,7 @@ test_autoarm_stands_down_on_cursor_payload
 test_sessionstart_run_stands_down_on_cursor_payload
 test_pretool_guards_deduplicate_and_render_cursor_deny
 test_cd_guard_renders_cursor_deny
+test_telegram_stop_hooks_stand_down_on_cursor_payload
 test_park_silent_when_nothing_in_flight
 test_park_delivers_actionable_wake_as_followup
 test_park_never_exits_two

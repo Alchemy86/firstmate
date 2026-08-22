@@ -72,6 +72,12 @@ A message whose attachment could not be pulled down in time is still recorded an
 The two Stop hooks are registered in this repository's own tracked `.claude/settings.json`, project-scoped rather than in the user's global `~/.claude/settings.json`.
 That is the fix for the crew-fan-out defect below; see that section for why it matters and why `bin/fm-tg-isfirstmate.sh` still exists on top of it.
 
+Both entries stand down on a foreign-host payload through `fm_hook_payload_is_foreign_host` in `bin/fm-hook-host-lib.sh`, like every other tracked Claude-shaped entrypoint.
+Cursor loads `<project>/.claude/settings.json` as well as its own registration and has no `asyncRewake`, so an unguarded `bin/fm-tg-hook.sh` would run its long poll synchronously inside Cursor's stop step and hold that turn for the whole of `FM_TG_HOOK_MAX` ([turnend-guard.md](turnend-guard.md) "Harness integrations").
+
+Both also check for usable configuration before they touch the filesystem at all.
+An ungated `mkdir` in `bin/fm-tg-hook.sh` used to create `state/tg-inbox` and `state/tg-processed` on every turn end of every firstmate primary, including one that had never configured Telegram, which broke this file's opening promise that an unconfigured home is left byte-for-byte unchanged.
+
 ## Guarantees
 
 Each of these was a real, captain-visible failure before the fix that now guarantees it cannot recur.
@@ -109,7 +115,9 @@ A message surfaces exactly as many times as it takes to get answered, no more an
 **Fix.** `bin/fm-tg-archive.py` retires a message when it has been surfaced, OR when it arrived more than 60 seconds before the reply went out.
 A message that old has had every chance to be seen, so the reply is taken to cover it even if `surfaced` never got set in time; that unsurfaced retirement is recorded so it is never invisible.
 A message newer than 60 seconds and never surfaced stays pending rather than being silently eaten.
-The notice is appended to `state/.tg-archive.log` as well as printed, because the only caller runs the archive as a subprocess whose output an ack path discards - printing alone made the one outcome that can cost the captain an answer completely silent in practice.
+The notice is appended to `state/.tg-archive.log` as well as printed, because the only caller runs the archive as a subprocess whose output it discards - printing alone made the one outcome that can cost the captain an answer completely silent in practice.
+Only notices go to that log; routing the archive run's whole stdout there instead recorded every retirement twice and appended a no-op line on every single reply.
+The log is trimmed to its last lines once it passes its byte cap, the same bound `state/.watch-triage.log` carries.
 
 ### The `...` acknowledgement is not a reply
 
@@ -132,7 +140,9 @@ The record is marked `acked: 1`; `bin/fm-tg-drain.py` only re-sends the ack as a
 When the condition *cannot* clear (Telegram unreachable, a revoked token, no network) the model has no way to satisfy either one, so every turn end would re-block for ever.
 
 **Fix.** `bin/fm-tg-hook-lib.sh` gives both hooks the same bounded block budget `bin/fm-turnend-guard.sh` already uses, with one difference that is load-bearing: the budget is keyed on the *condition*, not on the session.
-Each block records exactly what it is blocking about - which messages are pending, or which surfacing is unanswered - and any change to that key is progress and resets the count.
+Each block records exactly what it is blocking about - which messages are pending - and any change to that key is progress and resets the count.
+Keying the reply guard on the *surfacing time* instead looked equivalent and was not: `bin/fm-tg-drain.py`, the sibling Stop hook that runs on every single turn end, rewrites `state/.tg-last-surfaced` unconditionally, so the key changed every turn, the count reset to 1 every turn, and the guard blocked for ever on a message it could not send a reply for.
+Both hooks therefore key on the pending-message set.
 A new or newly-answered message therefore always gets a full budget, and only the same unchanged, unanswerable condition ever runs out.
 Exhaustion is not permanent silence either: the record is left untouched at that point, so `FM_TG_TURNEND_BLOCK_TTL` (default 3600s) after the last block the same condition may speak up again.
 `FM_TG_TURNEND_BLOCK_BUDGET` (default 3) sets the count.

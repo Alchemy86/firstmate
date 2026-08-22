@@ -27,6 +27,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # shellcheck source=bin/fm-tg-hook-lib.sh
 . "$SCRIPT_DIR/fm-tg-hook-lib.sh"
 
+fm_tg_hook_foreign_host && exit 0
+fm_tg_configured || exit 0
 "$SCRIPT_DIR/fm-tg-isfirstmate.sh" || exit 0
 
 SENT="$STATE/.tg-last-sent"
@@ -34,17 +36,24 @@ SURF="$STATE/.tg-last-surfaced"
 BUDGET_FILE="$STATE/.turnend-tg-guard-blocks"
 
 [ -f "$SURF" ] || exit 0
-s=$(stat -c %Y "$SURF" 2>/dev/null || echo 0)
-r=$(stat -c %Y "$SENT" 2>/dev/null || echo 0)
+s=$(fm_tg_path_mtime "$SURF"); case "$s" in ''|*[!0-9]*) s=0 ;; esac
+r=$(fm_tg_path_mtime "$SENT"); case "$r" in ''|*[!0-9]*) r=0 ;; esac
 
 if [ "$s" -le "$r" ]; then
   fm_tg_budget_clear "$BUDGET_FILE"
   exit 0
 fi
 
-# Bounded: the same unanswered surfacing may hold the turn only so many times,
-# so an unreachable Telegram cannot wedge the session (bin/fm-tg-hook-lib.sh).
-if ! fm_tg_budget_ok "$BUDGET_FILE" "surfaced:$s"; then
+# Bounded: the same unanswered message set may hold the turn only so many
+# times, so an unreachable Telegram cannot wedge the session
+# (bin/fm-tg-hook-lib.sh).
+#
+# The key is WHICH messages are unanswered, never the surfacing time. Keying on
+# the marker's mtime looked equivalent and was not: bin/fm-tg-drain.py rewrites
+# that marker on every turn end, so the key changed every turn, the count reset
+# to 1 every turn, and the budget never bounded anything - the guard blocked for
+# ever, which is exactly the wedge it was added to prevent.
+if ! fm_tg_budget_ok "$BUDGET_FILE" "$(fm_tg_pending_key "$STATE/tg-inbox")"; then
   echo "fm-tg-guard: no reply has gone out for the message surfaced at $s and the turn has already been held for it; standing down so the session is not wedged. Send it with $SCRIPT_DIR/fm-tg-send.sh once Telegram is reachable." >&2
   exit 0
 fi

@@ -91,24 +91,39 @@ if not d.get("ok"):
 '
 }
 
+# Portable file size in bytes; macOS stat has no -c. A silent 0 here would send
+# an oversized image through sendPhoto, skip the 50MB refusal, and flatten the
+# size-scaled upload timeout, so an unreadable size is loud rather than 0.
+file_size() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %z "$1" 2>/dev/null
+  else
+    stat -c %s "$1" 2>/dev/null
+  fi
+}
+
 # A real reply: stamp it, and retire the inbox messages it answers. FM_TG_ACK=1
 # (the instant "..." acknowledgement) skips this entirely - it is not a reply.
-# The archive run's own output is the only record that a message was retired
-# without ever having been surfaced (bin/fm-tg-archive.py). It used to go to
-# /dev/null, which made that retirement completely invisible; it now lands in
-# state/.tg-archive.log, which fm-tg-archive.py also appends to directly, so
-# the notice survives an ack subprocess that discards both streams.
+# An unsurfaced retirement is the one outcome that can cost the captain an
+# answer, and bin/fm-tg-archive.py records each one in state/.tg-archive.log
+# itself, so this call does not need to capture its stdout - doing so logged
+# every retirement twice and appended a no-op "archived 0" line per reply.
 mark_sent() {
   if [ -z "${FM_TG_ACK:-}" ]; then
     touch "$STATE/.tg-last-sent"
     python3 "$SCRIPT_DIR/fm-tg-archive.py" "$STATE/tg-inbox" "$STATE/tg-processed" \
-      >> "$STATE/.tg-archive.log" 2>&1 || true
+      >/dev/null 2>&1 || true
   fi
 }
 
 if [ "${1:-}" = "--file" ]; then
   f=${2:?path required}; cap=${3:-}
-  sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+  sz=$(file_size "$f")
+  case "$sz" in
+    ''|*[!0-9]*)
+      echo "telegram: cannot read the size of $f; refusing to guess how to upload it" >&2
+      exit 1 ;;
+  esac
   case "${f##*.}" in
     png|jpg|jpeg|webp)
       # Telegram's sendPhoto re-encodes and rejects large or very large-

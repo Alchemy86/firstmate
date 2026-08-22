@@ -31,6 +31,9 @@
 # disable both hooks permanently after their first block instead of bounding
 # them.
 
+# shellcheck source=bin/fm-hook-host-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-hook-host-lib.sh"
+
 # fm_tg_budget_ok <record-file> <condition-key>
 # Exit 0 when this block is still within budget (and record it), 1 when the
 # same unchanged condition has already used the budget up.
@@ -85,4 +88,49 @@ fm_tg_pending_key() {
     names="$names$(basename "$f"),"
   done
   printf 'pending:%s' "$names"
+}
+
+# fm_tg_configured
+# 0 when this machine has usable Telegram captain-comms configuration. The
+# hooks must be completely inert without it (docs/telegram.md), including
+# creating no state directories, so this is checked before any mkdir. Sourced
+# in a subshell so a hook never leaks TG_TOKEN into its own environment.
+fm_tg_configured() {
+  local envf
+  envf=${FM_TG_ENV_OVERRIDE:-$HOME/.config/fm-telegram.env}
+  [ -f "$envf" ] || return 1
+  (
+    set -a
+    # shellcheck source=/dev/null # a resolved runtime path, not a repo file
+    . "$envf" || exit 1
+    set +a
+    [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT_ID:-}" ]
+  ) >/dev/null 2>&1
+}
+
+# fm_tg_path_mtime <path>
+# Portable mtime in epoch seconds, empty when the path cannot be read. macOS
+# stat has no -c, and a bare `stat -c %Y ... || echo 0` made both sides of the
+# guard's comparison 0 there, which silently disabled it.
+fm_tg_path_mtime() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %m "$1" 2>/dev/null
+  else
+    stat -c %Y "$1" 2>/dev/null
+  fi
+}
+
+# fm_tg_hook_foreign_host
+# 0 when this Stop event was delivered by a foreign host whose own tracked
+# registration already owns the turn boundary. Cursor loads this repo's
+# .claude/settings.json as well as its own hooks, and has no asyncRewake, so an
+# unguarded bin/fm-tg-hook.sh would run synchronously inside Cursor's stop step
+# and hold that turn for its whole declared timeout (docs/turnend-guard.md
+# "Harness integrations"). A terminal stdin is never read: a hook always pipes
+# its payload and a hand-run must not block on a read.
+fm_tg_hook_foreign_host() {
+  local payload=
+  [ -t 0 ] || payload=$(cat 2>/dev/null || true)
+  [ -n "$payload" ] || return 1
+  fm_hook_payload_is_foreign_host "$payload"
 }
