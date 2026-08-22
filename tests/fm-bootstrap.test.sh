@@ -39,6 +39,17 @@ export FM_BACKEND_CMUX_BUNDLE_BIN="$TMP_ROOT/no-bundled-cmux"
 unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
   CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_SOCKET_PATH CMUX_TAB_ID CMUX_PANEL_ID 2>/dev/null || true
 
+# Telegram captain-comms config lives at a fixed $HOME path, deliberately
+# outside any FM_HOME (docs/telegram.md - one captain, one bot per machine).
+# That means, unlike X mode's FM_HOME-scoped .env, it is NOT naturally
+# isolated by this suite's per-case FM_HOME scratch dirs: on a machine that
+# has real Telegram captain-comms configured (such as the one this repo's own
+# fleet runs on), every bootstrap call below would otherwise pick up the real
+# ~/.config/fm-telegram.env and leak an unexpected TELEGRAM: line into cases
+# that are pinning unrelated tool-detection output. Point it at a path that
+# never exists so this suite stays hermetic regardless of the host machine.
+export FM_TG_ENV_OVERRIDE="$TMP_ROOT/no-telegram-config-in-this-suite.env"
+
 # A fake toolchain where every required tool is present and gh is authenticated.
 # treehouse's `get --help` advertises --lease only when FM_FAKE_TREEHOUSE_LEASE_HELP=1.
 make_fake_toolchain() {

@@ -49,6 +49,27 @@
             "timeout": 28800
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -z \"${GROK_AGENT:-}${GROK_HOOK_EVENT:-}\" ] || exit 0; exec \"$CLAUDE_PROJECT_DIR\"/bin/fm-tg-guard.sh",
+            "timeout": 15,
+            "statusMessage": "checking the captain got his answer"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -z \"${GROK_AGENT:-}${GROK_HOOK_EVENT:-}\" ] || exit 0; exec \"$CLAUDE_PROJECT_DIR\"/bin/fm-tg-hook.sh",
+            "asyncRewake": true,
+            "timeout": 1900,
+            "statusMessage": "listening for the captain on Telegram"
+          }
+        ]
       }
     ]
   }
