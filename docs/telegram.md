@@ -58,13 +58,13 @@ A host where other local users are not trusted should not hold `~/.config/fm-tel
 | `bin/fm-tg-hook-lib.sh` | The two Stop hooks' shared block budget - see "A hook can never wedge the session" below. |
 | `bin/fm-tg-isfirstmate.sh` | Identity check; exits non-zero for a crewmate session. Defense in depth - see "Only firstmate talks to the captain" below. |
 
-Runtime state - `state/tg-inbox/`, `state/tg-processed/`, `state/tg-media/`, `state/.tg-last-sent`, `state/.tg-last-surfaced`, `state/.tg-offset`, `state/.tg-archive.log`, the two `state/.turnend-tg-*-blocks` budget records, the `state/.tg-hook.lock` single-flight claim, and the generated `state/tg-watch.check.sh` with its `state/tg-watch.check-trust` binding - lives in gitignored `state/`, same as every other task and watcher artifact.
+Runtime state - `state/tg-inbox/`, `state/tg-processed/`, `state/tg-media/`, `state/.tg-last-sent`, `state/.tg-last-surfaced`, `state/.tg-offset`, `state/.tg-archive.log`, the `state/.tg-poll-error` refusal record, the two `state/.turnend-tg-*-blocks` budget records, the `state/.tg-hook.lock` single-flight claim, and the generated `state/tg-watch.check.sh` with its `state/tg-watch.check-trust` binding - lives in gitignored `state/`, same as every other task and watcher artifact.
 Nothing under this feature is ever tracked in git except the `bin/fm-tg-*` scripts themselves and the two Stop hook registrations in `.claude/settings.json`.
 
 ### Bootstrap and the watcher
 
 `bin/fm-bootstrap.sh` detects `~/.config/fm-telegram.env` the same way it detects X mode's `.env` token (`AGENTS.md` section 14): presence-gated, nothing written or printed when unconfigured.
-When both `TG_TOKEN` and `TG_CHAT_ID` are set and `curl`/`python3` are available, it writes two idempotent, gitignored artifacts and prints `TELEGRAM: on (chat configured) - ...`:
+When both `TG_TOKEN` and `TG_CHAT_ID` are set and `curl`/`python3` are available, it writes three idempotent, gitignored artifacts and prints `TELEGRAM: on (chat configured) - ...`:
 
 - `state/tg-watch.check.sh` - a generated shim that `exec`s `bin/fm-tg-poll.sh`; the watcher's own `*.check.sh` sweep (`AGENTS.md` section 8) picks it up with no changes to the watcher itself.
 - `state/tg-watch.check-trust` - the shim's byte binding, written by `bin/fm-check-register.sh`. The watcher runs a custom state check only against a current binding; an unregistered shim is never executed at all and is reported as an unauthenticated check on every single cycle instead, so arming and registering are one step (the same contract `bin/fm-tool-update-check.sh arm` follows).
@@ -78,6 +78,11 @@ If both X mode and Telegram are configured at once, both cadence files export th
 The poll also has to finish inside the watcher's per-check bound (`FM_CHECK_TIMEOUT`, default 30s), because a check killed part way through has written neither the inbox record nor the offset and would refetch and re-acknowledge the same update on every following cycle.
 `bin/fm-tg-poll.sh` therefore bounds its own `getUpdates` call and hands `bin/fm-tg-fetch.py` an explicit wall-clock budget for the rest; the fetch writes the inbox record and the offset before it acknowledges anything or downloads any media, and skips a media download that no longer fits rather than starting one.
 A message whose attachment could not be pulled down in time is still recorded and still surfaces, carrying its Telegram file id.
+
+A refused channel is reported rather than mistaken for a quiet one.
+A revoked token (401), a lasting conflict with the Stop hook's own long poll (409), and a sustained rate limit (429) all come back as an error body that `curl` transfers perfectly, so without this they looked exactly like a captain who had not written: no output, no wake, no trace.
+`bin/fm-tg-fetch.py` names the refusal on stderr, and the poll prints one `telegram: the channel refused the poll (...)` line carrying Telegram's own reason.
+That line is recorded in `state/.tg-poll-error` and reported once per distinct reason, so one standing failure does not wake firstmate every 30 seconds; the next usable poll clears the record, so a recurrence is reported again (the same shape `bin/fm-tool-update-check.sh` uses for `state/.tool-updates`).
 
 ### Stop hook registration
 

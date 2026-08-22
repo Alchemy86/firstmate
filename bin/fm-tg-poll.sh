@@ -18,6 +18,12 @@
 # offset, so it would refetch and re-acknowledge the same update on every
 # following cycle. The fetch is therefore given an explicit wall-clock budget
 # built from what this script has not already spent.
+#
+# A channel that refuses us is reported, not mistaken for a quiet one: a
+# revoked token, a lasting conflict with the Stop hook's long poll, and a rate
+# limit all arrive as an error body curl transfers perfectly. state/.tg-poll-error
+# holds the last reported reason so one standing failure is reported once
+# rather than every cycle, and a usable poll clears it.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,6 +70,37 @@ resp=$(fm_run_timed "$GETUPDATES_TMO" curl -s --max-time "$GETUPDATES_TMO" \
 FETCH_BUDGET=$(( CHECK_BUDGET - ( $(date +%s) - started ) - MARGIN ))
 [ "$FETCH_BUDGET" -gt 0 ] || exit 0
 
+err="$STATE/.tg-poll-error"
+diag=$(mktemp "$STATE/.tg-poll-diag.XXXXXX" 2>/dev/null) || diag=/dev/null
 printf '%s' "$resp" \
-  | FM_TG_FETCH_BUDGET="$FETCH_BUDGET" python3 "$SCRIPT_DIR/fm-tg-fetch.py" poll "$IN" "$OFF" "$SCRIPT_DIR/fm-tg-send.sh"
+  | FM_TG_FETCH_BUDGET="$FETCH_BUDGET" python3 "$SCRIPT_DIR/fm-tg-fetch.py" \
+      poll "$IN" "$OFF" "$SCRIPT_DIR/fm-tg-send.sh" 2>"$diag"
+rc=$?
+reason=$(head -n 1 "$diag" 2>/dev/null | tr -d '\r')
+[ "$diag" = /dev/null ] || rm -f -- "$diag"
+
+# A refusal has to be told apart from a quiet channel. A revoked token, a
+# sustained rate limit, or a permanent conflict all return an error body that
+# curl transfers perfectly, so without this the captain sees exactly what he
+# sees when he simply has not written: nothing. Reported once per distinct
+# reason - the record is what keeps one broken token from waking firstmate
+# every 30 seconds - and cleared by the next usable poll so a recurrence is
+# reported again (bin/fm-tool-update-check.sh's state/.tool-updates does the
+# same for its own sweep).
+if [ "$rc" -eq 3 ]; then
+  [ -n "$reason" ] || reason="unusable reply"
+  line="telegram: the channel refused the poll ($reason)"
+  if [ "$line" != "$(cat "$err" 2>/dev/null || true)" ]; then
+    printf '%s\n' "$line"
+    if tmp=$(mktemp "$err.XXXXXX" 2>/dev/null); then
+      if printf '%s\n' "$line" > "$tmp"; then
+        mv -f -- "$tmp" "$err" || rm -f -- "$tmp"
+      else
+        rm -f -- "$tmp"
+      fi
+    fi
+  fi
+else
+  rm -f -- "$err"
+fi
 exit 0

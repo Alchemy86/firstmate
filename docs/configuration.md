@@ -419,7 +419,8 @@ The dashboard owns account creation, identity linking, bot installation, and tok
 The locked session-start bootstrap step turns the token into local generated state.
 It writes `state/x-watch.check.sh`, a byte-static identity shim for `bin/fm-x-poll.sh`, and `config/x-mode.env`, which exports `FM_CHECK_INTERVAL=30` for watcher processes in that home.
 The watcher accepts the shim only when its bytes match the expected generated content, then invokes the trusted repository poll script directly instead of executing state-file source.
-This section is the single owner of the Relay cadence contract: a Relay instance polls every 30 seconds instead of the default 300, only a Relay instance speeds up because a non-Relay home has no `config/x-mode.env`, and the session-start supervision operating block includes the cadence instruction when that file exists.
+This section is the single owner of the Relay cadence contract: a Relay instance polls every 30 seconds instead of the default 300, a home with no generated cadence file keeps the default because nothing raises it, and the session-start supervision operating block includes the cadence instruction when that file exists.
+The 30-second cadence is not Relay's alone: `config/tg-mode.env` exports the same `FM_CHECK_INTERVAL=30` for a Telegram-configured home and travels the same sourcing path, so a home with either file speeds up and a home with both is unaffected by the order they are sourced in ([telegram.md](telegram.md) owns that file).
 The active primary-harness supervision protocol owns how that sourced cadence reaches the watcher process.
 Because `bin/fm-watch.sh` reads `FM_CHECK_INTERVAL` only at process start, a cadence transition - opt-in while a watcher is already running, or opt-out - is applied by restarting the home-scoped watcher through the emitted harness protocol; bootstrap deliberately never restarts the watcher itself.
 While away mode is active the daemon owns the watcher and its default cadence applies; away-mode Relay cadence is a deferred follow-up.
@@ -504,6 +505,15 @@ The session-start digest separately prints a "Public commitments" subsection fro
 `bin/fm-teardown.sh` refuses to clean up a task while this home still owes a public reply for exactly that work, unless `--force` carries explicit discard approval.
 `FM_PF_RETRY_BACKOFF_SECS` (default 900) sets the next-attempt time recorded with a retryable delivery error.
 See [verification/public-followup.md](verification/public-followup.md) for the current maintainer evidence behind restart recovery, retained-loop disposition, and the relay-disabled zero-overhead guarantee.
+
+## Telegram captain-comms (~/.config/fm-telegram.env / config/tg-mode.env)
+
+Telegram captain-comms is presence-gated on `~/.config/fm-telegram.env`, which lives outside this repo and outside `FM_HOME` by design - one bot per machine regardless of how many firstmate homes exist - and must set both `TG_TOKEN` and `TG_CHAT_ID`.
+Absent or partial configuration is silent and inert: nothing is written and nothing about firstmate's behavior changes.
+When it is configured, the locked session-start bootstrap step writes `state/tg-watch.check.sh`, its `state/tg-watch.check-trust` byte binding, and `config/tg-mode.env`, and removes all three on opt-out.
+
+The `FM_TG_*` knobs are listed under "Environment variables" below with the rest of the runtime tuning; [telegram.md](telegram.md) owns the behavior they tune, along with the feature's guarantees, its Stop hook registrations, and its runtime state.
+This section owns only where its configuration lives and what bootstrap generates from it.
 
 ## Process-to-event sources (state/procevent)
 
@@ -698,6 +708,18 @@ FM_COMPOSER_IDLE_RE=    # optional fleet-wide idle-placeholder regex override (b
 FM_COMPOSER_CAPTURE_LINES=20   # fleet-wide bound for tail-capture composer reads; tmux instead supplies its bounded visible pane, while the other adapters use this small window so stale scrollback banners stay out of the candidate set
 FM_COMPOSER_PI_MAX_LINES=8     # fleet-wide: maximum rows admitted between Pi's identity-corroborated separator pair; taller or ambiguous candidates stay unknown
 FM_COMPOSER_GHOST_LUMA_MAX=128   # fleet-wide: max perceived luminance (0.299R+0.587G+0.114B, 0-255) for a TRUECOLOR foreground to count as de-emphasised ghost/placeholder text and be stripped; dim/faint (SGR 2) is stripped regardless. Assumes a dark terminal theme (bin/fm-composer-lib.sh's fm_composer_strip_ghost, used by styled tmux, herdr, and Zellij reads)
+# Telegram captain-comms; presence-gated on ~/.config/fm-telegram.env (docs/telegram.md)
+FM_TG_ENV_OVERRIDE=     # alternate Telegram config file; default ~/.config/fm-telegram.env, mainly for tests
+FM_TG_HOOK_MAX=1800     # seconds the Stop hook's long poll may live; must stay under its registered hook timeout
+FM_TG_WAIT_MAX=3600     # seconds one fm-tg-wait.sh run may live when invoked directly; the Stop hook passes FM_TG_HOOK_MAX instead
+FM_TG_WAIT_BACKOFF=2    # base seconds multiplied by the consecutive-unusable-pass count before the long poll retries
+FM_TG_WAIT_BACKOFF_MAX=60   # cap on that backoff, also bounded by what is left of the run's own lifetime
+FM_TG_TURNEND_BLOCK_BUDGET=3   # re-blocks either Telegram Stop hook may impose for one unchanged unanswered condition; a new or newly-answered message resets the count
+FM_TG_TURNEND_BLOCK_TTL=3600   # seconds after the last block before an exhausted budget lets the same unchanged condition speak up again
+FM_TG_FETCH_BUDGET=     # whole-second wall-clock budget the caller hands fm-tg-fetch.py; the watcher poll derives it from FM_CHECK_TIMEOUT
+FM_TG_LIMIT=3900        # per-message character budget before a reply is split; under Telegram's 4096 to leave room for a part marker
+FM_TG_ACK=              # internal: set by the arrival-time acknowledgement so it is never mistaken for a real reply
+FM_TG_FORCE=            # bypass the primary-checkout identity check; for tests and deliberate manual sends only
 GROK_HOME=              # optional Grok config home for firstmate's global grok turn-end hook; defaults to ~/.grok
 FM_SEND_RETRIES=3       # fm-send Enter-retry attempts after typing the line once
 FM_SEND_SLEEP=0.4       # seconds between fm-send submit checks

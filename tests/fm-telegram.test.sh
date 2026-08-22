@@ -830,6 +830,49 @@ test_poll_sh_end_to_end() {
   pass "telegram: bin/fm-tg-poll.sh (the state/tg-watch.check.sh watcher artifact) fetches, records, and acks end-to-end"
 }
 
+test_poll_reports_a_refusal_once() {
+  local home env out
+
+  home="$TMP_ROOT/poll-refusal-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+
+  # A revoked token, a duplicate poller and a rate limit all come back as an
+  # error body curl transfers perfectly, which used to look exactly like a
+  # captain who had not written: no output, no wake, no trace anywhere.
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":false,"error_code":401,"description":"Unauthorized"}'
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  assert_contains "$out" "refused the poll" "a Telegram refusal must be reported, not swallowed as a quiet channel"
+  assert_contains "$out" "401" "the report must carry Telegram's own reason so the captain can tell a revoked token from a rate limit"
+  assert_present "$home/state/.tg-poll-error" "the refusal must be recorded so the same failure is not reported on every poll"
+
+  # Every 30s for as long as the token stays revoked is not a wake; report once.
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  [ -z "$out" ] || fail "the same standing refusal was reported again: $out"
+
+  # A different refusal is news again.
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 30"}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  assert_contains "$out" "429" "a different refusal must be reported rather than suppressed by the previous one"
+
+  # A usable poll clears the record, so a recurrence is reported again.
+  fm_tg_getupdates_fixture "$TMP_ROOT" '{"ok":true,"result":[]}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  [ -z "$out" ] || fail "a healthy quiet poll printed output: $out"
+  assert_absent "$home/state/.tg-poll-error" "a usable poll must clear the refusal record"
+
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":false,"error_code":401,"description":"Unauthorized"}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  assert_contains "$out" "401" "a refusal recurring after a healthy poll must be reported again"
+
+  unset FAKE_TG_GETUPDATES_FILE
+  pass "telegram: the watcher poll reports a refused channel once per distinct reason instead of looking quiet"
+}
+
 # --- an unusable answer is not a good pass -----------------------------------
 
 test_wait_backs_off_on_error_body() {
@@ -1027,5 +1070,6 @@ test_large_png_uses_senddocument
 test_small_png_uses_sendphoto
 test_upload_timeout_explicit_message
 test_poll_sh_end_to_end
+test_poll_reports_a_refusal_once
 test_poll_without_a_timeout_binary
 test_records_are_private_and_left_whole

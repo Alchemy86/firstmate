@@ -50,7 +50,9 @@ keys on: Telegram answers a duplicate getUpdates on one token with an immediate
 409, and a revoked token with a 401, both of which curl reports as a perfectly
 successful transfer of an error body. Treating those as a good pass re-polled
 with no delay at all, spinning that loop at ~16 calls a second for the whole
-Stop-hook window.
+Stop-hook window. An unusable response also names itself on stderr, so
+bin/fm-tg-poll.sh can report WHY the channel refused rather than leaving a
+revoked token indistinguishable from a captain who has not written.
 """
 import json
 import os
@@ -198,6 +200,32 @@ def write_offset(offset_file, last):
     records.write_atomic(offset_file, str(last + 1))
 
 
+def describe_refusal(data):
+    """Telegram's own words for why it refused, short enough for one line."""
+    if not isinstance(data, dict):
+        return "malformed reply"
+    code = data.get("error_code")
+    desc = data.get("description")
+    if not isinstance(desc, str) or not desc.strip():
+        desc = "no description"
+    desc = " ".join(desc.split())[:120]
+    if isinstance(code, int):
+        return "%d %s" % (code, desc)
+    return desc
+
+
+def refuse(reason):
+    """Name the refusal on stderr so a caller can report it, not just count it.
+
+    The exit status alone tells a caller that the response was unusable; only
+    the body says whether that is a revoked token, a duplicate poller, or a
+    rate limit, which is the difference between something the captain must fix
+    and something that clears itself.
+    """
+    sys.stderr.write("%s\n" % reason)
+    return UNUSABLE
+
+
 def main():
     global DEADLINE
     mode, inbox, offset_file, send_script = sys.argv[1:5]
@@ -207,9 +235,9 @@ def main():
     try:
         data = json.load(sys.stdin)
     except Exception:
-        return UNUSABLE
+        return refuse("malformed reply")
     if not isinstance(data, dict) or not data.get("ok"):
-        return UNUSABLE
+        return refuse(describe_refusal(data))
     results = data.get("result") or []
     if not results:
         return 0
