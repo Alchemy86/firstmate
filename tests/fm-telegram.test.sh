@@ -349,7 +349,7 @@ test_undownloadable_media_still_surfaces() {
 # --- the unsurfaced-retirement notice is not swallowed ----------------------
 
 test_unsurfaced_retirement_is_recorded() {
-  local home env inbox fresh_ts
+  local home env inbox fresh_ts elapsed
 
   home="$TMP_ROOT/notice-home"
   mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
@@ -369,6 +369,13 @@ test_unsurfaced_retirement_is_recorded() {
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'a reply' >"$TMP_ROOT/notice-out" 2>&1
   expect_code 0 "$?" "fm-tg-send.sh failed: $(cat "$TMP_ROOT/notice-out")"
   rm -f "$TMP_ROOT/notice-out"
+
+  # The record is only eligible while it is inside that 10s window, so this
+  # assertion silently depends on the whole send finishing within it. Name that
+  # dependency outright: a slower send path must fail as what it is, not as a
+  # phantom defect in the notice path below.
+  elapsed=$(( $(date +%s) - fresh_ts ))
+  [ "$elapsed" -lt 10 ] || fail "the send took ${elapsed}s, outside the 10s same-turn window this test's fixture depends on"
 
   assert_present "$home/state/.tg-archive.log" "an unsurfaced retirement must be recorded somewhere durable"
   assert_grep "retired unsurfaced" "$home/state/.tg-archive.log" "the retirement notice must name what happened"
@@ -410,16 +417,41 @@ test_config_absent_hooks_silent() {
 
   # A half-configured file is not configuration either: a token with no chat id
   # cannot reach the captain, so it must stay just as inert.
+  #
+  # The two POLLERS matter most here, and used to gate on TG_TOKEN alone. A
+  # token-only file left them fetching real inbound updates while
+  # bin/fm-tg-fetch.py's captain-impersonation filter had no configured chat id
+  # to compare against - so anyone who found the bot's public username was
+  # recorded and surfaced as the captain. Both must now refuse outright.
   printf 'TG_TOKEN=faketoken\n' > "$home/half.env"
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/half.env" FM_TG_WAIT_MAX=1 \
     "$sbin/fm-tg-hook.sh" >"$TMP_ROOT/absent-hook-out" 2>&1 </dev/null
   expect_code 0 "$?" "fm-tg-hook.sh with a chat-id-less config"
   [ ! -s "$TMP_ROOT/absent-hook-out" ] || fail "fm-tg-hook.sh printed output with a half config: $(cat "$TMP_ROOT/absent-hook-out")"
 
+  # With a stranger's message genuinely waiting on the wire, so this is the real
+  # hole and not merely a quiet channel.
+  printf '{"ok":true,"result":[{"update_id":300,"message":{"chat":{"id":424242},"date":%s,"text":"i am not the captain"}}]}' \
+    "$(date +%s)" > "$home/stranger.json"
+
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/half.env" FAKE_TG_GETUPDATES_FILE="$home/stranger.json" \
+    "$sbin/fm-tg-poll.sh" >"$TMP_ROOT/absent-poll-out" 2>&1
+  expect_code 0 "$?" "fm-tg-poll.sh with a chat-id-less config"
+  [ ! -s "$TMP_ROOT/absent-poll-out" ] \
+    || fail "fm-tg-poll.sh polled with no chat id to filter inbound updates against: $(cat "$TMP_ROOT/absent-poll-out")"
+
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$home/half.env" FM_TG_WAIT_MAX=1 \
+    FAKE_TG_GETUPDATES_FILE="$home/stranger.json" \
+    "$sbin/fm-tg-wait.sh" >"$TMP_ROOT/absent-wait-out" 2>&1 </dev/null
+  expect_code 0 "$?" "fm-tg-wait.sh with a chat-id-less config"
+  [ ! -s "$TMP_ROOT/absent-wait-out" ] \
+    || fail "fm-tg-wait.sh long-polled with no chat id to filter inbound updates against: $(cat "$TMP_ROOT/absent-wait-out")"
+
   assert_absent "$home/state/tg-inbox" "no config must never create state/tg-inbox"
   assert_absent "$home/state/tg-processed" "no config must never create state/tg-processed"
-  rm -f "$TMP_ROOT/absent-guard-out" "$TMP_ROOT/absent-hook-out" "$TMP_ROOT/absent-poll-out"
-  pass "telegram: absent or half config -> guard, hook, and poll all exit 0 silently, nothing created (identity-neutralized, so the config-absent path is actually exercised)"
+  rm -f "$TMP_ROOT/absent-guard-out" "$TMP_ROOT/absent-hook-out" \
+    "$TMP_ROOT/absent-poll-out" "$TMP_ROOT/absent-wait-out"
+  pass "telegram: absent or half config -> guard, hook, poll, and the long-poll waiter all exit 0 silently, nothing created (identity-neutralized, so the config-absent path is actually exercised)"
 }
 
 # --- crew worktree: send refuses, hooks no-op -------------------------------
@@ -614,8 +646,9 @@ test_arrival_ack_guard_reply_pipeline() {
 #
 # Final, captain-approved semantics (a no-mistakes review finding on this
 # branch, captain's own design calls for both parts):
-#   - SURFACED at least once (bin/fm-tg-drain.py stamps surfaced_ts on first
-#     surfacing): ALWAYS retire on any real reply, however much later.
+#   - SURFACED at least once (bin/fm-tg-drain.py counts each surfacing in the
+#     record's "surfaced" field, which is the whole of what the retirement
+#     rule reads): ALWAYS retire on any real reply, however much later.
 #   - NEVER surfaced: retire ONLY within a short (10s) window of arrival - the
 #     genuine same-turn race, where a message that will imminently be shown
 #     has not yet had a surfacing pass run. Older than that and still never
@@ -659,9 +692,9 @@ test_archive_never_surfaced_old_stays_pending() {
   # sweep up a message the model has genuinely never had a chance to see.
   printf '{"update_id": 51, "chat_id": 999, "ts": %s, "text": "old and unsurfaced"}' "$old_ts" > "$inbox/51.json"
 
-  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'unrelated proactive update' >/tmp/race-old-out 2>&1
-  expect_code 0 "$?" "fm-tg-send.sh failed: $(cat /tmp/race-old-out)"
-  rm -f /tmp/race-old-out
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'unrelated proactive update' >"$TMP_ROOT/race-old-out" 2>&1
+  expect_code 0 "$?" "fm-tg-send.sh failed: $(cat "$TMP_ROOT/race-old-out")"
+  rm -f "$TMP_ROOT/race-old-out"
 
   assert_present "$inbox/51.json" \
     "an old (>10s), never-surfaced message must NOT be retired by an unrelated reply - this is the 'no message lost' fix"
@@ -693,11 +726,11 @@ test_archive_surfaced_always_retires_regardless_of_age() {
   old_ts=$(( $(date +%s) - 3600 ))   # arrived an hour ago
 
   # Surfaced (drain already ran on it), but the reply happens to come a long
-  # time after that surfacing. "Keyed on first-surfaced time" means this
-  # always retires - there is no window for a record the model has genuinely
-  # already been shown.
-  printf '{"update_id": 64, "chat_id": 999, "ts": %s, "text": "old but surfaced", "surfaced": 1, "surfaced_ts": %s}' \
-    "$old_ts" "$old_ts" > "$home/state/tg-inbox/64.json"
+  # time after that surfacing. Having been surfaced at all is the whole test -
+  # there is no window for a record the model has genuinely already been shown,
+  # so an old arrival time must not save it.
+  printf '{"update_id": 64, "chat_id": 999, "ts": %s, "text": "old but surfaced", "surfaced": 1}' \
+    "$old_ts" > "$home/state/tg-inbox/64.json"
 
   python3 "$ROOT/bin/fm-tg-archive.py" "$home/state/tg-inbox" "$home/state/tg-processed" >/dev/null
   assert_absent "$home/state/tg-inbox/64.json" "a surfaced record must always retire on a real reply, however much later"
@@ -743,8 +776,8 @@ test_fetch_drops_mismatched_chat_id() {
   set +a
 
   out=$(printf '{"ok":true,"result":[{"update_id":70,"message":{"chat":{"id":424242},"date":%s,"text":"i am not the captain"}}]}' "$(date +%s)" \
-    | python3 "$ROOT/bin/fm-tg-fetch.py" poll "$inbox" "$offset" "$send" 2>/tmp/chatfilter-err)
-  err=$(cat /tmp/chatfilter-err); rm -f /tmp/chatfilter-err
+    | python3 "$ROOT/bin/fm-tg-fetch.py" poll "$inbox" "$offset" "$send" 2>"$TMP_ROOT/chatfilter-err")
+  err=$(cat "$TMP_ROOT/chatfilter-err"); rm -f "$TMP_ROOT/chatfilter-err"
 
   assert_absent "$inbox/70.json" "an update from a mismatched chat_id must never be recorded as a captain message"
   [ -z "$out" ] || fail "a dropped update must not report a new message: $out"
@@ -774,6 +807,87 @@ test_fetch_accepts_matching_chat_id() {
   assert_present "$inbox/71.json" "a matching chat_id must still be recorded normally"
   assert_contains "$out" "telegram: 1 message(s)" "a matching chat_id must still report as a new message"
   pass "telegram: an update whose chat_id matches TG_CHAT_ID is recorded normally (the filter is not over-broad)"
+}
+
+# --- a malformed update must not stall the channel -------------------------
+# --- Every acknowledgement offset is update_id + 1, so an update with no  ---
+# --- usable update_id used to raise an uncaught TypeError that aborted    ---
+# --- the batch: nothing recorded, the offset left behind the payload, the ---
+# --- same bytes refetched and crashed on for ever - and silently, because ---
+# --- a traceback's exit 1 reads to the poller exactly like a good poll.   ---
+
+test_fetch_survives_unusable_update_id() {
+  local home env inbox offset send out rc err
+  home="$TMP_ROOT/badid-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")   # TG_CHAT_ID=999
+  inbox="$home/state/tg-inbox"
+  offset="$home/state/.tg-offset"
+  send="$ROOT/bin/fm-tg-send.sh"
+  mkdir -p "$inbox"
+
+  set -a
+  # shellcheck source=/dev/null
+  . "$env"
+  set +a
+
+  # A whole payload of unacknowledgeable updates: reported as a refusal, which
+  # is what bin/fm-tg-poll.sh surfaces, rather than passing for a quiet channel.
+  out=$(printf '{"ok":true,"result":[{"message":{"chat":{"id":999},"date":%s,"text":"no id at all"}}]}' "$(date +%s)" \
+    | python3 "$ROOT/bin/fm-tg-fetch.py" poll "$inbox" "$offset" "$send" 2>"$TMP_ROOT/badid-err")
+  rc=$?
+  err=$(cat "$TMP_ROOT/badid-err"); rm -f "$TMP_ROOT/badid-err"
+
+  expect_code 3 "$rc" "an unacknowledgeable payload must be reported as a refusal, not crash or pass for a quiet channel"
+  assert_contains "$err" "update_id" "the refusal must name what was wrong with the update"
+  [ -z "$out" ] || fail "a malformed update must not be reported as a captain message: $out"
+  assert_absent "$offset" "an update that cannot be acknowledged must not move the offset"
+
+  # A malformed update alongside a real one must not cost the real one: it is
+  # skipped, the good message is still recorded, and the offset still advances.
+  out=$(printf '{"ok":true,"result":[{"update_id":"not-a-number","message":{"chat":{"id":999},"date":%s,"text":"junk"}},{"update_id":73,"message":{"chat":{"id":999},"date":%s,"text":"the real one"}}]}' "$(date +%s)" "$(date +%s)" \
+    | python3 "$ROOT/bin/fm-tg-fetch.py" poll "$inbox" "$offset" "$send" 2>/dev/null)
+  rc=$?
+
+  expect_code 0 "$rc" "one malformed update must not abort the rest of the batch"
+  assert_contains "$out" "the real one" "the good message in a part-malformed batch must still be reported"
+  assert_present "$inbox/73.json" "the good message in a part-malformed batch must still be recorded"
+  [ "$(cat "$offset")" = "74" ] || fail "the offset must advance past the good update: got $(cat "$offset" 2>/dev/null)"
+
+  unset TG_TOKEN TG_CHAT_ID
+  pass "telegram: an update with no usable update_id is skipped and reported, never a crash that stalls the channel"
+}
+
+test_fetch_nonmessage_update_is_not_a_chat_mismatch() {
+  local home env inbox offset send err
+  home="$TMP_ROOT/nonmessage-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")   # TG_CHAT_ID=999
+  inbox="$home/state/tg-inbox"
+  offset="$home/state/.tg-offset"
+  send="$ROOT/bin/fm-tg-send.sh"
+  mkdir -p "$inbox"
+
+  set -a
+  # shellcheck source=/dev/null
+  . "$env"
+  set +a
+
+  # An ordinary non-message update kind. It carries no chat to compare, so
+  # deciding the chat filter first described it as a wrong-chat sender - the
+  # one line an operator reads while chasing an impersonation report.
+  printf '{"ok":true,"result":[{"update_id":75,"my_chat_member":{"chat":{"id":999}}}]}' \
+    | python3 "$ROOT/bin/fm-tg-fetch.py" poll "$inbox" "$offset" "$send" \
+      >/dev/null 2>"$TMP_ROOT/nonmessage-err"
+  err=$(cat "$TMP_ROOT/nonmessage-err"); rm -f "$TMP_ROOT/nonmessage-err"
+
+  assert_not_contains "$err" "dropped update" \
+    "an ordinary non-message update must never be reported as a wrong-chat sender"
+  assert_absent "$inbox/75.json" "a non-message update carries nothing to record"
+  [ "$(cat "$offset")" = "76" ] || fail "the offset must still advance past a non-message update: got $(cat "$offset" 2>/dev/null)"
+
+  unset TG_TOKEN TG_CHAT_ID
+  pass "telegram: an ordinary non-message update advances the offset without being blamed on a wrong chat_id"
 }
 
 # --- several messages, one arriving mid-turn: all surface, in order --------
@@ -1294,6 +1408,8 @@ test_archive_surfaced_always_retires_regardless_of_age
 test_archive_missing_ts_never_retired
 test_fetch_drops_mismatched_chat_id
 test_fetch_accepts_matching_chat_id
+test_fetch_survives_unusable_update_id
+test_fetch_nonmessage_update_is_not_a_chat_mismatch
 test_multiple_messages_mid_turn_none_swallowed
 test_drain_retries_failed_ack
 test_large_png_uses_senddocument

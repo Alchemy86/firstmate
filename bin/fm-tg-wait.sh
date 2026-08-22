@@ -2,7 +2,7 @@
 # Block until the captain sends a Telegram message, then print it and exit.
 # Run as a harness-tracked background task, or invoked from bin/fm-tg-hook.sh's
 # Stop hook: its completion IS the ping. Completely inert with no
-# ~/.config/fm-telegram.env or an empty TG_TOKEN.
+# ~/.config/fm-telegram.env, or with either of TG_TOKEN and TG_CHAT_ID empty.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,7 +22,12 @@ set -a
 # shellcheck source=/dev/null # ENVF is a resolved runtime path, not a repo file
 . "$ENVF"
 set +a
-[ -n "${TG_TOKEN:-}" ] || exit 0
+# Both values, exactly as fm_tg_configured requires (bin/fm-tg-hook-lib.sh).
+# TG_CHAT_ID is not just addressing: bin/fm-tg-fetch.py's captain-impersonation
+# filter compares every inbound update against it, and a token-only config left
+# that filter with nothing to compare, so any stranger who knows the bot's
+# public username was recorded and surfaced as the captain.
+if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then exit 0; fi
 
 # The captain's message bodies and the offset are private state; keep whatever
 # this waiter creates owner-only, matching bin/fm-tg-poll.sh.

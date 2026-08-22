@@ -9,7 +9,8 @@
 # New messages are recorded to state/tg-inbox/<update_id>.json and acknowledged
 # the moment they arrive, here - not at firstmate's turn end. See
 # bin/fm-tg-fetch.py for why arrival time is the only correct moment.
-# Completely inert with no ~/.config/fm-telegram.env or an empty TG_TOKEN.
+# Completely inert with no ~/.config/fm-telegram.env, or with either of
+# TG_TOKEN and TG_CHAT_ID empty.
 #
 # Everything here has to finish inside the watcher's own per-check bound: the
 # watcher kills a check's whole process group at FM_CHECK_TIMEOUT (default 30s,
@@ -42,7 +43,12 @@ set -a
 # shellcheck source=/dev/null # ENVF is a resolved runtime path, not a repo file
 . "$ENVF"
 set +a
-[ -n "${TG_TOKEN:-}" ] || exit 0
+# Both values, exactly as fm_tg_configured requires (bin/fm-tg-hook-lib.sh).
+# TG_CHAT_ID is not just addressing: bin/fm-tg-fetch.py's captain-impersonation
+# filter compares every inbound update against it, and a token-only config left
+# that filter with nothing to compare, so any stranger who knows the bot's
+# public username was recorded and surfaced as the captain.
+if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then exit 0; fi
 
 # The captain's message bodies, the offset, and any downloaded media are
 # private state, so everything this poll creates is owner-only (the same

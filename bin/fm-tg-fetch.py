@@ -52,7 +52,11 @@ successful transfer of an error body. Treating those as a good pass re-polled
 with no delay at all, spinning that loop at ~16 calls a second for the whole
 Stop-hook window. An unusable response also names itself on stderr, so
 bin/fm-tg-poll.sh can report WHY the channel refused rather than leaving a
-revoked token indistinguishable from a captain who has not written.
+revoked token indistinguishable from a captain who has not written. Anything
+else that goes wrong - an update carrying no usable update_id, or any
+unexpected failure at all - takes the same route, because a bare traceback's
+exit 1 reads to a caller exactly like a usable poll: the error record gets
+cleared while the same unacknowledgeable payload is refetched for ever.
 
 CHAT-ID FILTER (2026-08-22, a no-mistakes review finding, captain-approved).
 Telegram bots accept a direct message from ANYONE who knows the bot's public
@@ -260,9 +264,29 @@ def main():
     configured_chat_id = os.environ.get("TG_CHAT_ID") or ""
 
     new_texts = []
+    unusable_updates = 0
     for update in results:
         uid = update.get("update_id")
+        # Every acknowledgement offset is uid + 1, so an update carrying no
+        # usable update_id cannot be acknowledged and must not be allowed to
+        # abort the batch: an uncaught TypeError here left the offset behind
+        # this payload, so the very next poll refetched it and crashed again -
+        # a permanent stall of the captain channel, invisible because the
+        # traceback's exit 1 is not the UNUSABLE the pollers report on.
+        if isinstance(uid, bool) or not isinstance(uid, int):
+            sys.stderr.write(
+                "telegram: skipped an update with no usable update_id (%r)\n" % (uid,))
+            unusable_updates += 1
+            continue
         message = update.get("message") or update.get("edited_message") or {}
+        if not message:
+            # Not a captain message at all - a chat-member change, a poll
+            # answer, some other update kind. Nothing was sent to record, and
+            # deciding that before the chat filter keeps an ordinary update
+            # kind out of the drop notice an operator reads while chasing an
+            # impersonation report.
+            write_offset(offset_file, uid)
+            continue
         msg_chat_id = (message.get("chat") or {}).get("id")
         if configured_chat_id and str(msg_chat_id) != str(configured_chat_id):
             sys.stderr.write(
@@ -277,11 +301,6 @@ def main():
         # real even when its bytes cannot be fetched right now.
         fid = media_file_id(message)
         if not text.strip() and not fid:
-            if not message:
-                # Not a captain message at all - a chat-member change, a poll
-                # answer, some other update kind. Nothing was sent to record.
-                write_offset(offset_file, uid)
-                continue
             text = describe_contentless(message)
         path = os.path.join(inbox, "%s.json" % uid)
         if os.path.exists(path):
@@ -315,6 +334,11 @@ def main():
         new_texts.append(text)
 
     if not new_texts:
+        if unusable_updates and unusable_updates == len(results):
+            # Nothing in this payload could be acknowledged, so Telegram hands
+            # back the same bytes next time. Report it as a refusal instead of
+            # letting it read as a quiet channel and retry unbounded in silence.
+            return refuse("no usable update_id in %d update(s)" % unusable_updates)
         return 0
 
     if mode == "poll":
@@ -327,4 +351,11 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        # Any unexpected failure on one update is a refusal a caller can see and
+        # report, never a bare traceback: bin/fm-tg-poll.sh keys on UNUSABLE, so
+        # an exit 1 here was indistinguishable from a usable poll and quietly
+        # cleared the error record while the same payload retried forever.
+        sys.exit(refuse("fetch failed: %s: %s" % (type(exc).__name__, exc)))

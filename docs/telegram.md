@@ -84,6 +84,10 @@ A revoked token (401), a lasting conflict with the Stop hook's own long poll (40
 `bin/fm-tg-fetch.py` names the refusal on stderr, and the poll prints one `telegram: the channel refused the poll (...)` line carrying Telegram's own reason.
 That line is recorded in `state/.tg-poll-error` and reported once per distinct reason, so one standing failure does not wake firstmate every 30 seconds; the next usable poll clears the record, so a recurrence is reported again (the same shape `bin/fm-tool-update-check.sh` uses for `state/.tool-updates`).
 
+Anything else that goes wrong inside the fetch takes that same route, for the same reason.
+Every acknowledgement offset is `update_id + 1`, so an update carrying no usable `update_id` cannot be acknowledged: it is skipped with its own stderr line, and a payload of nothing but such updates is reported as a refusal.
+Any unexpected failure at all is reported the same way, because a bare traceback exits `1`, which reads to the poller exactly like a usable poll - it would clear the error record while the same unacknowledgeable payload was refetched for ever, in silence.
+
 ### Stop hook registration
 
 The two Stop hooks are registered in this repository's own tracked `.claude/settings.json`, project-scoped rather than in the user's global `~/.claude/settings.json`.
@@ -119,6 +123,9 @@ Telegram bots accept a direct message from anyone who knows the bot's public use
 
 **Fix.** `bin/fm-tg-fetch.py` drops any update whose chat id does not match `TG_CHAT_ID`, before it is ever recorded, with a visible (never silent) line to stderr naming both the offending and the configured chat id so a legitimately wrong-chat message from the captain himself is diagnosable rather than a silent mystery.
 The accepted cost: the captain must message from the chat he originally paired with the bot.
+
+That check has nothing to compare against when `TG_CHAT_ID` is empty, so `bin/fm-tg-poll.sh` and `bin/fm-tg-wait.sh` both require `TG_TOKEN` *and* `TG_CHAT_ID` before they fetch anything at all - the same two-value test `fm_tg_configured` applies to the Stop hooks.
+A token-only config file is not configuration; it is simply inert, exactly like an absent one.
 
 ### No message is lost
 
