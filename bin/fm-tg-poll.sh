@@ -26,6 +26,11 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 ENVF="${FM_TG_ENV_OVERRIDE:-$HOME/.config/fm-telegram.env}"
 
+# fm_run_timed: the repo's single owner of bounded execution. A bare `timeout`
+# is absent on macOS, where this check would have silently never polled.
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
+
 [ -f "$ENVF" ] || exit 0
 set -a
 # shellcheck source=/dev/null # ENVF is a resolved runtime path, not a repo file
@@ -33,6 +38,10 @@ set -a
 set +a
 [ -n "${TG_TOKEN:-}" ] || exit 0
 
+# The captain's message bodies, the offset, and any downloaded media are
+# private state, so everything this poll creates is owner-only (the same
+# umask 077 bin/fm-check-register.sh uses for its trust records).
+umask 077
 IN="$STATE/tg-inbox"
 OFF="$STATE/.tg-offset"
 mkdir -p "$IN"
@@ -48,7 +57,7 @@ GETUPDATES_TMO=$(( CHECK_BUDGET / 4 ))
 [ "$GETUPDATES_TMO" -gt 10 ] && GETUPDATES_TMO=10
 
 started=$(date +%s)
-resp=$(timeout "$GETUPDATES_TMO" curl -s --max-time "$GETUPDATES_TMO" \
+resp=$(fm_run_timed "$GETUPDATES_TMO" curl -s --max-time "$GETUPDATES_TMO" \
   "https://api.telegram.org/bot$TG_TOKEN/getUpdates?offset=$offset&timeout=0" 2>/dev/null) || exit 0
 [ -n "$resp" ] || exit 0
 

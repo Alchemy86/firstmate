@@ -31,7 +31,9 @@ on every following cycle ("..." spam) and never recorded at all. So:
   * The inbox record and the offset are written FIRST, before the ack and
     before any media download, so the durable "this update is handled" facts
     survive even a kill mid-download. The ack and the media path are folded
-    into the record afterwards.
+    into the record afterwards. Each of those writes is all-or-nothing, and
+    owner-only: bin/fm_tg_records.py owns both properties for every script
+    that touches a captain message.
   * A message whose media could not be fetched inside the budget is still
     recorded and still surfaces, carrying its file id, rather than being
     dropped as "no text and no media".
@@ -48,6 +50,10 @@ import os
 import sys
 import time
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import fm_tg_records as records          # noqa: E402
 
 # Ceilings used when no budget is imposed (bin/fm-tg-wait.sh runs as its own
 # tracked background task, not inside the watcher's per-check bound).
@@ -142,20 +148,11 @@ def ack_on_arrival(send_script):
 
 
 def write_record(path, rec):
-    try:
-        with open(path, "w") as fh:
-            json.dump(rec, fh, indent=2)
-        return True
-    except Exception:
-        return False
+    return records.write_record(path, rec)
 
 
 def write_offset(offset_file, last):
-    try:
-        with open(offset_file, "w") as fh:
-            fh.write(str(last + 1))
-    except Exception:
-        pass
+    records.write_atomic(offset_file, str(last + 1))
 
 
 def main():

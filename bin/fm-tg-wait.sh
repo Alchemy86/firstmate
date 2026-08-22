@@ -11,6 +11,12 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 ENVF="${FM_TG_ENV_OVERRIDE:-$HOME/.config/fm-telegram.env}"
 
+# fm_run_timed: the repo's single owner of bounded execution. A bare `timeout`
+# is absent on macOS, where every long poll would have failed instantly and,
+# together with the retry paths below, spun this loop at full CPU.
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
+
 [ -f "$ENVF" ] || exit 0
 set -a
 # shellcheck source=/dev/null # ENVF is a resolved runtime path, not a repo file
@@ -18,12 +24,36 @@ set -a
 set +a
 [ -n "${TG_TOKEN:-}" ] || exit 0
 
+# The captain's message bodies and the offset are private state; keep whatever
+# this waiter creates owner-only, matching bin/fm-tg-poll.sh.
+umask 077
 IN="$STATE/tg-inbox"
 OFF="$STATE/.tg-offset"
 DONE="$STATE/tg-processed"
 mkdir -p "$IN"
 MAX=${FM_TG_WAIT_MAX:-3600}    # give up after this long so the task never hangs forever
 start=$(date +%s)
+
+# Every pass that reaches no network spawns a python3 drain plus a curl. The
+# happy path self-paces on Telegram's own 50s long poll, but a failing call
+# returns instantly - offline, no route, DNS failure, connection refused - so
+# without a backoff this loop burned CPU spawning processes for the whole
+# FM_TG_HOOK_MAX window, on every turn end. Back off after each consecutive
+# failure and reset the moment a call succeeds.
+BACKOFF_BASE=${FM_TG_WAIT_BACKOFF:-2}
+case "$BACKOFF_BASE" in ''|*[!0-9]*|0) BACKOFF_BASE=2 ;; esac
+BACKOFF_MAX=${FM_TG_WAIT_BACKOFF_MAX:-60}
+case "$BACKOFF_MAX" in ''|*[!0-9]*|0) BACKOFF_MAX=60 ;; esac
+fails=0
+back_off() {
+  fails=$(( fails + 1 ))
+  local nap=$(( BACKOFF_BASE * fails ))
+  [ "$nap" -gt "$BACKOFF_MAX" ] && nap=$BACKOFF_MAX
+  local left=$(( MAX - ( $(date +%s) - start ) ))
+  [ "$nap" -gt "$left" ] && nap=$left
+  [ "$nap" -gt 0 ] && sleep "$nap"
+  return 0
+}
 
 while :; do
   now=$(date +%s)
@@ -47,8 +77,11 @@ while :; do
 
   offset=$(cat "$OFF" 2>/dev/null || echo 0)
   # long poll: returns as soon as a message arrives, else after 50s
-  resp=$(timeout 70 curl -s "https://api.telegram.org/bot$TG_TOKEN/getUpdates?offset=$offset&timeout=50" 2>/dev/null) || continue
-  [ -n "$resp" ] || continue
+  resp=$(fm_run_timed 70 curl -s --max-time 70 \
+    "https://api.telegram.org/bot$TG_TOKEN/getUpdates?offset=$offset&timeout=50" 2>/dev/null) \
+    || { back_off; continue; }
+  [ -n "$resp" ] || { back_off; continue; }
+  fails=0
   # Bound the fetch by what is left of this waiter's own lifetime, so a slow
   # media download cannot outlive the Stop hook that is waiting on it.
   budget=$(( MAX - ( $(date +%s) - start ) ))

@@ -38,6 +38,10 @@ import os
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import fm_tg_records as records          # noqa: E402  (owner-only umask on import)
+
 inbox, done = sys.argv[1], sys.argv[2]
 os.makedirs(done, exist_ok=True)
 log_path = os.path.join(os.path.dirname(os.path.normpath(inbox)), ".tg-archive.log")
@@ -56,10 +60,7 @@ def notice(line):
         if os.path.getsize(log_path) >= LOG_MAX_BYTES:
             with open(log_path) as fh:
                 kept = fh.readlines()[-LOG_KEEP_LINES:]
-            tmp = log_path + ".tmp"
-            with open(tmp, "w") as fh:
-                fh.writelines(kept)
-            os.replace(tmp, log_path)
+            records.write_atomic(log_path, "".join(kept))
     except Exception:
         pass
 

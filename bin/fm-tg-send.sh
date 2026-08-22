@@ -45,6 +45,11 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # directory is a crew location whether or not git reports it as a worktree.
 # shellcheck source=bin/fm-primary-scope-lib.sh
 . "$SCRIPT_DIR/fm-primary-scope-lib.sh"
+# fm_run_timed: the repo's single owner of bounded execution. A bare `timeout`
+# does not exist on macOS, where every send would have failed to run curl at all
+# and reported the misleading "unparseable reply" of an empty response.
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
 _fmtg_refuse_crew() {
   echo "fm-tg-send: REFUSED - crewmates must not contact the captain." >&2
   echo "  You are in a crew worktree. Report through your status file:" >&2
@@ -149,7 +154,7 @@ if [ "${1:-}" = "--file" ]; then
   # "unparseable reply" rather than anything actionable.
   tmo=$(( 180 + sz / 20000 ))
   [ "$tmo" -gt 900 ] && tmo=900
-  resp=$(timeout "$tmo" curl -s --max-time "$tmo" -X POST "$API/$meth" \
+  resp=$(fm_run_timed "$tmo" curl -s --max-time "$tmo" -X POST "$API/$meth" \
       -F "chat_id=$TG_CHAT_ID" -F "$field=@$f" -F "caption=${cap:0:1000}")
   if [ -z "$resp" ]; then
     echo "telegram: no reply after ${tmo}s uploading $((sz/1048576))MB via $meth - upload timed out" >&2
@@ -204,8 +209,9 @@ while [ "$i" -lt "$n" ]; do
   p=${PARTS[i]}
   i=$((i + 1))
   [ -n "$p" ] || continue
-  timeout 60 curl -s -X POST "$API/sendMessage" -d "chat_id=$TG_CHAT_ID" \
-      --data-urlencode "text=$p" | check || { echo "FAILED mid-send" >&2; exit 1; }
+  fm_run_timed 60 curl -s --max-time 60 -X POST "$API/sendMessage" \
+      -d "chat_id=$TG_CHAT_ID" --data-urlencode "text=$p" \
+      | check || { echo "FAILED mid-send" >&2; exit 1; }
 done
 mark_sent
 echo "sent ($n part(s))"

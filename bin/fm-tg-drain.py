@@ -29,6 +29,10 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import fm_tg_records as records          # noqa: E402
+
 inbox, done = sys.argv[1], sys.argv[2]
 os.makedirs(done, exist_ok=True)
 state_dir = os.path.dirname(os.path.normpath(inbox))
@@ -69,7 +73,10 @@ for _ts, path, rec in rows:
         first_surface = True
     # NEVER archive here; see the module docstring.
     rec["surfaced"] = seen
-    json.dump(rec, open(path, "w"), indent=2)
+    # All-or-nothing: a half-written record is skipped by every reader, and the
+    # message it holds is then never surfaced, never retired and never refetched
+    # (bin/fm_tg_records.py). This hook is interruptible mid-write.
+    records.write_record(path, rec)
 
 if not out:
     sys.exit(1)

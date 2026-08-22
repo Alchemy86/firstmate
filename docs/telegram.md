@@ -24,6 +24,18 @@ To create the bot:
 
 Never commit this file or its values anywhere. `bin/fm-tg-send.sh` and friends read it fresh on every call; no script ever prints `TG_TOKEN` or `TG_CHAT_ID`, and bootstrap's own report line never repeats the chat id back.
 
+### Local privacy of the token and the records
+
+Everything these scripts create under `state/` - the inbox records holding the captain's own words, the poll offset, downloaded media, and the archive log - is written owner-only.
+`bin/fm_tg_records.py` applies `umask 077` on import, covering all three Python scripts, and the poller, the waiter and the Stop hook set the same umask before creating any directory - the bound `bin/fm-check-register.sh` puts on its own private records.
+Without it those files landed at the ambient umask, which leaves the captain's message bodies world-readable on a default-umask host.
+
+**Known, accepted tradeoff: the bot token appears in process arguments.**
+Telegram's Bot API authenticates by putting the token in the request *path* (`https://api.telegram.org/bot<token>/<method>`); it has no header-based scheme, so there is nothing for `curl`'s `--url-query`, `-u`, or an `Authorization` header to carry instead.
+Every `curl` call therefore has the token in its argv, readable with `ps auxww` by any other local user for the duration of that call.
+This is accepted rather than fixed: it is a property of the vendor API, the exposure is local-only, and the token already sits in a file on the same machine.
+A host where other local users are not trusted should not hold `~/.config/fm-telegram.env` at all.
+
 ## What it does
 
 - The captain sends the bot a Telegram message at any time, including mid-turn.
@@ -103,6 +115,11 @@ If the harness did not actually surface that print - which happened repeatedly -
 **Fix.** `bin/fm-tg-archive.py` retires a message ONLY after a real reply has actually been sent (`bin/fm-tg-send.sh` calls it on every send that is not an ack).
 An unanswered message re-surfaces on every subsequent Stop hook firing via `bin/fm-tg-drain.py` instead of disappearing, so a wake the model missed simply tries again next turn.
 
+Every write to a record is also all-or-nothing, through `bin/fm_tg_records.py`.
+A record is the only copy of what the captain sent, and a plain truncating write leaves invalid JSON behind if the process dies mid-write - which every reader then skips for ever, while the offset file has already advanced past that update id, so it is never refetched either.
+Being killed mid-write is routine here, not hypothetical: the watcher terminates a check's whole process group at `FM_CHECK_TIMEOUT`, and the drain runs inside a Stop hook a turn interrupt can end.
+Each update is therefore staged to a sibling temp file and swapped into place, so a record is either its previous contents or its new ones and never a half-written one.
+
 ### No message is answered twice
 
 **Defect (2026-08-22).** The fix above's first version retired a message on its *second* surfacing instead of on a real reply, so every captain message was shown to the model twice on the way to being handled - which is what produced the duplicate replies the captain then received.
@@ -166,6 +183,13 @@ These do not each map to one of the guarantees above, but explain choices in the
 - **`mapfile -d` and bash 3.2.** The outbound text splitter read its NUL-delimited chunks with `mapfile -d ''`, which needs bash >= 4.4.
   macOS still ships `/bin/bash` 3.2, where `mapfile` does not exist at all, so the array stayed unset and the very next line aborted under `set -u` - every text send would have failed there.
   It now reads the chunks with a portable `while IFS= read -r -d ''` loop and counts them as they arrive, because `${#PARTS[@]}` on an empty array is itself an unbound-variable error on those shells.
+- **Bare `timeout` and macOS.** The poller, the waiter and both send paths bounded their `curl` calls with a bare `timeout`, which macOS does not ship.
+  There every send failed before reaching `curl` and reported the misleading `telegram: unparseable reply` of an empty response, the watcher's poll silently never ran, and the waiter's long poll made no network call at all.
+  All four now go through `fm_run_timed` from `bin/fm-timeout-lib.sh`, this repo's single owner of bounded execution, which selects `timeout`, `gtimeout`, `perl` or a pure-Bash watchdog per host.
+- **The waiter spun when the network was down.** `bin/fm-tg-wait.sh`'s retry paths went straight back to the top of the loop with no delay.
+  The happy path self-paces on Telegram's own 50s long poll, but a call that fails instantly - offline, no route, DNS failure, connection refused - does not, and each pass spawns a `python3` drain plus another `curl`.
+  An offline machine therefore burned CPU spawning processes for the whole `FM_TG_HOOK_MAX` window on every single turn end.
+  Consecutive failures now back off (`FM_TG_WAIT_BACKOFF`, default 2s per consecutive failure, capped by `FM_TG_WAIT_BACKOFF_MAX`, default 60s), and the first successful call resets the count.
 - **Single-quoted embedded Python.** Earlier versions of the poller and waiter each embedded a near-identical parsing block as a `python3 -c '...'` single-quoted shell string.
   An apostrophe anywhere in that block - in a code comment, in captain text reflected back into it - broke the enclosing shell script.
   That logic is now the one real file `bin/fm-tg-fetch.py`, imported by argv rather than interpolated into a shell string, shared by both callers.

@@ -32,6 +32,9 @@ fm_tg_hook_foreign_host && exit 0
 fm_tg_configured || exit 0
 "$SCRIPT_DIR/fm-tg-isfirstmate.sh" || exit 0
 
+# The captain's message bodies are private state; whatever this hook creates is
+# owner-only, matching bin/fm_tg_records.py and the two pollers.
+umask 077
 IN="$STATE/tg-inbox"
 DONE="$STATE/tg-processed"
 BUDGET_FILE="$STATE/.turnend-tg-hook-blocks"

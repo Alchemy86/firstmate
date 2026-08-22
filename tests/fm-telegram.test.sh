@@ -20,12 +20,14 @@ TMP_ROOT=$(fm_test_tmproot fm-telegram)
 # same explicitly here since this file also cd's straight into it.
 mkdir -p "$TMP_ROOT"
 
-# fm-tg-guard.sh, fm-tg-hook.sh, and fm-tg-isfirstmate.sh all condemn a cwd
-# under $HOME/.treehouse/* as a crew worktree. This suite itself may be run
-# from inside one (a crewmate working on firstmate's own repo); move the
-# whole suite's default cwd to scratch so that never makes an assertion
-# flaky. Only the crew-worktree tests deliberately cd back under
-# $HOME/.treehouse/* in a subshell.
+# The identity gate condemns a cwd that git reports as a linked worktree
+# (fm_dir_is_child_worktree, via bin/fm-tg-isfirstmate.sh), and bin/fm-tg-send.sh
+# additionally condemns the literal $HOME/.treehouse/* lease path. This suite is
+# routinely run from inside a linked worktree - a crewmate working on firstmate's
+# own repo, or a validation worktree - so move the whole suite's default cwd to
+# scratch, which is neither, so that never makes an assertion flaky. Only the
+# crew-worktree tests deliberately cd back into a condemned location, in a
+# subshell.
 cd "$TMP_ROOT" || fail "could not cd into TMP_ROOT"
 
 # --- fake curl: no live network ---------------------------------------------
@@ -65,19 +67,19 @@ export PATH="$FAKEBIN:$PATH"
 # with fm-tg-isfirstmate.sh replaced by an always-allow stub, and echo the
 # scratch dir. Used only by tests that exercise fm-tg-guard.sh/fm-tg-hook.sh's
 # OWN logic (the timestamp comparison, the drain/wait delegation) - both call
-# the real bin/fm-tg-isfirstmate.sh first and no-op for any session whose
-# ancestry looks like a crewmate. This test suite is frequently run FROM a
-# live crewmate session (dogfooding), whose own real ancestry legitimately
-# carries the crewmate brief marker fm-tg-isfirstmate.sh is designed to
-# detect - so testing the guard/hook's downstream logic needs that one
-# dependency neutralized. The real bin/fm-tg-isfirstmate.sh is never modified;
-# its own condemn/allow contract is tested directly, against the genuine
-# script, in test_isfirstmate_direct below.
+# the real bin/fm-tg-isfirstmate.sh first and no-op when it condemns the
+# session. This suite is routinely run FROM a linked worktree (a crewmate
+# working on firstmate's own repo, or a validation worktree), which that script
+# correctly refuses, so testing the guard/hook's downstream logic at all needs
+# that one dependency neutralized. The real bin/fm-tg-isfirstmate.sh is never
+# modified; its own condemn/allow contract is tested directly, against the
+# genuine script, in test_isfirstmate_direct below.
 fm_tg_scratch_bin() {
   local dir=$1 sbin="$1/bin" f
   mkdir -p "$sbin"
-  for f in "$ROOT"/bin/fm-tg-*.sh "$ROOT"/bin/fm-tg-*.py "$ROOT"/bin/fm-primary-scope-lib.sh \
-    "$ROOT"/bin/fm-hook-host-lib.sh; do
+  for f in "$ROOT"/bin/fm-tg-*.sh "$ROOT"/bin/fm-tg-*.py "$ROOT"/bin/fm_tg_records.py \
+    "$ROOT"/bin/fm-primary-scope-lib.sh "$ROOT"/bin/fm-hook-host-lib.sh \
+    "$ROOT"/bin/fm-timeout-lib.sh; do
     cp "$f" "$sbin/$(basename "$f")"
   done
   cat > "$sbin/fm-tg-isfirstmate.sh" <<'SH'
@@ -95,6 +97,36 @@ fm_tg_env() {
   mkdir -p "$dir"
   printf 'TG_TOKEN=faketoken\nTG_CHAT_ID=999\n' > "$f"
   printf '%s' "$f"
+}
+
+# fm_tg_path_without_timeout <dir>: build a PATH that has every command this
+# host offers EXCEPT `timeout` and `gtimeout`, and echo it. That is macOS's base
+# install, which ships neither, and it is the only way to actually exercise what
+# a bare `timeout` does there rather than assume it.
+fm_tg_path_without_timeout() {
+  local farm=$1/no-timeout-path d f b
+  if [ ! -d "$farm" ]; then
+    mkdir -p "$farm"
+    for d in $(printf '%s' "$PATH" | tr ':' ' '); do
+      [ -d "$d" ] || continue
+      for f in "$d"/*; do
+        b=${f##*/}
+        case "$b" in timeout|gtimeout) continue ;; esac
+        [ -e "$farm/$b" ] || ln -s "$f" "$farm/$b" 2>/dev/null || true
+      done
+    done
+  fi
+  printf '%s' "$FAKEBIN:$farm"
+}
+
+# fm_tg_file_mode <path>: the file's permission bits, portably (macOS stat has
+# no -c). Echoes nothing when the path cannot be read.
+fm_tg_file_mode() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %Lp "$1" 2>/dev/null
+  else
+    stat -c %a "$1" 2>/dev/null
+  fi
 }
 
 # fm_tg_getupdates_fixture <dir> <json>: write a getUpdates result fixture and
@@ -704,6 +736,70 @@ test_upload_timeout_explicit_message() {
   pass "telegram: a stalled/empty upload reply reports an explicit timeout instead of 'unparseable reply'"
 }
 
+# --- portability and durability of the records the captain's words live in ---
+
+test_poll_without_a_timeout_binary() {
+  local home env inbox out nopath
+  home="$TMP_ROOT/no-timeout-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  inbox="$home/state/tg-inbox"
+  nopath=$(fm_tg_path_without_timeout "$TMP_ROOT")
+
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":120,"message":{"chat":{"id":999},"date":500,"text":"no timeout binary here"}}]}'
+
+  # With a bare `timeout` these scripts never invoked curl at all on such a
+  # host: the check exited 0 having silently polled nothing, and every text
+  # reply to the captain died reporting "unparseable reply" for an empty
+  # response. bin/fm-timeout-lib.sh picks a mechanism that exists instead.
+  out=$(PATH="$nopath" FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_contains "$out" "telegram: 1 message(s)" "the poll did not reach curl on a host with no timeout binary"
+  assert_present "$inbox/120.json" "the poll recorded nothing on a host with no timeout binary"
+
+  out=$(cd "$TMP_ROOT" && PATH="$nopath" FM_TG_FORCE=1 FM_HOME="$home" \
+    FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'a real reply' 2>&1)
+  assert_contains "$out" "sent" "a text send did not reach curl on a host with no timeout binary"
+  assert_not_contains "$out" "unparseable reply" "a send with no timeout binary must not report a parse error"
+
+  pass "telegram: the poll and a text send still reach curl on a host with no timeout binary"
+}
+
+test_records_are_private_and_left_whole() {
+  local home env inbox out mode stray f
+  home="$TMP_ROOT/private-records-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  inbox="$home/state/tg-inbox"
+
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":130,"message":{"chat":{"id":999},"date":600,"text":"private words"}}]}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_contains "$out" "telegram: 1 message(s)" "the poll did not record the message"
+
+  # The captain's own words, and the offset that decides what is refetched, are
+  # owner-only; at the ambient umask they were world-readable.
+  for f in "$inbox/130.json" "$home/state/.tg-offset"; do
+    mode=$(fm_tg_file_mode "$f")
+    case "$mode" in
+      600|0600) ;;
+      *) fail "$f is mode $mode, not owner-only" ;;
+    esac
+  done
+
+  # Every record update is staged and swapped, so nothing half-written is ever
+  # visible under the name a reader globs.
+  out=$(python3 "$ROOT/bin/fm-tg-drain.py" "$inbox" "$home/state/tg-processed") \
+    || fail "the drain did not surface the recorded message"
+  assert_grep '"surfaced": 1' "$inbox/130.json" "the drain did not stamp the surfaced counter"
+  stray=$(find "$home/state" -name '*.tmp*' | wc -l | tr -d ' ')
+  [ "$stray" = 0 ] || fail "a staged write was left behind in state/ ($stray file(s))"
+
+  pass "telegram: records and the offset are owner-only, and every update is swapped into place whole"
+}
+
 # --- end-to-end: the actual watcher check-cycle artifact ---------------------
 
 test_poll_sh_end_to_end() {
@@ -747,3 +843,5 @@ test_large_png_uses_senddocument
 test_small_png_uses_sendphoto
 test_upload_timeout_explicit_message
 test_poll_sh_end_to_end
+test_poll_without_a_timeout_binary
+test_records_are_private_and_left_whole
