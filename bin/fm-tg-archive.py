@@ -30,6 +30,15 @@ that file logged each retirement twice and grew the file by a no-op line on
 every single reply - and the log is trimmed once it passes its byte cap, the
 same bound state/.watch-triage.log carries.
 
+RETENTION. Retiring a message moves it into <state>/tg-processed, and any
+attachment stays in <state>/tg-media. Nothing used to prune either, so every
+message the captain had ever sent, and every image, accumulated for the life of
+the home - the one artifact here with no bound, next to a size-capped log and a
+recent-history-capped backlog. The newest PROCESSED_KEEP retired records are
+kept and the rest deleted, and a media file is deleted once nothing references
+it - neither a pending inbox record nor a kept retired one - and it is old
+enough that no download in flight could still be about to claim it.
+
 Usage: fm-tg-archive.py <inbox-dir> <processed-dir>
 """
 import glob
@@ -49,6 +58,12 @@ log_path = os.path.join(os.path.dirname(os.path.normpath(inbox)), ".tg-archive.l
 
 LOG_MAX_BYTES = 262144
 LOG_KEEP_LINES = 2000
+# Retired messages worth keeping for a look back through the captain's history.
+PROCESSED_KEEP = 500
+# An unreferenced media file younger than this may simply be a download whose
+# record has not been updated with its path yet (bin/fm-tg-fetch.py writes the
+# record first, then downloads), so it is never a deletion candidate.
+MEDIA_MIN_AGE = 86400
 
 
 def notice(line):
@@ -65,6 +80,53 @@ def notice(line):
         pass
 
 
+def load(path):
+    try:
+        with open(path) as fh:
+            rec = json.load(fh)
+        return rec if isinstance(rec, dict) else None
+    except Exception:
+        return None
+
+
+def mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def drop(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def prune(inbox_dir, done_dir, media_dir):
+    """Hold tg-processed and tg-media to their documented caps."""
+    retired = sorted(glob.glob(os.path.join(done_dir, "*.json")), key=mtime)
+    for path in retired[:-PROCESSED_KEEP] if len(retired) > PROCESSED_KEEP else []:
+        drop(path)
+
+    if not os.path.isdir(media_dir):
+        return
+    referenced = set()
+    for path in glob.glob(os.path.join(inbox_dir, "*.json")) \
+            + glob.glob(os.path.join(done_dir, "*.json")):
+        rec = load(path)
+        media = (rec or {}).get("media")
+        if media:
+            referenced.add(os.path.abspath(media))
+    cutoff = time.time() - MEDIA_MIN_AGE
+    for name in os.listdir(media_dir):
+        path = os.path.join(media_dir, name)
+        if os.path.abspath(path) in referenced or not os.path.isfile(path):
+            continue
+        if mtime(path) < cutoff:
+            drop(path)
+
+
 n = 0
 for path in glob.glob(os.path.join(inbox, "*.json")):
     try:
@@ -79,4 +141,5 @@ for path in glob.glob(os.path.join(inbox, "*.json")):
         if not seen:
             notice("retired unsurfaced (arrived %ds before reply): %s"
                    % (time.time() - float(rec.get("ts") or 0), os.path.basename(path)))
+prune(inbox, done, os.path.join(os.path.dirname(os.path.normpath(inbox)), "tg-media"))
 print("archived %d" % n)

@@ -79,7 +79,7 @@ fm_tg_scratch_bin() {
   mkdir -p "$sbin"
   for f in "$ROOT"/bin/fm-tg-*.sh "$ROOT"/bin/fm-tg-*.py "$ROOT"/bin/fm_tg_records.py \
     "$ROOT"/bin/fm-primary-scope-lib.sh "$ROOT"/bin/fm-hook-host-lib.sh \
-    "$ROOT"/bin/fm-timeout-lib.sh; do
+    "$ROOT"/bin/fm-timeout-lib.sh "$ROOT"/bin/fm-wake-lib.sh; do
     cp "$f" "$sbin/$(basename "$f")"
   done
   cat > "$sbin/fm-tg-isfirstmate.sh" <<'SH'
@@ -146,7 +146,11 @@ test_bootstrap_registers_poll_shim() {
   mkdir -p "$home/state" "$home/config"
   env=$(fm_tg_env "$home")
 
-  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-bootstrap.sh" >"$TMP_ROOT/arm-out" 2>&1
+  # Only the local telegram_setup sweep is under test here. Without the skip the
+  # run reaches bootstrap's network phase and calls `gh auth status` plus the
+  # fleet-sync and secondmate sweeps against this host's real credentials.
+  FM_BOOTSTRAP_NETWORK=skip FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" \
+    "$ROOT/bin/fm-bootstrap.sh" >"$TMP_ROOT/arm-out" 2>&1
   assert_grep "TELEGRAM: on" "$TMP_ROOT/arm-out" "bootstrap did not arm Telegram for a configured home"
   assert_present "$home/state/tg-watch.check.sh" "bootstrap did not write the poll shim"
   assert_present "$home/config/tg-mode.env" "bootstrap did not write the cadence config"
@@ -165,7 +169,8 @@ test_bootstrap_registers_poll_shim() {
   # Opt-out clears the binding as well as the shim, so nothing stale is left
   # authorising an execution.
   printf 'TG_TOKEN=\nTG_CHAT_ID=\n' > "$env"
-  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-bootstrap.sh" >"$TMP_ROOT/disarm-out" 2>&1
+  FM_BOOTSTRAP_NETWORK=skip FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" \
+    "$ROOT/bin/fm-bootstrap.sh" >"$TMP_ROOT/disarm-out" 2>&1
   assert_grep "TELEGRAM: off" "$TMP_ROOT/disarm-out" "bootstrap did not report the disarm"
   assert_absent "$home/state/tg-watch.check.sh" "opt-out must remove the poll shim"
   assert_absent "$home/state/tg-watch.check-trust" "opt-out must remove the shim's byte binding"
@@ -825,6 +830,185 @@ test_poll_sh_end_to_end() {
   pass "telegram: bin/fm-tg-poll.sh (the state/tg-watch.check.sh watcher artifact) fetches, records, and acks end-to-end"
 }
 
+# --- an unusable answer is not a good pass -----------------------------------
+
+test_wait_backs_off_on_error_body() {
+  local home env fixture calls rc
+
+  home="$TMP_ROOT/spin-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+
+  # Telegram answers a duplicate getUpdates on one token with an immediate 409,
+  # a revoked token with a 401, and a rate limit with a 429. curl reports every
+  # one of those as a completely successful transfer of a NON-EMPTY body, so a
+  # backoff that only covers transport failure never fires: the loop re-polled
+  # with zero delay, measured at ~16 curl+python3 spawn pairs a second for the
+  # whole FM_TG_HOOK_MAX window, on every single turn end.
+  fixture="$TMP_ROOT/spin-fixture.json"
+  printf '{"ok":false,"error_code":409,"description":"terminated by other getUpdates request"}' > "$fixture"
+  export FAKE_TG_GETUPDATES_FILE="$fixture"
+  export FAKE_CURL_LOG="$TMP_ROOT/spin-curl.log"
+  : > "$FAKE_CURL_LOG"
+
+  rc=0
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FM_TG_WAIT_MAX=6 \
+    "$ROOT/bin/fm-tg-wait.sh" >/dev/null 2>&1 || rc=$?
+  expect_code 0 "$rc" "the waiter must still time out cleanly when Telegram only ever refuses"
+
+  calls=$(grep -c getUpdates "$FAKE_CURL_LOG" || true)
+  [ "$calls" -le 5 ] \
+    || fail "the waiter made $calls getUpdates calls in 6s against a {\"ok\":false} body; an unusable answer must back off, not re-poll immediately"
+
+  unset FAKE_TG_GETUPDATES_FILE FAKE_CURL_LOG
+  pass "telegram: an {\"ok\":false} error body is a failed pass and backs the long poll off, not a free full-speed retry"
+}
+
+# --- one long-poll waiter per home ------------------------------------------
+
+test_hook_long_poll_is_single_flight() {
+  local home env sbin calls i
+
+  home="$TMP_ROOT/singleflight-home"
+  mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
+  env=$(fm_tg_env "$home")
+  sbin=$(fm_tg_scratch_bin "$home/scratch")
+
+  # The harness starts a fresh background firing of this hook on EVERY stop and
+  # never dedupes them, and each firing's long poll lives for up to
+  # FM_TG_HOOK_MAX. Without a claim, a busy session accumulates waiters that all
+  # call getUpdates on the one bot token - which is itself what produces the 409
+  # the case above backs off from.
+  export FAKE_CURL_LOG="$TMP_ROOT/singleflight-curl.log"
+  : > "$FAKE_CURL_LOG"
+
+  i=0
+  while [ "$i" -lt 4 ]; do
+    ( FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FM_TG_HOOK_MAX=4 \
+      "$sbin/fm-tg-hook.sh" >/dev/null 2>&1 </dev/null ) &
+    i=$((i + 1))
+  done
+  wait
+
+  # Four concurrent firings, one waiter: the empty-result fixture returns at
+  # once, so a single waiter loops a handful of times in its 4s window while
+  # four would multiply that by four. Bound it well under the four-waiter mark.
+  calls=$(grep -c getUpdates "$FAKE_CURL_LOG" || true)
+  [ "$calls" -gt 0 ] || fail "no firing ran the long poll at all"
+  assert_absent "$home/state/.tg-hook.lock" "the waiter claim must be released when the hook exits"
+
+  # And with a waiter already holding the claim, another firing stands down
+  # immediately instead of starting a second poll.
+  : > "$FAKE_CURL_LOG"
+  ( FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FM_TG_HOOK_MAX=4 \
+    "$sbin/fm-tg-hook.sh" >/dev/null 2>&1 </dev/null ) &
+  local held=$!
+  local waited=0
+  while [ ! -e "$home/state/.tg-hook.lock" ] && [ "$waited" -lt 40 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  [ -e "$home/state/.tg-hook.lock" ] || fail "the live waiter never published its claim"
+  local rc=0
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FM_TG_HOOK_MAX=4 \
+    "$sbin/fm-tg-hook.sh" >/dev/null 2>&1 </dev/null || rc=$?
+  expect_code 0 "$rc" "a firing that cannot claim the waiter must exit 0, not block the turn"
+  wait "$held" 2>/dev/null || true
+
+  unset FAKE_CURL_LOG
+  pass "telegram: at most one long-poll waiter is ever live per home, and its claim is released on exit"
+}
+
+# --- every kind of message the captain can send is recorded ------------------
+
+test_video_note_and_sticker_are_not_dropped() {
+  local home env inbox out
+
+  home="$TMP_ROOT/videonote-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  inbox="$home/state/tg-inbox"
+
+  # A video_note is the round clip a phone records with one tap, and it carries
+  # no text and no caption. It was not in the recognised-media list, so the
+  # update advanced the offset and vanished: no record, no acknowledgement, no
+  # trace on disk, and no way to refetch it. The captain saw his message
+  # delivered and then total silence.
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":300,"message":{"chat":{"id":999},"date":600,"video_note":{"file_id":"vn-1"}}},{"update_id":301,"message":{"chat":{"id":999},"date":601,"sticker":{"file_id":"st-1"}}},{"update_id":302,"message":{"chat":{"id":999},"date":602,"contact":{"phone_number":"1"}}}]}'
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_contains "$out" "telegram: 3 message(s)" "a video_note, a sticker and a contact must all count as messages"
+  assert_grep '"media_id": "vn-1"' "$inbox/300.json" "a video_note must be recorded with its file id"
+  assert_grep '"media_id": "st-1"' "$inbox/301.json" "a sticker must be recorded with its file id"
+  # Something with no text and no fetchable file still has to leave a trace, or
+  # it is silence to the captain.
+  assert_grep 'contact' "$inbox/302.json" "a message with no text and no file must still be recorded, naming what it was"
+
+  # An update that carries no message at all is not something the captain sent,
+  # and must not litter the inbox.
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":303,"my_chat_member":{"chat":{"id":999}}}]}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  [ -z "$out" ] || fail "a non-message update must be skipped silently, not surfaced: $out"
+  assert_absent "$inbox/303.json" "a non-message update must not be recorded as a captain message"
+
+  pass "telegram: a video_note, a sticker, or any other contentless message is recorded and surfaced instead of silently dropped"
+}
+
+# --- retired messages and media do not grow without bound --------------------
+
+test_retired_records_and_media_are_capped() {
+  local home inbox done_dir media i kept
+
+  home="$TMP_ROOT/retention-home"
+  inbox="$home/state/tg-inbox"
+  done_dir="$home/state/tg-processed"
+  media="$home/state/tg-media"
+  mkdir -p "$inbox" "$done_dir" "$media"
+
+  # Every message the captain has ever sent, and every image, used to be kept
+  # for the life of the home - the one artifact here with no bound.
+  i=0
+  while [ "$i" -lt 620 ]; do
+    printf '{"update_id": %d, "ts": %d, "text": "old", "media": "%s/%d.bin"}' \
+      "$i" "$i" "$media" "$i" > "$done_dir/$i.json"
+    touch -t 202001010000 "$done_dir/$i.json"
+    : > "$media/$i.bin"
+    touch -t 202001010000 "$media/$i.bin"
+    i=$((i + 1))
+  done
+  # An orphan too young to be sure of: a download whose record has not been
+  # updated with its path yet must never be swept.
+  : > "$media/in-flight.bin"
+
+  python3 "$ROOT/bin/fm-tg-archive.py" "$inbox" "$done_dir" >/dev/null
+
+  kept=$(find "$done_dir" -name '*.json' | wc -l | tr -d ' ')
+  [ "$kept" -eq 500 ] || fail "tg-processed holds $kept retired records; the documented cap is 500"
+  assert_present "$media/in-flight.bin" "a media file too young to be provably orphaned must be left alone"
+
+  # Media follows its record: everything a kept record still points at survives,
+  # and the media of every pruned record goes with it. Checked as a property
+  # rather than by naming files, since which records fall outside the cap is
+  # decided by mtime.
+  local f id
+  for f in "$done_dir"/*.json; do
+    id=$(basename "$f" .json)
+    assert_present "$media/$id.bin" "media referenced by a kept retired record must not be pruned"
+  done
+  kept=$(find "$media" -name '*.bin' | wc -l | tr -d ' ')
+  [ "$kept" -eq 501 ] || fail "tg-media holds $kept files; expected the 500 still referenced plus the one in-flight orphan"
+
+  pass "telegram: retired messages and downloaded media are held to a documented cap instead of growing for ever"
+}
+
+test_wait_backs_off_on_error_body
+test_hook_long_poll_is_single_flight
+test_video_note_and_sticker_are_not_dropped
+test_retired_records_and_media_are_capped
 test_bootstrap_registers_poll_shim
 test_cadence_config_is_actually_usable
 test_guard_block_budget_bounded

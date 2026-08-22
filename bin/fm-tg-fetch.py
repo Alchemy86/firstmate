@@ -41,9 +41,16 @@ on every following cycle ("..." spam) and never recorded at all. So:
 Usage: fm-tg-fetch.py <poll|wait> <inbox-dir> <offset-file> <send-script>
   poll - print at most one summary line: "telegram: N message(s) ...: <preview>"
   wait - print one "CAPTAIN: <text>" line per new message
-Prints nothing when the response carried no new message. Always exits 0; a
-malformed or empty response is silently ignored, matching the two callers'
-"absence of output means nothing new" contract.
+Prints nothing when the response carried no new message.
+
+EXIT STATUS. 0 means the response was a usable getUpdates payload, whether or
+not it carried anything new; UNUSABLE (3) means it was not - malformed, or an
+{"ok": false} error body. The distinction is what bin/fm-tg-wait.sh's backoff
+keys on: Telegram answers a duplicate getUpdates on one token with an immediate
+409, and a revoked token with a 401, both of which curl reports as a perfectly
+successful transfer of an error body. Treating those as a good pass re-polled
+with no delay at all, spinning that loop at ~16 calls a second for the whole
+Stop-hook window.
 """
 import json
 import os
@@ -67,6 +74,11 @@ ACK_MIN = 3
 
 DEADLINE = None
 
+# Exit status for a response this script could not use (see the module
+# docstring): distinct from 0 so a caller can tell "nothing new" from "Telegram
+# refused us" without parsing the body itself.
+UNUSABLE = 3
+
 
 def remaining():
     """Seconds left in the wall-clock budget, or None when unbounded."""
@@ -86,15 +98,46 @@ def allot(ceiling, floor):
     return max(floor, min(ceiling, int(left)))
 
 
+# Every message kind that carries a downloadable file id. video_note (the round
+# clip a phone records with one tap) and sticker were missing, so a message
+# carrying only one of those had no text and no recognised file id, advanced the
+# offset, and vanished without a record, an acknowledgement, or any trace on
+# disk - a hole straight through the "no message is lost" guarantee, on exactly
+# the phone-first path this feature exists to serve.
+MEDIA_KEYS = ("document", "video", "video_note", "animation", "audio", "voice", "sticker")
+
+# Envelope fields every message carries; anything left over names what the
+# message actually is, which is what a contentless message is described by.
+ENVELOPE_KEYS = frozenset((
+    "message_id", "message_thread_id", "from", "sender_chat", "chat", "date",
+    "edit_date", "reply_to_message", "entities", "caption_entities", "via_bot",
+    "media_group_id", "link_preview_options", "has_protected_content",
+    "is_topic_message", "is_automatic_forward", "author_signature",
+    "forward_origin", "business_connection_id", "reply_markup",
+))
+
+
 def media_file_id(message):
     """The file id of whatever media this message carries, or None."""
     photos = message.get("photo") or []
     if photos:
         return sorted(photos, key=lambda p: p.get("file_size") or 0)[-1].get("file_id")
-    for key in ("document", "video", "animation", "audio", "voice"):
+    for key in MEDIA_KEYS:
         if message.get(key):
             return (message.get(key) or {}).get("file_id")
     return None
+
+
+def describe_contentless(message):
+    """A stand-in body for a message with no text and no fetchable file.
+
+    A contact, a location, a poll, a dice roll: something the captain sent that
+    this script cannot render. Recording it as a placeholder still surfaces it,
+    so he learns it arrived and can say what it was, instead of getting the
+    total silence a dropped update produces.
+    """
+    kinds = sorted(k for k in message if k not in ENVELOPE_KEYS)
+    return "[message with no text: %s]" % (", ".join(kinds) or "empty")
 
 
 def fetch_media(tok, message, fid, media_dir):
@@ -164,9 +207,9 @@ def main():
     try:
         data = json.load(sys.stdin)
     except Exception:
-        return 0
-    if not data.get("ok"):
-        return 0
+        return UNUSABLE
+    if not isinstance(data, dict) or not data.get("ok"):
+        return UNUSABLE
     results = data.get("result") or []
     if not results:
         return 0
@@ -185,8 +228,12 @@ def main():
         # real even when its bytes cannot be fetched right now.
         fid = media_file_id(message)
         if not text.strip() and not fid:
-            write_offset(offset_file, uid)
-            continue
+            if not message:
+                # Not a captain message at all - a chat-member change, a poll
+                # answer, some other update kind. Nothing was sent to record.
+                write_offset(offset_file, uid)
+                continue
+            text = describe_contentless(message)
         path = os.path.join(inbox, "%s.json" % uid)
         if os.path.exists(path):
             write_offset(offset_file, uid)

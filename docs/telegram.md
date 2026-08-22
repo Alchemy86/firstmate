@@ -58,7 +58,7 @@ A host where other local users are not trusted should not hold `~/.config/fm-tel
 | `bin/fm-tg-hook-lib.sh` | The two Stop hooks' shared block budget - see "A hook can never wedge the session" below. |
 | `bin/fm-tg-isfirstmate.sh` | Identity check; exits non-zero for a crewmate session. Defense in depth - see "Only firstmate talks to the captain" below. |
 
-Runtime state - `state/tg-inbox/`, `state/tg-processed/`, `state/tg-media/`, `state/.tg-last-sent`, `state/.tg-last-surfaced`, `state/.tg-offset`, `state/.tg-archive.log`, the two `state/.turnend-tg-*-blocks` budget records, and the generated `state/tg-watch.check.sh` with its `state/tg-watch.check-trust` binding - lives in gitignored `state/`, same as every other task and watcher artifact.
+Runtime state - `state/tg-inbox/`, `state/tg-processed/`, `state/tg-media/`, `state/.tg-last-sent`, `state/.tg-last-surfaced`, `state/.tg-offset`, `state/.tg-archive.log`, the two `state/.turnend-tg-*-blocks` budget records, the `state/.tg-hook.lock` single-flight claim, and the generated `state/tg-watch.check.sh` with its `state/tg-watch.check-trust` binding - lives in gitignored `state/`, same as every other task and watcher artifact.
 Nothing under this feature is ever tracked in git except the `bin/fm-tg-*` scripts themselves and the two Stop hook registrations in `.claude/settings.json`.
 
 ### Bootstrap and the watcher
@@ -136,6 +136,10 @@ The notice is appended to `state/.tg-archive.log` as well as printed, because th
 Only notices go to that log; routing the archive run's whole stdout there instead recorded every retirement twice and appended a no-op line on every single reply.
 The log is trimmed to its last lines once it passes its byte cap, the same bound `state/.watch-triage.log` carries.
 
+Retirement is also bounded.
+A retired message moves into `state/tg-processed/` and its attachment stays in `state/tg-media/`, and nothing used to prune either, so every message the captain had ever sent and every image accumulated for the life of the home - the one artifact here with no cap, next to a size-capped log and a recent-history-capped backlog.
+`bin/fm-tg-archive.py` keeps the newest 500 retired records and deletes the rest, and deletes a media file once nothing references it - neither a pending inbox record nor a kept retired one - and it is more than a day old, so a download whose record has not been updated with its path yet is never swept.
+
 ### The `...` acknowledgement is not a reply
 
 **Defect risk.** Without an explicit signal, the instant `...` acknowledgement firstmate sends the moment a message arrives could itself satisfy "a reply was sent" and let a message be marked answered - and therefore stop re-surfacing - without ever actually being answered.
@@ -190,6 +194,16 @@ These do not each map to one of the guarantees above, but explain choices in the
   The happy path self-paces on Telegram's own 50s long poll, but a call that fails instantly - offline, no route, DNS failure, connection refused - does not, and each pass spawns a `python3` drain plus another `curl`.
   An offline machine therefore burned CPU spawning processes for the whole `FM_TG_HOOK_MAX` window on every single turn end.
   Consecutive failures now back off (`FM_TG_WAIT_BACKOFF`, default 2s per consecutive failure, capped by `FM_TG_WAIT_BACKOFF_MAX`, default 60s), and the first successful call resets the count.
+- **The waiter also spun when Telegram *answered*.** The backoff above only covered a failed transfer, and `curl` reports an HTTP error body as a completely successful one.
+  Telegram returns such a body instantly for conditions this feature genuinely meets: a `409` when two callers share one token (the poll shim and the waiter, by design - see the poller/waiter race above), a `429` rate limit, a `401` for a revoked token.
+  Each of those reset the failure count and re-polled with no delay at all, measured at ~16 `curl` + `python3` spawn pairs a second for the whole window.
+  A pass is now judged on whether `bin/fm-tg-fetch.py` could *use* the response - it exits `3` for a malformed body or an `{"ok": false}` one - rather than on whether `curl` ran, so any answer that produced nothing backs the loop off.
+- **Every Stop firing started its own long poll.** The harness starts a fresh background firing of `bin/fm-tg-hook.sh` on every stop and never deduplicates them, and each firing's long poll lives up to `FM_TG_HOOK_MAX`.
+  A session with frequent turns therefore accumulated waiters, all calling `getUpdates` on the one bot token - which is itself what produces the `409` above, so two accumulated waiters terminated each other's long poll in a tight ping-pong.
+  The long poll now takes a home-scoped claim (`state/.tg-hook.lock`), the same single-flight shape `bin/fm-claude-stop-autoarm.sh` uses for the same harness contract: at most one waiter per home, and every other firing exits 0 having already surfaced anything pending through the drain that runs before the claim.
+- **Message kinds with no text and no recognised file.** `media_file_id()` did not recognise `video_note` (the round clip a phone records with one tap) or `sticker`, so a message carrying only one of those had no text and no file id, advanced the offset, and vanished - no record, no acknowledgement, no trace on disk, and no way to refetch it.
+  Both are now recognised media, and any remaining message with no text and no fetchable file is recorded as a placeholder naming what it was (a contact, a location, a poll) rather than dropped.
+  An update that carries no message at all - a chat-member change, a poll answer - is still skipped silently: it is not something the captain sent.
 - **Single-quoted embedded Python.** Earlier versions of the poller and waiter each embedded a near-identical parsing block as a `python3 -c '...'` single-quoted shell string.
   An apostrophe anywhere in that block - in a code comment, in captain text reflected back into it - broke the enclosing shell script.
   That logic is now the one real file `bin/fm-tg-fetch.py`, imported by argv rather than interpolated into a shell string, shared by both callers.

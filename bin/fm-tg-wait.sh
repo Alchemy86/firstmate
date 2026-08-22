@@ -35,11 +35,17 @@ MAX=${FM_TG_WAIT_MAX:-3600}    # give up after this long so the task never hangs
 start=$(date +%s)
 
 # Every pass that reaches no network spawns a python3 drain plus a curl. The
-# happy path self-paces on Telegram's own 50s long poll, but a failing call
-# returns instantly - offline, no route, DNS failure, connection refused - so
-# without a backoff this loop burned CPU spawning processes for the whole
-# FM_TG_HOOK_MAX window, on every turn end. Back off after each consecutive
-# failure and reset the moment a call succeeds.
+# happy path self-paces on Telegram's own 50s long poll, but a pass that gets no
+# usable answer returns instantly, so without a backoff this loop burned CPU
+# spawning processes for the whole FM_TG_HOOK_MAX window, on every turn end.
+#
+# A failed pass is NOT just a failed transfer. curl reports an HTTP error body
+# as a perfectly successful transfer, and Telegram returns one instantly for the
+# conditions this feature actually meets: a 409 when two getUpdates callers
+# share a token (this waiter and the watcher's own poll shim by design), a 429
+# rate limit, a 401 for a revoked token. Those are ~16 no-delay iterations a
+# second, measured. So the pass is judged on whether the FETCH could use the
+# response (bin/fm-tg-fetch.py exit 3 = unusable), not on whether curl ran.
 BACKOFF_BASE=${FM_TG_WAIT_BACKOFF:-2}
 case "$BACKOFF_BASE" in ''|*[!0-9]*|0) BACKOFF_BASE=2 ;; esac
 BACKOFF_MAX=${FM_TG_WAIT_BACKOFF_MAX:-60}
@@ -81,7 +87,6 @@ while :; do
     "https://api.telegram.org/bot$TG_TOKEN/getUpdates?offset=$offset&timeout=50" 2>/dev/null) \
     || { back_off; continue; }
   [ -n "$resp" ] || { back_off; continue; }
-  fails=0
   # Bound the fetch by what is left of this waiter's own lifetime, so a slow
   # media download cannot outlive the Stop hook that is waiting on it.
   budget=$(( MAX - ( $(date +%s) - start ) ))
@@ -89,6 +94,10 @@ while :; do
   [ "$budget" -gt 0 ] || continue
   out=$(printf '%s' "$resp" \
     | FM_TG_FETCH_BUDGET="$budget" python3 "$SCRIPT_DIR/fm-tg-fetch.py" wait "$IN" "$OFF" "$SCRIPT_DIR/fm-tg-send.sh")
+  rc=$?
+  # Only a response the fetch actually consumed counts as progress.
+  [ "$rc" -eq 0 ] || { back_off; continue; }
+  fails=0
   if [ -n "$out" ]; then
     printf '%s\n' "$out"
     exit 0

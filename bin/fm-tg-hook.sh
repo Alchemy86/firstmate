@@ -9,6 +9,9 @@
 # on first print vanished when the wake did not reach the model. See
 # bin/fm-tg-drain.py for the surface-until-answered rule.
 #
+# The long poll is single-flight per home (state/.tg-hook.lock): the harness
+# starts a fresh background firing on every stop and never dedupes them.
+#
 # Registered project-scoped in this repo's own .claude/settings.json
 # (docs/telegram.md) so only a session actually running as firstmate loads
 # this hook at all; bin/fm-tg-isfirstmate.sh is kept as defense in depth for
@@ -56,6 +59,23 @@ if pending=$(python3 "$SCRIPT_DIR/fm-tg-drain.py" "$IN" "$DONE"); then
   block_pending "$pending"
 fi
 fm_tg_budget_clear "$BUDGET_FILE"
+
+# --- single-flight waiter claim ----------------------------------------------
+# Claude fires an asyncRewake Stop hook in the background on EVERY stop with no
+# deduplication across firings (bin/fm-claude-stop-autoarm.sh records that
+# contract, and carries state/.claude-autoarm.lock for exactly this reason).
+# Each firing's long poll below lives for up to FM_TG_HOOK_MAX, so without a
+# claim a session with frequent turns accumulates waiters that all call
+# getUpdates on the one bot token - which Telegram answers by terminating the
+# others' long poll with a 409, a tight ping-pong between accumulated waiters.
+# Exactly one waiter per home: every other firing exits 0, having already
+# surfaced anything pending in the drain above, and this home's live waiter
+# remains free to wake the model when the next message lands.
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+WAIT_LOCK="$STATE/.tg-hook.lock"
+fm_lock_try_acquire "$WAIT_LOCK" || exit 0
+trap 'fm_lock_release "$WAIT_LOCK"' EXIT
 
 out=$(FM_TG_WAIT_MAX=${FM_TG_HOOK_MAX:-1800} "$SCRIPT_DIR/fm-tg-wait.sh" 2>/dev/null)
 case "$out" in
