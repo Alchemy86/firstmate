@@ -10,16 +10,23 @@
 #     on startup) follows the PRIMARY checkout's current default-branch commit:
 #     base_mode is that local commit, with NO fetch and no origin dependency.
 #
-# Every secondmate home is a worktree of this same repo, so it already holds the
-# primary's commit in the shared object store; the local-HEAD sync is therefore a
-# purely local fast-forward that never touches the network. A tracked-files
-# fast-forward never touches the gitignored operational dirs (data/, state/,
-# config/, projects/, .no-mistakes/), so a secondmate's backlog, projects, and
-# in-flight work are never disturbed. Homes are leased at a detached HEAD on the
+# A linked-worktree secondmate home already holds the primary's commit in the
+# shared object store, so its local-HEAD sync is a purely local fast-forward that
+# never touches the network. A standalone clone moves through that path only when
+# it already has the target; otherwise it is skipped until the origin path updates it.
+# A tracked-files fast-forward never touches the gitignored operational dirs
+# (data/, state/, config/, projects/, .no-mistakes/), so it cannot disturb a
+# secondmate's backlog, projects, or in-flight work.
+# The seeded .fm-secondmate-home identity marker is gitignored too; the local
+# sync tolerates only that marker during the one-time upgrade of pre-ignore
+# linked-worktree homes.
+# Homes are leased at a detached HEAD on the
 # default branch, so the fast-forward advances HEAD only and never moves the
 # shared default branch or any other worktree's checkout.
 
 SUB_HOME_MARKER="${SUB_HOME_MARKER:-.fm-secondmate-home}"
+# shellcheck source=bin/fm-secondmate-registry-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-secondmate-registry-lib.sh"
 
 # --- helpers ---------------------------------------------------------------
 
@@ -204,7 +211,7 @@ fetch_once() {
 
 # Which watched instruction paths changed between HEAD and BASE (comma list).
 # These are the files a running agent actually reads or runs: its instructions
-# (AGENTS.md, which CLAUDE.md symlinks), its agent-loaded skills
+# (AGENTS.md, which CLAUDE.md imports via @AGENTS.md), its agent-loaded skills
 # (.agents/skills/), and its tooling (bin/). Public skills/ is installer-facing
 # and intentionally not part of this watched instruction surface.
 changed_instr() {
@@ -224,20 +231,6 @@ dirty_status() {
   else
     git -C "$dir" status --porcelain 2>/dev/null | head -1
   fi
-}
-
-secondmate_registry_field() {
-  local reg=$1 id=$2 key=$3 line value
-  [ -f "$reg" ] || return 1
-  line=$(grep -E "^- $id( |$)" "$reg" | tail -1 || true)
-  [ -n "$line" ] || return 1
-  case "$key" in
-    home) value=$(printf '%s\n' "$line" | sed -n 's/.*(home:[[:space:]]*\([^;)]*\);.*/\1/p' | sed 's/[[:space:]]*$//') ;;
-    projects) value=$(printf '%s\n' "$line" | sed -n 's/.*; projects:[[:space:]]*\([^;)]*\); added .*/\1/p' | sed 's/[[:space:]]*$//') ;;
-    *) return 1 ;;
-  esac
-  [ -n "$value" ] || return 1
-  printf '%s\n' "$value"
 }
 
 # List this home's LIVE secondmate direct reports from state/<id>.meta records.
@@ -405,6 +398,10 @@ process_secondmate() {
       return 0
     fi
     FF_NUDGE_WINDOWS="$FF_NUDGE_WINDOWS fm-$id"
+    if [ "$nudge_requires_instr" = yes ] && [ -n "$FF_INSTR" ] \
+      && type fm_ff_after_instruction_update >/dev/null 2>&1; then
+      fm_ff_after_instruction_update "$id" "$home_real" "$window" "$FF_INSTR"
+    fi
   fi
 }
 
@@ -417,6 +414,7 @@ sweep_live_secondmate_metas() {
   local state=$1 base_mode=$2 nudge_requires_instr=${3:-no} registry=${4:-$FM_HOME/data/secondmates.md} id home window meta
   [ -d "$state" ] || return 0
   while IFS='|' read -r id home window meta; do
+    if grep -q '^remote_host=.' "$meta" 2>/dev/null; then continue; fi
     process_secondmate "$id" "$home" "$window" "$base_mode" "$nudge_requires_instr"
   done < <(live_secondmate_meta_records "$state" "$registry")
 }
