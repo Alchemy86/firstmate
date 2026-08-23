@@ -32,8 +32,9 @@ Without it those files landed at the ambient umask, which leaves the captain's m
 
 **Known, accepted tradeoff: the bot token appears in process arguments.**
 Telegram's Bot API authenticates by putting the token in the request *path* (`https://api.telegram.org/bot<token>/<method>`); it has no header-based scheme, so there is nothing for `curl`'s `--url-query`, `-u`, or an `Authorization` header to carry instead.
-Every `curl` call therefore has the token in its argv, readable with `ps auxww` by any other local user for the duration of that call.
-This is accepted rather than fixed: it is a property of the vendor API, the exposure is local-only, and the token already sits in a file on the same machine.
+Every `curl` call in this feature therefore builds the URL directly on the command line and has the token in its argv, readable with `ps auxww` by any other local user for the duration of that call.
+An alternative exists and is deliberately not used here: `curl -K -` can read the URL (and any `-d`/`-F` fields) from a config file on stdin instead of argv, keeping the token off `ps auxww` entirely without touching the Bot API's path-based scheme.
+This is accepted rather than fixed today: the exposure is local-only, the token already sits in a file on the same machine, and reworking three call sites' request construction to build and feed a `-K` config file - correctly quoting the token, the chat id, and the message text, none of which the captain controls - is its own source of bugs for a local-only hardening step nobody has asked for.
 A host where other local users are not trusted should not hold `~/.config/fm-telegram.env` at all.
 
 ## What it does

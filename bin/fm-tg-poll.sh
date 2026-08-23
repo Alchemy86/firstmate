@@ -85,17 +85,18 @@ rc=$?
 reason=$(head -n 1 "$diag" 2>/dev/null | tr -d '\r')
 [ "$diag" = /dev/null ] || rm -f -- "$diag"
 
-# fm-tg-fetch.py's own record write leaves "surfaced" at 0 - only
-# fm-tg-drain.py increments it and stamps state/.tg-last-surfaced. This
-# watcher path prints fetch.py's summary directly (the pipe above) without
-# ever running the drain, the identical gap bin/fm-tg-wait.sh's own fetch
-# success path had (see its comment) before it started delegating to the
-# drain too. Without this, a message the watcher poll wins the getUpdates
-# race for is recorded but never marked surfaced, so a reply composed more
-# than 10s later finds it still pending under bin/fm-tg-archive.py's
-# never-surfaced window and it re-surfaces forever. Run silently - the pipe
-# above already produced this check's one wake line.
-[ "$rc" -eq 0 ] && { python3 "$SCRIPT_DIR/fm-tg-drain.py" "$IN" "$STATE/tg-processed" >/dev/null 2>&1 || true; }
+# fm-tg-fetch.py stamps "surfaced" and state/.tg-last-surfaced itself for
+# exactly the record whose preview the pipe above just printed
+# (mark_surfaced() in bin/fm-tg-fetch.py) - this script does not need to do
+# anything further. An earlier version ran bin/fm-tg-drain.py here instead,
+# with its own stdout discarded, purely for that bookkeeping side effect and
+# purely outside this check's own budget; drain.py surfaces (and marks)
+# EVERY pending inbox record, not just the one this poll actually printed a
+# preview of, so a message that arrived earlier and was never really shown to
+# the model got marked surfaced=1 anyway - and the very next unrelated reply
+# then silently retired it under bin/fm-tg-archive.py's "surfaced -> retire
+# on any reply" rule, with no "retired unsurfaced" notice since it no longer
+# reads as unsurfaced at all (a no-mistakes review finding, 2026-08-23).
 
 # A refusal has to be told apart from a quiet channel. A revoked token, a
 # sustained rate limit, or a permanent conflict all return an error body that

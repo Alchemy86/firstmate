@@ -269,11 +269,13 @@ test_bootstrap_warns_inbound_claude_only_on_other_harnesses() {
   assert_grep "TELEGRAM: inbound is Claude-only on this setup" "$TMP_ROOT/inbound-scope-out" \
     "bootstrap must plainly warn that inbound will not surface when the primary is not Claude"
 
-  # A Claude primary gets the normal arm line and no such warning.
+  # A Claude primary gets the normal arm line and no such warning. CLAUDECODE=1
+  # forces a deterministic verdict here too, for the same CI-portability
+  # reason as test_poll_sh_end_to_end.
   home="$TMP_ROOT/inbound-scope-claude-home"
   mkdir -p "$home/state" "$home/config"
   env=$(fm_tg_env "$home")
-  FM_BOOTSTRAP_NETWORK=skip FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" \
+  CLAUDECODE=1 FM_BOOTSTRAP_NETWORK=skip FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" \
     "$ROOT/bin/fm-bootstrap.sh" >"$TMP_ROOT/inbound-scope-claude-out" 2>&1
   assert_grep "TELEGRAM: on" "$TMP_ROOT/inbound-scope-claude-out" "bootstrap must arm Telegram for a configured Claude home"
   assert_not_contains "$(cat "$TMP_ROOT/inbound-scope-claude-out")" "inbound is Claude-only" \
@@ -667,7 +669,10 @@ test_arrival_ack_guard_reply_pipeline() {
   send="$sbin/fm-tg-send.sh"
   mkdir -p "$inbox"
 
-  export FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" TG_TOKEN=faketoken
+  # CLAUDECODE=1 forces a deterministic Claude verdict from bin/fm-harness.sh
+  # for the arrival ack below, regardless of the host running this suite -
+  # see the comment in test_poll_sh_end_to_end.
+  export FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" TG_TOKEN=faketoken CLAUDECODE=1
 
   # 1. A message arrives (simulating what curl's getUpdates would have
   #    returned) and is fed straight into the shared fetch core, exactly as
@@ -724,7 +729,7 @@ test_arrival_ack_guard_reply_pipeline() {
   expect_code 0 "$rc" "guard still blocking after a real reply was sent: $(cat "$TMP_ROOT/guard2-out")"
   rm -f "$TMP_ROOT/guard2-out"
 
-  unset FM_HOME TG_TOKEN
+  unset FM_HOME TG_TOKEN CLAUDECODE
   export FM_TG_ENV_OVERRIDE="$FM_TG_LIB_DEFAULT_ENV_OVERRIDE"
   pass "telegram: arrival acks once, guard demands a real reply, unanswered re-surfaces, real reply silences the guard and archives"
 }
@@ -1379,7 +1384,12 @@ test_poll_sh_end_to_end() {
   fm_tg_getupdates_fixture "$TMP_ROOT" \
     '{"ok":true,"result":[{"update_id":90,"message":{"chat":{"id":999},"date":400,"text":"is the poll shim wired right?"}}]}'
 
-  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  # CLAUDECODE=1 forces a deterministic Claude verdict from
+  # bin/fm-harness.sh regardless of the host running this suite - relying on
+  # an ambient marker or process ancestry left this assertion dependent on
+  # whichever harness actually launched the suite, which is unset on a CI
+  # runner (a no-mistakes review finding, 2026-08-23).
+  out=$(CLAUDECODE=1 FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
   unset FAKE_TG_GETUPDATES_FILE
   assert_contains "$out" "telegram: 1 message(s)" "bin/fm-tg-poll.sh (the real watcher check-cycle artifact) did not report the new message"
   assert_present "$inbox/90.json" "bin/fm-tg-poll.sh did not record the message to the inbox"
@@ -1396,6 +1406,70 @@ test_poll_sh_end_to_end() {
   [ -z "$out" ] || fail "bin/fm-tg-poll.sh printed output with no new messages: $out"
 
   pass "telegram: bin/fm-tg-poll.sh (the state/tg-watch.check.sh watcher artifact) fetches, records, and acks end-to-end"
+}
+
+test_poll_never_surfaces_an_unrelated_pending_message() {
+  local home env inbox old_ts out
+
+  home="$TMP_ROOT/poll-no-collateral-home"
+  mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
+  env=$(fm_tg_env "$home")
+  inbox="$home/state/tg-inbox"
+  old_ts=$(( $(date +%s) - 120 ))
+
+  # THE BUG THIS PINS (a no-mistakes review finding, 2026-08-23):
+  # bin/fm-tg-poll.sh used to run bin/fm-tg-drain.py afterward with its
+  # output discarded, purely to stamp "surfaced" bookkeeping on the message
+  # it had just fetched - but drain.py surfaces (and marks) EVERY pending
+  # record, not just that one. An older message that arrived earlier and was
+  # never actually shown to the model (never printed anywhere, never seen)
+  # got marked surfaced=1 as collateral damage, and the very next unrelated
+  # reply then silently retired it under bin/fm-tg-archive.py's
+  # "surfaced -> retire on any reply" rule - the exact "no message is lost"
+  # regression this whole feature exists to prevent, reopened by the fix for
+  # a different bug.
+  printf '{"update_id": 80, "chat_id": 999, "ts": %s, "text": "never shown to anyone"}' \
+    "$old_ts" > "$inbox/80.json"
+
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":81,"message":{"chat":{"id":999},"date":500,"text":"a brand new, unrelated message"}}]}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_contains "$out" "telegram: 1 message(s)" "the poll must still report the new message"
+  assert_grep '"surfaced": 1' "$inbox/81.json" "the message this poll actually fetched must be marked surfaced"
+  assert_no_grep '"surfaced"' "$inbox/80.json" "an unrelated older message that was never shown must NOT be marked surfaced as collateral damage"
+
+  # And the practical consequence: an unrelated reply afterward must not
+  # silently retire the never-shown message (bin/fm-tg-archive.py's window
+  # for a genuinely never-surfaced record is 10s of its OWN arrival, and this
+  # one is 120s old, so it must stay pending either way).
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'an unrelated proactive update' >/dev/null 2>&1
+  assert_present "$inbox/80.json" "the never-shown message must still be pending after an unrelated reply"
+
+  pass "telegram: bin/fm-tg-poll.sh marks surfaced only the message it actually fetched, never an unrelated pending one"
+}
+
+test_poll_multi_message_batch_only_marks_the_previewed_one() {
+  local home env inbox out
+
+  home="$TMP_ROOT/poll-multi-batch-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  inbox="$home/state/tg-inbox"
+
+  # fm-tg-fetch.py's poll-mode summary only ever previews new_texts[0] - the
+  # rest of a multi-message batch is recorded but genuinely not shown by this
+  # call, so only the first must be marked surfaced.
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":82,"message":{"chat":{"id":999},"date":500,"text":"first"}},{"update_id":83,"message":{"chat":{"id":999},"date":501,"text":"second"}}]}'
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_contains "$out" "telegram: 2 message(s)" "the poll must report both messages recorded"
+  assert_grep '"surfaced": 1' "$inbox/82.json" "the previewed (first) message of a multi-message batch must be marked surfaced"
+  assert_no_grep '"surfaced"' "$inbox/83.json" "the second message of a multi-message batch was never actually shown by the poll's own preview and must not be marked surfaced"
+
+  pass "telegram: a multi-message poll batch marks surfaced only the message its own preview actually showed"
 }
 
 test_poll_does_not_ack_on_a_non_claude_harness() {
@@ -1430,10 +1504,12 @@ test_poll_does_not_ack_on_a_non_claude_harness() {
   assert_no_grep sendMessage "$log" "a non-Claude harness must never actually call sendMessage for the arrival ack"
 
   # A Claude primary polling the SAME home afterward must still ack normally -
-  # this is a per-poll harness check, not a home-wide latch.
+  # this is a per-poll harness check, not a home-wide latch. CLAUDECODE=1
+  # forces a deterministic verdict here too (see the comment in
+  # test_poll_sh_end_to_end).
   fm_tg_getupdates_fixture "$TMP_ROOT" \
     '{"ok":true,"result":[{"update_id":92,"message":{"chat":{"id":999},"date":420,"text":"claude picks this one up"}}]}'
-  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" "$ROOT/bin/fm-tg-poll.sh")
+  out=$(CLAUDECODE=1 FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" "$ROOT/bin/fm-tg-poll.sh")
   unset FAKE_TG_GETUPDATES_FILE
   assert_grep '"acked": 1' "$home/state/tg-inbox/92.json" "a Claude poll on the same home must ack normally"
 
@@ -1755,6 +1831,8 @@ test_send_retry_labels_definite_non_send
 test_send_retry_labels_ambiguous_empty_reply
 test_send_retry_labels_timeout_as_ambiguous
 test_poll_sh_end_to_end
+test_poll_never_surfaces_an_unrelated_pending_message
+test_poll_multi_message_batch_only_marks_the_previewed_one
 test_poll_does_not_ack_on_a_non_claude_harness
 test_poll_reports_a_refusal_once
 test_poll_preserves_error_record_on_unexpected_exit

@@ -194,41 +194,12 @@ def fetch_media(tok, message, fid, media_dir):
         return None
 
 
-def harness_can_surface():
-    """Only Claude has the Stop-hook drain/guard pair that actually shows a
-    captain message to the model and enforces a reply (docs/telegram.md
-    "Inbound is Claude-only"). Acking a message on any other primary harness
-    would tell the captain it landed and is being worked when nothing will
-    ever surface it - a false promise, worse than no ack at all, and exactly
-    the "ack then silence forever" failure the captain was angriest about
-    (2026-08-23: "that is a FALSE PROMISE... we would be manufacturing it").
-
-    Fails toward "no": an undetectable harness, a missing bin/fm-harness.sh,
-    or a timed-out check all mean this returns False, so a message looks
-    unhandled rather than falsely reassures. The watcher's own poll (running
-    on every primary harness) is the caller that actually needs this - the
-    long-poll path only ever runs from Claude's own Stop hook to begin with,
-    so this check is a no-op there in practice, but it is applied
-    unconditionally rather than keyed on `mode` so the guarantee holds even
-    if that calling context ever changes."""
-    tmo = allot(HARNESS_CHECK_MAX, HARNESS_CHECK_MIN)
-    if tmo is None:
-        return False
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fm-harness.sh")
-    try:
-        result = subprocess.run(
-            [script], timeout=tmo,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        return result.stdout.decode("utf-8", "replace").strip() == "claude"
-    except Exception:
-        return False
-
-
 def ack_on_arrival(send_script):
     """Best-effort instant '...' so the captain knows the message landed.
     Returns True on a send that did not raise, so the caller can mark the
     record acked=1; fm-tg-drain.py retries later if this returns False.
-    Caller must gate this on harness_can_surface() first - see there."""
+    Caller must gate this on records.harness_can_surface() first - see
+    fm_tg_records.py."""
     ack_tmo = allot(ACK_MAX, ACK_MIN)
     if ack_tmo is None:
         return False
@@ -276,6 +247,41 @@ def refuse(reason):
     return UNUSABLE
 
 
+def mark_surfaced(records, inbox):
+    """Stamp surfaced=1 and state/.tg-last-surfaced for exactly the records
+    whose text is about to be printed to THIS call's own stdout - the real
+    surfacing event.
+
+    THE BUG THIS REPLACES (a no-mistakes review finding, 2026-08-23).
+    bin/fm-tg-wait.sh and bin/fm-tg-poll.sh both used to run
+    bin/fm-tg-drain.py afterward with its stdout discarded, purely for the
+    "surfaced" side effect. But drain.py surfaces (and marks) EVERY pending
+    inbox record, not just the one(s) this fetch just wrote - so a message
+    that arrived earlier and was never actually shown to the model (under a
+    non-Claude harness, or simply not yet drained) got marked surfaced=1
+    anyway. bin/fm-tg-archive.py treats surfaced>=1 as "retire unconditionally
+    on any real reply, however much later", so the very next unrelated
+    outbound send silently swept an unseen message into tg-processed - no
+    "retired unsurfaced" notice, no trace, exactly the "no message is lost"
+    guarantee this whole feature exists to keep. Marking only the records
+    whose content is ACTUALLY in this call's own real (non-discarded) output
+    closes that: a poll's own "N message(s)... : <preview>" line only ever
+    shows message 0 of a batch, so callers pass only that one record here,
+    never the rest of a multi-message batch; a wait's "CAPTAIN: <text>" loop
+    prints every new message in full, so callers pass all of them.
+    """
+    if not records:
+        return
+    for path, rec in records:
+        rec["surfaced"] = 1
+        write_record(path, rec)
+    state_dir = os.path.dirname(os.path.normpath(inbox))
+    try:
+        open(os.path.join(state_dir, ".tg-last-surfaced"), "w").close()
+    except Exception:
+        pass
+
+
 def main():
     global DEADLINE
     mode, inbox, offset_file, send_script = sys.argv[1:5]
@@ -297,6 +303,7 @@ def main():
     configured_chat_id = os.environ.get("TG_CHAT_ID") or ""
 
     new_texts = []
+    new_records = []  # (path, rec) parallel to new_texts - see mark_surfaced()
     unusable_updates = 0
     write_failures = 0
     # Computed at most once per fetch, not per message (the harness cannot
@@ -368,7 +375,7 @@ def main():
         write_offset(offset_file, uid)
 
         if can_surface is None:
-            can_surface = harness_can_surface()
+            can_surface = records.harness_can_surface(allot(HARNESS_CHECK_MAX, HARNESS_CHECK_MIN) or 0)
         if can_surface and ack_on_arrival(send_script):
             rec["acked"] = 1
             write_record(path, rec)
@@ -383,6 +390,7 @@ def main():
             else:
                 text = "[media received; bytes not downloaded]"
         new_texts.append(text)
+        new_records.append((path, rec))
 
     if not new_texts:
         if write_failures:
@@ -401,9 +409,14 @@ def main():
     if mode == "poll":
         first = new_texts[0].replace("\n", " ")[:70]
         print("telegram: %d message(s) from the captain: %s" % (len(new_texts), first))
+        # Only message 0 of a multi-message batch is actually shown (as a
+        # preview) in this summary line - the rest are recorded but not
+        # surfaced by this call at all, and stay pending for a real drain.
+        mark_surfaced(new_records[:1], inbox)
     else:
         for t in new_texts:
             print("CAPTAIN: " + t.replace("\n", " ")[:300])
+        mark_surfaced(new_records, inbox)
     return 0
 
 
