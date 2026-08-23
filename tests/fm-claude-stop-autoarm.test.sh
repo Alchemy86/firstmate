@@ -511,6 +511,23 @@ test_arms_for_x_mode_poll_need_without_inflight() {
   pass "auto-arm: X-mode poll need arms the cycle even with no tasks in flight"
 }
 
+test_arms_for_telegram_poll_need_without_inflight() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/tg-need")
+  # A no-mistakes review finding, 2026-08-23: fm_supervision_status
+  # (bin/fm-supervision-lib.sh) recognised state/x-watch.check.sh as a reason
+  # to keep the watcher armed on an otherwise-idle home, but never the
+  # identically-armed state/tg-watch.check.sh - so a Telegram-configured
+  # Claude primary with no other in-flight work never force-armed the
+  # watcher at all, making the 30s cadence fix moot: nothing ever polled.
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$dir/state/tg-watch.check.sh"
+  write_arm_fixture "$dir" actionable
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "a Telegram poll need must keep the auto-arm active with zero tasks in flight"
+  [ -e "$dir/state/arm-ran" ] || fail "hook did not arm for the Telegram poll need"
+  pass "auto-arm: Telegram poll need arms the cycle even with no tasks in flight"
+}
+
 test_single_flight_admits_exactly_one_owner() {
   local dir rc1 rc2 count
   dir=$(make_primary_dir "$TMP_ROOT/single-flight")
@@ -803,6 +820,7 @@ test_post_alarm_actionable_close_is_suppressed
 test_benign_cycle_end_with_live_watcher_is_silent
 test_positive_recovery_budget_contention_preserves_episode
 test_arms_for_x_mode_poll_need_without_inflight
+test_arms_for_telegram_poll_need_without_inflight
 test_single_flight_admits_exactly_one_owner
 test_abandoned_owner_claim_is_reclaimed_and_rearms
 test_arming_claim_is_never_reclaimed
