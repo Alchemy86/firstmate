@@ -72,7 +72,12 @@ for _ts, path, rec in rows:
     text = (rec.get("text") or "").strip()
     media = rec.get("media")
     if text:
-        line = text.replace("\n", " ")[:4000]
+        # 4096 is Telegram's own documented text/caption cap, so this never
+        # actually truncates a real message - see bin/fm-tg-fetch.py's
+        # PRINT_MAX for the identical reasoning and a no-mistakes review
+        # finding, 2026-08-23, that caught this file's own 4000 as the same
+        # class of near-miss (below the real cap, just less severely).
+        line = text.replace("\n", " ")[:4096]
     elif media:
         line = "[image] %s" % media
     elif rec.get("media_id"):

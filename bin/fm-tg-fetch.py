@@ -96,18 +96,21 @@ HARNESS_CHECK_MIN = 1
 
 DEADLINE = None
 
-# Print length for a genuine "wait" mode surfacing - matches
-# bin/fm-tg-drain.py's own PRINT_MAX for the identical job, and comfortably
-# exceeds Telegram's own 4096-character message cap, so this is a truncation
-# limit in name only: a real Telegram message is never actually cut short by
-# it. A no-mistakes review finding, 2026-08-23, caught the 300 this used to
-# be: shorter than a real message can be, yet mark_surfaced() (see below)
-# still marked the WHOLE record surfaced=1 off that truncated print, the
-# same class of defect as the poll branch's 70-char preview fixed just
-# before it - the model could reply from a partial read and
-# bin/fm-tg-archive.py would retire the record as though it had been shown
-# in full.
-PRINT_MAX = 4000
+# Print length for a genuine "wait" mode surfacing, matching
+# bin/fm-tg-drain.py's own PRINT_MAX for the identical job. A no-mistakes
+# review finding, 2026-08-23, caught the 300 this used to be: shorter than a
+# real message can be, yet mark_surfaced() (see below) still marked the WHOLE
+# record surfaced=1 off that truncated print - the model could reply from a
+# partial read and bin/fm-tg-archive.py would retire the record as though it
+# had been shown in full. The FIRST attempt at that fix raised this to 4000
+# and claimed that "comfortably exceeds Telegram's own 4096-character message
+# cap" - a second review finding caught that 4000 is LESS than 4096, so a
+# 4001-4096-character message (one Telegram genuinely delivers) was still
+# truncated and still marked fully surfaced, the identical defect narrowed
+# but not closed. 4096 is Telegram's own documented sendMessage/text cap, so
+# nothing longer ever legitimately arrives here; this is now a truncation
+# limit in name only, not merely in intent.
+PRINT_MAX = 4096
 
 # Exit status for a response this script could not use (see the module
 # docstring): distinct from 0 so a caller can tell "nothing new" from "Telegram

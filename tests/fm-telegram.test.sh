@@ -1600,6 +1600,41 @@ test_poll_reports_a_refusal_once() {
   pass "telegram: the watcher poll reports a refused channel once per distinct reason instead of looking quiet"
 }
 
+test_poll_dedups_a_sustained_rate_limit_despite_the_countdown() {
+  local home env out
+
+  home="$TMP_ROOT/poll-429-dedup-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+
+  # A no-mistakes review finding, 2026-08-23: Telegram's 429 description is
+  # "Too Many Requests: retry after N", where N counts down every poll, so
+  # the literal refusal line never repeats and the dedup this test's sibling
+  # already covers for a STANDING refusal (same text every time) never
+  # engaged for a sustained rate limit specifically - the exact
+  # "wakes firstmate every 30 seconds" failure state/.tg-poll-error exists to
+  # prevent, defeated by its own error body's design.
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 30"}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  assert_contains "$out" "429" "the first 429 must be reported"
+
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 15"}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  [ -z "$out" ] || fail "a sustained 429 with only its countdown changed must not be reported again: $out"
+
+  # A genuinely different refusal (a different error code) is still news,
+  # even with its own volatile-looking tail.
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":false,"error_code":401,"description":"Unauthorized"}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  assert_contains "$out" "401" "a genuinely different refusal code must still be reported despite the countdown-normalizing dedup"
+
+  unset FAKE_TG_GETUPDATES_FILE
+  pass "telegram: a sustained rate limit is reported once despite its own ever-changing countdown text"
+}
+
 test_poll_preserves_error_record_on_unexpected_exit() {
   local home env nopy out
 
@@ -1700,25 +1735,28 @@ test_wait_does_not_truncate_a_real_telegram_message_before_marking_surfaced() {
   env=$(fm_tg_env "$home")
   inbox="$home/state/tg-inbox"
 
-  # A no-mistakes review finding, 2026-08-23: the "CAPTAIN: <text>" print
-  # used to truncate at 300 characters - well under Telegram's own 4096
-  # character message cap - yet still marked the WHOLE record surfaced=1,
-  # the same class of defect the poll branch's 70-char preview was fixed
-  # for just before this. A message longer than 300 characters (but a real
-  # one Telegram would actually accept) must print in full here, matching
-  # bin/fm-tg-drain.py's own 4000-character ceiling for the identical job -
-  # in name only, since no real Telegram message is ever actually that long.
-  long=$(python3 -c 'print("x" * 500)')
+  # A no-mistakes review finding, 2026-08-23, TWICE: the "CAPTAIN: <text>"
+  # print used to truncate at 300 characters - well under Telegram's own
+  # 4096-character message cap - yet still marked the WHOLE record
+  # surfaced=1, the same class of defect the poll branch's 70-char preview
+  # was fixed for just before this. The first attempt at this fix raised the
+  # limit to 4000 and claimed that "comfortably exceeds" the real cap - it
+  # does not, 4000 < 4096, so a 4001-4096-character message (one Telegram
+  # genuinely delivers) was still truncated and still marked fully surfaced.
+  # Use the real maximum here, not merely something bigger than the old
+  # broken limit, so this test cannot pass on a second near-miss the way the
+  # first version of this test (500 characters) did.
+  long=$(python3 -c 'print("x" * 4096)')
   fm_tg_getupdates_fixture "$TMP_ROOT" \
     "$(printf '{"ok":true,"result":[{"update_id":95,"message":{"chat":{"id":999},"date":650,"text":"%s"}}]}' "$long")"
 
   out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FM_TG_WAIT_MAX=10 "$ROOT/bin/fm-tg-wait.sh")
   unset FAKE_TG_GETUPDATES_FILE
-  assert_contains "$out" "$long" "a 500-character message must print in full, not truncated at the old 300-character cut"
+  assert_contains "$out" "$long" "a full 4096-character Telegram message must print in full, not truncated at any lesser cut"
 
   rec_path="$inbox/95.json"
   assert_grep '"surfaced": 1' "$rec_path" "a fully-printed long message is a genuine surfacing and must still be marked"
-  pass "telegram: the waiter prints a real Telegram-length message in full before marking it surfaced"
+  pass "telegram: the waiter prints a full-length (4096-character) Telegram message before marking it surfaced"
 }
 
 # --- one long-poll waiter per home ------------------------------------------
@@ -1907,6 +1945,7 @@ test_poll_multi_message_batch_marks_neither_message_surfaced
 test_poll_does_not_ack_on_a_non_claude_harness
 test_poll_surfaces_the_chat_id_drop_notice
 test_poll_reports_a_refusal_once
+test_poll_dedups_a_sustained_rate_limit_despite_the_countdown
 test_poll_preserves_error_record_on_unexpected_exit
 test_poll_without_a_timeout_binary
 test_records_are_private_and_left_whole

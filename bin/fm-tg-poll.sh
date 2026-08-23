@@ -120,8 +120,19 @@ reason=$(head -n 1 "$diag" 2>/dev/null | tr -d '\r')
 # reported again (bin/fm-tool-update-check.sh's state/.tool-updates does the
 # same for its own sweep).
 record_refusal() {
-  local line=$1
-  [ "$line" != "$(cat "$err" 2>/dev/null || true)" ] || return 0
+  local line=$1 key prior_key
+  # Dedup on a NORMALIZED key, not the literal line (a no-mistakes review
+  # finding, 2026-08-23): Telegram's 429 description is "Too Many Requests:
+  # retry after N", where N counts down every poll, so the literal line
+  # never repeats and this fired on every single cycle for a sustained rate
+  # limit - the exact "wakes firstmate every 30 seconds" failure this record
+  # exists to prevent, for the one refusal reason most likely to be
+  # sustained. Strip only that one known-volatile tail; the leading error
+  # code (401, 403, 409, 429, ...) is left untouched, so a genuinely
+  # different refusal still reports as new.
+  key=$(printf '%s' "$line" | sed -E 's/retry after [0-9]+/retry after N/')
+  prior_key=$(cat "$err" 2>/dev/null | sed -E 's/retry after [0-9]+/retry after N/' || true)
+  [ "$key" != "$prior_key" ] || return 0
   printf '%s\n' "$line"
   if tmp=$(mktemp "$err.XXXXXX" 2>/dev/null); then
     if printf '%s\n' "$line" > "$tmp"; then
