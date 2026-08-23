@@ -274,6 +274,61 @@ EOF
   pass "Pi redundant tool call returns ownership guidance and spawns no second child"
 }
 
+test_pi_extension_sources_telegram_cadence() {
+  local repo home plugin log out status
+  repo="$TMP_ROOT/pi-tg-cadence-root"
+  home="$TMP_ROOT/pi-tg-cadence-home"
+  log="$TMP_ROOT/pi-tg-cadence.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  # Only the Telegram cadence config is present here (no x-mode.env), pinning
+  # that this extension's arm child sources config/tg-mode.env on its own,
+  # not merely as a side effect of also sourcing config/x-mode.env. Missing
+  # this left a Telegram-configured Pi primary polling at the 300s default
+  # instead of the 30s this file exists to provide (bin/fm-claude-stop-
+  # autoarm.sh and bin/fm-turnend-guard-cursor.sh already had the matching fix).
+  printf 'export FM_POLL=7\n' > "$home/config/tg-mode.env"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'poll=%s\n' "${FM_POLL:-missing}" >> "${FM_ARM_LOG:?}"
+printf 'watcher: healthy pid=1 (beacon 0s)\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async () => {},
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("tool-call-first", {}, undefined, undefined, {});
+for (let i = 0; i < 100 && !existsSync(process.env.FM_ARM_LOG); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+if (!existsSync(process.env.FM_ARM_LOG)) throw new Error("arm child did not run");
+const text = readFileSync(process.env.FM_ARM_LOG, "utf8");
+if (!text.includes("poll=7")) {
+  console.error(text);
+  process.exit(1);
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi extension must source config/tg-mode.env before arming"
+  [ -z "$out" ] || fail "Pi Telegram-cadence test printed output: $out"
+  pass "Pi watcher extension sources the Telegram cadence config"
+}
+
 test_pi_scheduled_retry_call_is_owned_noop() {
   local repo home plugin log out status
   repo="$TMP_ROOT/pi-scheduled-retry-root"
@@ -1396,6 +1451,61 @@ EOF
   pass "OpenCode watcher plugin sources the effective config"
 }
 
+test_opencode_primary_watch_plugin_sources_telegram_cadence() {
+  local plugin repo home log out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  repo="$TMP_ROOT/opencode-tg-cadence-root"
+  home="$TMP_ROOT/opencode-tg-cadence-home"
+  log="$TMP_ROOT/opencode-tg-cadence.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  # Only config/tg-mode.env is present (no x-mode.env), pinning that this
+  # plugin's arm child sources the Telegram cadence config on its own, not
+  # merely as a side effect of also sourcing x-mode.env. Missing this left a
+  # Telegram-configured OpenCode primary polling at the 300s default instead
+  # of the 30s this file exists to provide (bin/fm-claude-stop-autoarm.sh and
+  # bin/fm-turnend-guard-cursor.sh already had the matching fix).
+  printf 'export FM_POLL=7\n' > "$home/config/tg-mode.env"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'poll=%s\n' "${FM_POLL:-missing}" >> "${FM_ARM_LOG:?}"
+printf 'watcher: healthy pid=1 (beacon 0s)\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" node 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const client = { session: { promptAsync: async () => {} } };
+const hooks = await mod.FmPrimaryWatchArm({
+  client,
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
+for (let i = 0; i < 250 && !existsSync(process.env.FM_ARM_LOG); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+if (!existsSync(process.env.FM_ARM_LOG)) {
+  console.error("watch arm did not run");
+  process.exit(1);
+}
+const text = readFileSync(process.env.FM_ARM_LOG, "utf8");
+if (!text.includes("poll=7")) {
+  console.error(text);
+  process.exit(1);
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode watch plugin must source config/tg-mode.env before arming"
+  [ -z "$out" ] || fail "OpenCode Telegram-cadence test printed output: $out"
+  pass "OpenCode watcher plugin sources the Telegram cadence config"
+}
+
 test_opencode_primary_watch_plugin_requires_session_lock() {
   local plugin repo home log out status
   plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
@@ -2253,6 +2363,7 @@ EOF
 test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
 test_pi_redundant_tool_call_is_owned_noop
+test_pi_extension_sources_telegram_cadence
 test_pi_scheduled_retry_call_is_owned_noop
 test_pi_actionable_close_starts_single_successor_before_delivery
 test_pi_handling_delivery_failure_is_typed_once
@@ -2269,6 +2380,7 @@ test_pi_process_exit_cleanup_stops_arm_child
 test_opencode_plugin_package_boundary_is_explicit_esm
 test_opencode_primary_watch_plugin_uses_effective_state_home
 test_opencode_primary_watch_plugin_sources_effective_config
+test_opencode_primary_watch_plugin_sources_telegram_cadence
 test_opencode_primary_watch_plugin_requires_session_lock
 test_opencode_watch_arm_coordinator_respects_primary_scope
 test_opencode_primary_watch_plugin_rearms_after_wake

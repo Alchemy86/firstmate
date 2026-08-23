@@ -85,6 +85,18 @@ rc=$?
 reason=$(head -n 1 "$diag" 2>/dev/null | tr -d '\r')
 [ "$diag" = /dev/null ] || rm -f -- "$diag"
 
+# fm-tg-fetch.py's own record write leaves "surfaced" at 0 - only
+# fm-tg-drain.py increments it and stamps state/.tg-last-surfaced. This
+# watcher path prints fetch.py's summary directly (the pipe above) without
+# ever running the drain, the identical gap bin/fm-tg-wait.sh's own fetch
+# success path had (see its comment) before it started delegating to the
+# drain too. Without this, a message the watcher poll wins the getUpdates
+# race for is recorded but never marked surfaced, so a reply composed more
+# than 10s later finds it still pending under bin/fm-tg-archive.py's
+# never-surfaced window and it re-surfaces forever. Run silently - the pipe
+# above already produced this check's one wake line.
+[ "$rc" -eq 0 ] && { python3 "$SCRIPT_DIR/fm-tg-drain.py" "$IN" "$STATE/tg-processed" >/dev/null 2>&1 || true; }
+
 # A refusal has to be told apart from a quiet channel. A revoked token, a
 # sustained rate limit, or a permanent conflict all return an error body that
 # curl transfers perfectly, so without this the captain sees exactly what he
@@ -93,20 +105,38 @@ reason=$(head -n 1 "$diag" 2>/dev/null | tr -d '\r')
 # every 30 seconds - and cleared by the next usable poll so a recurrence is
 # reported again (bin/fm-tool-update-check.sh's state/.tool-updates does the
 # same for its own sweep).
-if [ "$rc" -eq 3 ]; then
-  [ -n "$reason" ] || reason="unusable reply"
-  line="telegram: the channel refused the poll ($reason)"
-  if [ "$line" != "$(cat "$err" 2>/dev/null || true)" ]; then
-    printf '%s\n' "$line"
-    if tmp=$(mktemp "$err.XXXXXX" 2>/dev/null); then
-      if printf '%s\n' "$line" > "$tmp"; then
-        mv -f -- "$tmp" "$err" || rm -f -- "$tmp"
-      else
-        rm -f -- "$tmp"
-      fi
+record_refusal() {
+  local line=$1
+  [ "$line" != "$(cat "$err" 2>/dev/null || true)" ] || return 0
+  printf '%s\n' "$line"
+  if tmp=$(mktemp "$err.XXXXXX" 2>/dev/null); then
+    if printf '%s\n' "$line" > "$tmp"; then
+      mv -f -- "$tmp" "$err" || rm -f -- "$tmp"
+    else
+      rm -f -- "$tmp"
     fi
   fi
-else
+}
+
+# rc==3 is fm-tg-fetch.py's own "the channel refused this poll" verdict
+# (a revoked token, a rate limit, a lasting getUpdates conflict). Any OTHER
+# nonzero rc used to fall into the same "else: clear the record" branch as a
+# genuine success, on the false assumption that only rc==3 was ever possible -
+# so python3 vanishing from PATH after bootstrap armed this shim (rc=127), or
+# the watcher killing the check's process group mid-fetch (rc=137/143), each
+# produced no output, no wake, AND silently erased any standing refusal
+# record, making a permanently broken channel indistinguishable from a
+# captain who simply has not written. Only a confirmed rc==0 poll (fetch.py
+# actually ran to completion and judged the reply usable) clears the record;
+# every other outcome, expected or not, is reported and remembered the same
+# dedup'd way so one broken condition does not wake firstmate every cycle.
+if [ "$rc" -eq 3 ]; then
+  [ -n "$reason" ] || reason="unusable reply"
+  record_refusal "telegram: the channel refused the poll ($reason)"
+elif [ "$rc" -eq 0 ]; then
   rm -f -- "$err"
+else
+  [ -n "$reason" ] || reason="exit $rc"
+  record_refusal "telegram: the poll failed unexpectedly ($reason)"
 fi
 exit 0

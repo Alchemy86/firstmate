@@ -12,6 +12,17 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# tests/lib.sh exports FM_TG_ENV_OVERRIDE at a nonexistent path so every
+# sourcing suite is isolated from a real ~/.config/fm-telegram.env by default.
+# A bare `unset FM_HOME FM_TG_ENV_OVERRIDE` below (used to fall back to this
+# suite's own default per-test scoping) discarded that default for every test
+# defined AFTER it in this file, not just the one doing the unsetting - a
+# later test then ran with no override at all and, on a machine where the
+# captain actually has Telegram configured, could read and act on his real
+# TG_TOKEN/TG_CHAT_ID. Capture the default once here so those call sites can
+# restore it instead of dropping it for the rest of the file.
+FM_TG_LIB_DEFAULT_ENV_OVERRIDE=$FM_TG_ENV_OVERRIDE
+
 TMP_ROOT=$(fm_test_tmproot fm-telegram)
 # fm_test_tmproot's own cleanup trap is registered inside the command-
 # substitution subshell above and fires the moment that subshell exits, which
@@ -162,6 +173,25 @@ fm_tg_path_without_timeout() {
 
 # fm_tg_file_mode <path>: the file's permission bits, portably (macOS stat has
 # no -c). Echoes nothing when the path cannot be read.
+# fm_tg_path_without_python3 <dir>: build a PATH that has every command this
+# host offers EXCEPT `python3`, and echo it (with the fake curl still first).
+# Simulates python3 vanishing from PATH after bootstrap armed a watcher shim.
+fm_tg_path_without_python3() {
+  local farm=$1/no-python3-path d f b
+  if [ ! -d "$farm" ]; then
+    mkdir -p "$farm"
+    for d in $(printf '%s' "$PATH" | tr ':' ' '); do
+      [ -d "$d" ] || continue
+      for f in "$d"/*; do
+        b=${f##*/}
+        [ "$b" = python3 ] && continue
+        [ -e "$farm/$b" ] || ln -s "$f" "$farm/$b" 2>/dev/null || true
+      done
+    done
+  fi
+  printf '%s' "$FAKEBIN:$farm"
+}
+
 fm_tg_file_mode() {
   if [ "$(uname)" = Darwin ]; then
     stat -f %Lp "$1" 2>/dev/null
@@ -310,7 +340,8 @@ test_guard_block_budget_bounded() {
   assert_absent "$home/state/.turnend-tg-guard-blocks" "a reply must clear the block record"
 
   rm -f "$TMP_ROOT/wedge-out"
-  unset FM_HOME FM_TG_ENV_OVERRIDE
+  unset FM_HOME
+  export FM_TG_ENV_OVERRIDE="$FM_TG_LIB_DEFAULT_ENV_OVERRIDE"
   pass "telegram: an unanswerable message holds the turn a bounded number of times even as the drain re-stamps every turn, and a new message still gets a full budget"
 }
 
@@ -660,7 +691,8 @@ test_arrival_ack_guard_reply_pipeline() {
   expect_code 0 "$rc" "guard still blocking after a real reply was sent: $(cat "$TMP_ROOT/guard2-out")"
   rm -f "$TMP_ROOT/guard2-out"
 
-  unset FM_HOME FM_TG_ENV_OVERRIDE TG_TOKEN
+  unset FM_HOME TG_TOKEN
+  export FM_TG_ENV_OVERRIDE="$FM_TG_LIB_DEFAULT_ENV_OVERRIDE"
   pass "telegram: arrival acks once, guard demands a real reply, unanswered re-surfaces, real reply silences the guard and archives"
 }
 
@@ -978,7 +1010,8 @@ test_multiple_messages_mid_turn_none_swallowed() {
   [ "$first_at" -lt "$second_at" ] && [ "$second_at" -lt "$third_at" ] \
     || fail "messages did not surface in arrival order: $out"
 
-  unset FM_HOME FM_TG_ENV_OVERRIDE TG_TOKEN
+  unset FM_HOME TG_TOKEN
+  export FM_TG_ENV_OVERRIDE="$FM_TG_LIB_DEFAULT_ENV_OVERRIDE"
   pass "telegram: several messages including one arriving mid-turn all surface, in order, none swallowed"
 }
 
@@ -1150,15 +1183,41 @@ test_records_are_private_and_left_whole() {
     esac
   done
 
+  # bin/fm-tg-poll.sh's own fetch success path now runs the drain itself
+  # (tg-poll-path-no-surfaced-stamp), so the record is already surfaced=1
+  # before this test ever calls fm-tg-drain.py directly - a second, genuinely
+  # independent surfacing pass (a Stop hook firing again on an unanswered
+  # message) increments it again rather than leaving it at 1.
+  assert_grep '"surfaced": 1' "$inbox/130.json" "the poll's own fetch path did not stamp the surfaced counter"
+
   # Every record update is staged and swapped, so nothing half-written is ever
   # visible under the name a reader globs.
   out=$(python3 "$ROOT/bin/fm-tg-drain.py" "$inbox" "$home/state/tg-processed") \
     || fail "the drain did not surface the recorded message"
-  assert_grep '"surfaced": 1' "$inbox/130.json" "the drain did not stamp the surfaced counter"
+  assert_grep '"surfaced": 2' "$inbox/130.json" "a second, independent drain pass did not increment the surfaced counter"
   stray=$(find "$home/state" -name '*.tmp*' | wc -l | tr -d ' ')
   [ "$stray" = 0 ] || fail "a staged write was left behind in state/ ($stray file(s))"
 
   pass "telegram: records and the offset are owner-only, and every update is swapped into place whole"
+}
+
+# --- the suite must never discard its own Telegram-config isolation default -
+
+test_isolation_default_survives_every_earlier_test() {
+  # Several tests above restore state with `unset FM_HOME ... TG_TOKEN` after
+  # scoping their own FM_TG_ENV_OVERRIDE - a bare `unset FM_HOME
+  # FM_TG_ENV_OVERRIDE` used to be part of that reset, which discarded
+  # tests/lib.sh's isolation default (a nonexistent path) for every test
+  # defined AFTER it in this file, not just the one resetting. A later test
+  # then ran with no override at all and could read the host's real
+  # ~/.config/fm-telegram.env. This runs last in the invocation list below so
+  # it catches a regression in ANY earlier test's reset, not just the three
+  # historical offenders.
+  [ "${FM_TG_ENV_OVERRIDE:-}" = "$FM_TG_LIB_DEFAULT_ENV_OVERRIDE" ] \
+    || fail "FM_TG_ENV_OVERRIDE drifted from tests/lib.sh's isolation default (now '${FM_TG_ENV_OVERRIDE:-<unset>}'); some earlier test's reset discarded it instead of restoring it"
+  [ ! -e "$FM_TG_ENV_OVERRIDE" ] \
+    || fail "the isolation default path unexpectedly exists on disk: $FM_TG_ENV_OVERRIDE"
+  pass "telegram: the isolation default set by tests/lib.sh survives every test defined earlier in this file"
 }
 
 # --- amendment 5: fm-tg-send.sh auto-retries a transient text-send failure --
@@ -1292,6 +1351,12 @@ test_poll_sh_end_to_end() {
   assert_contains "$out" "telegram: 1 message(s)" "bin/fm-tg-poll.sh (the real watcher check-cycle artifact) did not report the new message"
   assert_present "$inbox/90.json" "bin/fm-tg-poll.sh did not record the message to the inbox"
   assert_grep '"acked": 1' "$inbox/90.json" "bin/fm-tg-poll.sh did not ack on arrival"
+  # The watcher poll wins the getUpdates race just like the waiter's own fetch
+  # path can - it must not skip the same surfaced bookkeeping that path was
+  # fixed to do, or the record stays re-surfacing forever past the archive's
+  # 10s never-surfaced window.
+  assert_grep '"surfaced": 1' "$inbox/90.json" "bin/fm-tg-poll.sh must mark a message it fetches surfaced, same as the waiter's own fetch path"
+  assert_present "$home/state/.tg-last-surfaced" "bin/fm-tg-poll.sh must stamp .tg-last-surfaced, same as the waiter's own fetch path"
 
   # A second run with nothing new must print nothing and touch nothing new.
   out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
@@ -1341,6 +1406,33 @@ test_poll_reports_a_refusal_once() {
 
   unset FAKE_TG_GETUPDATES_FILE
   pass "telegram: the watcher poll reports a refused channel once per distinct reason instead of looking quiet"
+}
+
+test_poll_preserves_error_record_on_unexpected_exit() {
+  local home env nopy out
+
+  home="$TMP_ROOT/poll-hardfail-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+
+  # An existing standing refusal record.
+  printf 'telegram: the channel refused the poll (401)\n' > "$home/state/.tg-poll-error"
+
+  fm_tg_getupdates_fixture "$TMP_ROOT" '{"ok":true,"result":[]}'
+
+  # python3 vanishing from PATH (e.g. after bootstrap armed this shim) makes
+  # fm-tg-fetch.py exit unexpectedly (127), neither the "refused" verdict
+  # (rc==3) nor a genuine success (rc==0). This used to fall into the same
+  # "else: clear the record" branch as a real success, silently erasing a
+  # standing failure while producing no output and no wake - a permanently
+  # broken channel then looked identical to a captain who has not written.
+  nopy=$(fm_tg_path_without_python3 "$TMP_ROOT")
+
+  out=$(PATH="$nopy" FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_contains "$out" "telegram: the poll failed unexpectedly" "an unexpected non-refusal, non-success exit must be reported, not silently swallowed"
+  assert_present "$home/state/.tg-poll-error" "the standing refusal record must survive an unexpected exit that is neither a confirmed refusal nor a confirmed success"
+  pass "telegram: an unexpected poll exit (neither refused nor successful) is reported and does not erase the standing failure record"
 }
 
 # --- an unusable answer is not a good pass -----------------------------------
@@ -1588,5 +1680,7 @@ test_send_retry_labels_ambiguous_empty_reply
 test_send_retry_labels_timeout_as_ambiguous
 test_poll_sh_end_to_end
 test_poll_reports_a_refusal_once
+test_poll_preserves_error_record_on_unexpected_exit
 test_poll_without_a_timeout_binary
 test_records_are_private_and_left_whole
+test_isolation_default_survives_every_earlier_test
