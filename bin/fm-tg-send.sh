@@ -81,6 +81,10 @@ API="https://api.telegram.org/bot$TG_TOKEN"
 LIMIT=${FM_TG_LIMIT:-3900}   # under 4096, leaving room for a part marker
 
 # Parse a Telegram reply: silent on ok, loud and non-zero otherwise.
+# Exit 0 on ok, 2 on a genuine parsed-but-not-ok rejection, 1 on anything
+# unparseable. send_part() branches retry decisions on that distinction
+# instead of re-inspecting the raw body for "ok":false, which missed any
+# whitespace-formatted variant of the same JSON.
 check() {
   python3 -c '
 import json, sys
@@ -92,7 +96,7 @@ except Exception:
 if not d.get("ok"):
     sys.stderr.write("telegram REJECTED: %s (%s)\n"
                      % (d.get("description"), d.get("error_code")))
-    sys.exit(1)
+    sys.exit(2)
 '
 }
 
@@ -220,9 +224,7 @@ send_part() {
     if [ -n "$resp" ]; then
       printf '%s' "$resp" | check && return 0
       rc=$?
-      case "$resp" in
-        *'"ok":false'*) return "$rc" ;;   # rejected, not transient
-      esac
+      [ "$rc" -eq 2 ] && return "$rc"   # genuine rejection, not transient
     fi
     if [ "$attempt" -lt 3 ]; then
       # Distinguished only for the retry-notice wording (docs/telegram.md "No
@@ -247,7 +249,14 @@ while [ "$i" -lt "$n" ]; do
   p=${PARTS[i]}
   i=$((i + 1))
   [ -n "$p" ] || continue
-  send_part "$p" || { echo "FAILED mid-send after 3 attempts" >&2; exit 1; }
+  send_part "$p" && continue
+  part_rc=$?
+  if [ "$part_rc" -eq 2 ]; then
+    echo "FAILED mid-send (rejected)" >&2
+  else
+    echo "FAILED mid-send after 3 attempts" >&2
+  fi
+  exit 1
 done
 mark_sent
 echo "sent ($n part(s))"

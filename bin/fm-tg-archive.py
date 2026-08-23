@@ -36,8 +36,9 @@ pass run. A record that HAS been surfaced at least once retires unconditionally
 on any real reply, however much later - keyed on the fact that surfacing
 already happened in the past, no window needed. A record that has never been
 surfaced and is older than 10 seconds stays pending no matter what unrelated
-reply goes out; a missing or malformed "ts" is treated as brand new, never as
-infinitely old, so it is never swept up by the window either.
+reply goes out; a missing or malformed "ts" is unknown, so it is never
+retired by the window at all - neither as ancient nor as fresh enough to
+qualify.
 
 An unsurfaced retirement is the one outcome here that can cost the captain an
 answer, so it is recorded rather than merely printed: this script's stdout is
@@ -166,8 +167,10 @@ for path in glob.glob(os.path.join(inbox, "*.json")):
         # Never surfaced: only the genuine same-turn race - arrived WITHIN
         # the last 10s, off a real arrival timestamp. Anything older than
         # that and still never surfaced is left alone; it is not part of the
-        # current exchange. No ts (or a malformed one) means "unknown, treat
-        # as brand new" - it must never be swept up as if it were ancient.
+        # current exchange. An unknown arrival time (no ts, or a malformed
+        # one) is never retired by this window: it is unknown, not "ancient"
+        # (float(None or 0) == 0.0 would make it look infinitely old) and not
+        # "fresh enough to qualify" either.
         retire = ts is not None and ts >= (now - 10)
 
     if retire:

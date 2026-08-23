@@ -265,6 +265,7 @@ def main():
 
     new_texts = []
     unusable_updates = 0
+    write_failures = 0
     for update in results:
         uid = update.get("update_id")
         # Every acknowledgement offset is uid + 1, so an update carrying no
@@ -315,7 +316,17 @@ def main():
         # Durable first: the record suppresses a duplicate refetch and the
         # offset advances past this update, both before anything slow runs.
         if not write_record(path, rec):
-            continue
+            # write_offset() only ever writes uid + 1, with no memory of which
+            # uids actually got recorded - so `continue`ing to the next update
+            # in this batch and letting IT succeed would advance the offset
+            # PAST this failed one, and Telegram never re-sends an
+            # already-acknowledged offset. That silently lost the update
+            # forever on any write failure (full disk, a permission change).
+            # Stop the whole batch here instead: nothing after this point gets
+            # acknowledged, so everything from here, including this update,
+            # is refetched and retried on the next poll.
+            write_failures += 1
+            break
         write_offset(offset_file, uid)
 
         if ack_on_arrival(send_script):
@@ -334,6 +345,12 @@ def main():
         new_texts.append(text)
 
     if not new_texts:
+        if write_failures:
+            # Same reasoning as the unusable-update_id case: nothing in this
+            # payload was durably recorded, so it must not read as "the
+            # captain has not written" - that hides a real, ongoing write
+            # failure (full disk, a permission change) behind total silence.
+            return refuse("could not durably record %d update(s)" % write_failures)
         if unusable_updates and unusable_updates == len(results):
             # Nothing in this payload could be acknowledged, so Telegram hands
             # back the same bytes next time. Report it as a refusal instead of

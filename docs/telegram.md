@@ -161,7 +161,7 @@ The same review also caught that a missing or malformed `ts` made a record look 
 
 **Fix (the captain's own design call, both parts).** The arrival-time window now applies ONLY to a record that has genuinely never been surfaced, and only within a short, conservative 10-second window of arrival - the one case it exists for: a message that arrived moments before a reply and has not yet had a surfacing pass run.
 A record that HAS been surfaced at least once retires unconditionally on any real reply, however much later - keyed on the fact that surfacing already happened in the past, no window needed.
-A record that has never been surfaced and is older than 10 seconds stays pending no matter what unrelated reply goes out; a missing or malformed `ts` is treated as brand new, never as infinitely old, so it is never swept up by the window either.
+A record that has never been surfaced and is older than 10 seconds stays pending no matter what unrelated reply goes out; a missing or malformed `ts` is unknown, so it is never retired by the window at all - not treated as ancient, and not treated as fresh enough to qualify.
 Verified: a 9-second-old never-surfaced message retires (inside the window), an 11-second-old one stays pending (outside it), and a surfaced record retires even an hour after it arrived.
 
 The notice is appended to `state/.tg-archive.log` as well as printed, because the only caller runs the archive as a subprocess whose output it discards - printing alone made the one outcome that can cost the captain an answer completely silent in practice.

@@ -1046,6 +1046,16 @@ x_mode_setup() {
 # written, nothing printed). Never writes the token or chat id anywhere.
 telegram_setup() {
   local env_file token chat_id shim trust cadence shim_body cadence_body tool missing shim_home
+  # The config this keys on is deliberately machine-wide ($HOME/.config, not
+  # FM_HOME-scoped like X mode's own .env), so without this gate a live
+  # secondmate home would ALSO arm its own 30s poller against the same bot
+  # token - and since getUpdates offsets are server-side, whichever home polls
+  # first consumes the update, silently stealing captain messages the primary
+  # never sees. A secondmate is passive here, same as
+  # startup_memory_budget_setup: only the primary owns arming this.
+  if [ -e "$FM_HOME/.fm-secondmate-home" ] || [ -L "$FM_HOME/.fm-secondmate-home" ]; then
+    return 0
+  fi
   env_file="${FM_TG_ENV_OVERRIDE:-$HOME/.config/fm-telegram.env}"
   shim="$STATE/tg-watch.check.sh"
   trust="$STATE/tg-watch.check-trust"
