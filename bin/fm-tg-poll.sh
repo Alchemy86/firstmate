@@ -78,6 +78,15 @@ FETCH_BUDGET=$(( CHECK_BUDGET - ( $(date +%s) - started ) - MARGIN ))
 
 err="$STATE/.tg-poll-error"
 diag=$(mktemp "$STATE/.tg-poll-diag.XXXXXX" 2>/dev/null) || diag=/dev/null
+# Best-effort cleanup on any exit this script itself controls (the explicit
+# rm -f calls below still run first and are harmless no-ops once this fires).
+# The watcher kills a slow check's whole process group with SIGKILL, which
+# cannot be trapped by anything - this cannot make that case any better, and
+# a leaked .tg-poll-diag.* file from a killed check is a small, cheap file
+# under state/, not a captain-visible defect (a no-mistakes review finding,
+# 2026-08-23, noted this leak; closing the untrappable half of it is not
+# possible in bash, so this closes the half that is).
+trap '[ "$diag" = /dev/null ] || rm -f -- "$diag"' EXIT
 printf '%s' "$resp" \
   | FM_TG_FETCH_BUDGET="$FETCH_BUDGET" python3 "$SCRIPT_DIR/fm-tg-fetch.py" \
       poll "$IN" "$OFF" "$SCRIPT_DIR/fm-tg-send.sh" 2>"$diag"
@@ -149,11 +158,19 @@ elif [ "$rc" -eq 0 ]; then
   # no-mistakes review finding, 2026-08-23). Surface the whole file: a
   # multi-update batch can carry more than one drop notice, not just the
   # first line $reason holds.
-  [ "$diag" = /dev/null ] || [ ! -s "$diag" ] || cat "$diag" >&2
+  #
+  # STDOUT, NOT STDERR (a second no-mistakes review finding on the first
+  # attempt at this exact fix, 2026-08-23): the watcher captures a check's
+  # stdout as the wake text and discards stderr outright
+  # (bin/fm-watch.sh's run_check_capture, `2>/dev/null`), same as
+  # record_refusal below already correctly does with a bare printf. A
+  # `>&2` here reached the earlier test only because that test merged both
+  # streams with `2>&1`; the real watcher would have dropped it.
+  [ "$diag" = /dev/null ] || [ ! -s "$diag" ] || cat "$diag"
   rm -f -- "$err"
 else
   [ -n "$reason" ] || reason="exit $rc"
   record_refusal "telegram: the poll failed unexpectedly ($reason)"
 fi
-[ "$diag" = /dev/null ] || rm -f -- "$diag"
+# $diag's removal is owned by the EXIT trap set above it.
 exit 0

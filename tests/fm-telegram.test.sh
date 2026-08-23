@@ -1536,19 +1536,21 @@ test_poll_surfaces_the_chat_id_drop_notice() {
   env=$(fm_tg_env "$home")   # TG_CHAT_ID=999
   inbox="$home/state/tg-inbox"
 
-  # A no-mistakes review finding, 2026-08-23: fm-tg-fetch.py writes the
-  # captain-impersonation drop notice to stderr and keeps going (rc stays 0
-  # for an otherwise-usable poll), but bin/fm-tg-poll.sh captured stderr to a
-  # temp file and deleted it unconditionally before the rc==0 branch ever ran
-  # - the file bin/fm-tg-fetch.py's own tests already prove carries the
-  # notice was never actually surfaced through the real watcher-check
-  # artifact. docs/telegram.md promises this line is "visible (never
-  # silent)".
+  # A no-mistakes review finding, 2026-08-23, TWICE (the first attempt at
+  # this fix wrote the notice to stderr instead of stdout, which passed a
+  # test capturing both streams with `2>&1` but was still invisible in
+  # production): fm-tg-fetch.py writes the captain-impersonation drop notice
+  # to stderr and keeps going (rc stays 0 for an otherwise-usable poll).
+  # bin/fm-watch.sh's real check runner captures ONLY a check's stdout as
+  # the wake text and discards stderr outright (`2>/dev/null`), so this test
+  # captures stdout alone - anything only reaching stderr must NOT appear
+  # here, matching what the watcher would actually see. docs/telegram.md
+  # promises this line is "visible (never silent)".
   fm_tg_getupdates_fixture "$TMP_ROOT" \
     '{"ok":true,"result":[{"update_id":93,"message":{"chat":{"id":424242},"date":430,"text":"i am not the captain"}}]}'
-  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh" 2>&1)
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh" 2>/dev/null)
   unset FAKE_TG_GETUPDATES_FILE
-  assert_contains "$out" "dropped update" "the drop notice must reach bin/fm-tg-poll.sh's own real output, not just fetch.py's own stderr"
+  assert_contains "$out" "dropped update" "the drop notice must reach bin/fm-tg-poll.sh's own STDOUT - the watcher discards stderr entirely"
   assert_contains "$out" "424242" "the surfaced drop notice must name the offending chat_id"
   assert_absent "$inbox/93.json" "a mismatched-chat update must still never be recorded, drop notice aside"
 
@@ -1688,6 +1690,35 @@ test_wait_own_fetch_marks_surfaced() {
   assert_grep '"surfaced": 1' "$rec_path" "a message delivered through the waiter's own fetch path must be marked surfaced, exactly like the drain-first path"
   assert_present "$home/state/.tg-last-surfaced" "the waiter's own fetch path must stamp .tg-last-surfaced, same as the drain-first path"
   pass "telegram: a message delivered through the waiter's own fetch path is marked surfaced, not left to re-surface forever"
+}
+
+test_wait_does_not_truncate_a_real_telegram_message_before_marking_surfaced() {
+  local home env inbox rec_path out long
+
+  home="$TMP_ROOT/wait-long-message-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  inbox="$home/state/tg-inbox"
+
+  # A no-mistakes review finding, 2026-08-23: the "CAPTAIN: <text>" print
+  # used to truncate at 300 characters - well under Telegram's own 4096
+  # character message cap - yet still marked the WHOLE record surfaced=1,
+  # the same class of defect the poll branch's 70-char preview was fixed
+  # for just before this. A message longer than 300 characters (but a real
+  # one Telegram would actually accept) must print in full here, matching
+  # bin/fm-tg-drain.py's own 4000-character ceiling for the identical job -
+  # in name only, since no real Telegram message is ever actually that long.
+  long=$(python3 -c 'print("x" * 500)')
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    "$(printf '{"ok":true,"result":[{"update_id":95,"message":{"chat":{"id":999},"date":650,"text":"%s"}}]}' "$long")"
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FM_TG_WAIT_MAX=10 "$ROOT/bin/fm-tg-wait.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_contains "$out" "$long" "a 500-character message must print in full, not truncated at the old 300-character cut"
+
+  rec_path="$inbox/95.json"
+  assert_grep '"surfaced": 1' "$rec_path" "a fully-printed long message is a genuine surfacing and must still be marked"
+  pass "telegram: the waiter prints a real Telegram-length message in full before marking it surfaced"
 }
 
 # --- one long-poll waiter per home ------------------------------------------
@@ -1833,6 +1864,7 @@ test_retired_records_and_media_are_capped() {
 
 test_wait_backs_off_on_error_body
 test_wait_own_fetch_marks_surfaced
+test_wait_does_not_truncate_a_real_telegram_message_before_marking_surfaced
 test_hook_long_poll_is_single_flight
 test_video_note_and_sticker_are_not_dropped
 test_retired_records_and_media_are_capped

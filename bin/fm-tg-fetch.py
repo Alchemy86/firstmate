@@ -96,6 +96,19 @@ HARNESS_CHECK_MIN = 1
 
 DEADLINE = None
 
+# Print length for a genuine "wait" mode surfacing - matches
+# bin/fm-tg-drain.py's own PRINT_MAX for the identical job, and comfortably
+# exceeds Telegram's own 4096-character message cap, so this is a truncation
+# limit in name only: a real Telegram message is never actually cut short by
+# it. A no-mistakes review finding, 2026-08-23, caught the 300 this used to
+# be: shorter than a real message can be, yet mark_surfaced() (see below)
+# still marked the WHOLE record surfaced=1 off that truncated print, the
+# same class of defect as the poll branch's 70-char preview fixed just
+# before it - the model could reply from a partial read and
+# bin/fm-tg-archive.py would retire the record as though it had been shown
+# in full.
+PRINT_MAX = 4000
+
 # Exit status for a response this script could not use (see the module
 # docstring): distinct from 0 so a caller can tell "nothing new" from "Telegram
 # refused us" without parsing the body itself.
@@ -427,7 +440,7 @@ def main():
         # when this record has been shown.
     else:
         for t in new_texts:
-            print("CAPTAIN: " + t.replace("\n", " ")[:300])
+            print("CAPTAIN: " + t.replace("\n", " ")[:PRINT_MAX])
         mark_surfaced(new_records, inbox)
     return 0
 

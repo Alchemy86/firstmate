@@ -85,6 +85,32 @@ fm_supervision_needed() {
   [ "$FM_SUP_NEEDED" = true ]
 }
 
+# fm_supervision_poll_need_desc <state-dir>
+# Echoes a human-readable name for whichever poll shim(s) at <state-dir> are
+# the reason FM_SUP_NEEDED can be true with zero in-flight tasks and zero
+# process-event sources - the only case a caller ever needs this for. X mode
+# and Telegram captain-comms are both armed by writing state/x-watch.check.sh
+# and state/tg-watch.check.sh respectively (bin/fm-bootstrap.sh), and a home
+# can have either, both, or (if this is ever called when neither poll shim
+# nor any other need exists) neither, so this is the one owner of naming
+# whichever is actually present - bin/fm-guard.sh and bin/fm-turnend-guard.sh
+# each hand-rolled this same check three times between them before (a
+# no-mistakes review finding, 2026-08-23), which is exactly the drift risk a
+# shared predicate exists to avoid.
+fm_supervision_poll_need_desc() {
+  local state=$1 desc=
+  [ -f "$state/x-watch.check.sh" ] && desc="X-mode relay polling"
+  if [ -f "$state/tg-watch.check.sh" ]; then
+    if [ -n "$desc" ]; then
+      desc="$desc and Telegram captain-comms polling"
+    else
+      desc="Telegram captain-comms polling"
+    fi
+  fi
+  [ -n "$desc" ] || desc="a poll shim"
+  printf '%s\n' "$desc"
+}
+
 # fm_supervision_unhealthy <state-dir> [grace-seconds]
 # Exit 0 (true) exactly when supervision is needed and no watcher has a fresh
 # beacon. Exit 1 (false) otherwise.
