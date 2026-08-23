@@ -120,6 +120,12 @@ Session start's bootstrap prints `TELEGRAM: inbound is Claude-only on this setup
 
 Building real inbound coverage for the other verified harnesses - a Stop-hook or extension equivalent of `bin/fm-tg-guard.sh`/`bin/fm-tg-hook.sh` for Codex, Pi, OpenCode, Cursor, and Grok - is a real, multi-day expansion (five structurally distinct hook/extension systems, each needing its own drain-and-guard logic, tests, and review) and is a deliberate, standing scope decision to defer, not an oversight.
 
+**After switching a home between harnesses, restart the watcher: `bin/fm-watch-arm.sh --restart`.**
+`harness_can_surface()` decides whether to ack by asking `bin/fm-harness.sh` to identify *the calling process's own tree* - for the watcher's poll path, that means the harness that armed the watcher, not necessarily whichever harness is the home's primary right now.
+The watcher is long-lived and nothing automatically restarts it when a home's primary harness changes, so a home switched from Claude to some other harness without a watcher restart in between keeps a stale identity: it can go on acking messages nothing will ever surface (the false promise this feature exists to avoid), or the mirror case, wrongly withholding real acks after a switch back to Claude.
+This is a known, accepted limitation (a no-mistakes review finding, 2026-08-23) rather than something the code detects and fixes on its own - a genuinely rare situation (routinely switching one home's primary harness) that does not justify the new durable state a self-correcting mechanism would need.
+Restarting the watcher after any harness switch on a home with Telegram configured re-arms it under the new primary's own identity and closes the gap immediately.
+
 ## Guarantees
 
 Each of these was a real, captain-visible failure before the fix that now guarantees it cannot recur.
