@@ -208,7 +208,26 @@ if [ "$watcher_healthy" = false ]; then
       elif [ "$sources" -gt 0 ]; then
         printf '●  %s process-event source(s) registered, but %s.\n' "$sources" "$watcher_cause"
       else
-        printf '●  X-mode relay polling needs supervision, but %s.\n' "$watcher_cause"
+        # The only remaining reason fm_supervision_status (bin/fm-supervision-lib.sh)
+        # can have set FM_SUP_NEEDED with zero in-flight tasks and zero
+        # sources: a poll shim needs the watcher live on an otherwise-idle
+        # home. X mode and Telegram captain-comms are both armed this way and
+        # both possible here (docs/telegram.md - a home can have either, both,
+        # or neither), so name whichever is actually present rather than
+        # hardcoding one (a no-mistakes review finding, 2026-08-23, from when
+        # Telegram's poll shim was added to this predicate without updating
+        # this banner, which had only ever needed to name X mode before).
+        poll_need=
+        [ -f "$STATE/x-watch.check.sh" ] && poll_need="X-mode relay polling"
+        if [ -f "$STATE/tg-watch.check.sh" ]; then
+          if [ -n "$poll_need" ]; then
+            poll_need="$poll_need and Telegram captain-comms polling"
+          else
+            poll_need="Telegram captain-comms polling"
+          fi
+        fi
+        [ -n "$poll_need" ] || poll_need="a poll shim"
+        printf '●  %s needs supervision, but %s.\n' "$poll_need" "$watcher_cause"
       fi
       if [ "$READ_ONLY" -eq 1 ]; then
         printf '●  This read-only session should report the lapse, not repair it.\n'

@@ -172,7 +172,7 @@ if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
 fi
 
 block_stop() {
-  local afk x_mode reason rule
+  local afk x_mode reason rule poll_need
   afk=0
   [ -e "$STATE/.afk" ] && afk=1
   x_mode=0
@@ -188,7 +188,22 @@ block_stop() {
     elif [ "$FM_SUP_SOURCES" -gt 0 ]; then
       printf '●  %s process-event source(s) registered, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_SOURCES" "$FM_SUP_BEACON_DESC"
     else
-      printf '●  X-mode relay polling needs supervision, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_BEACON_DESC"
+      # See the identical reasoning in bin/fm-guard.sh's own banner (a
+      # no-mistakes review finding, 2026-08-23): the only remaining reason
+      # FM_SUP_NEEDED can be true with zero in-flight tasks and zero sources
+      # is a poll shim, and X mode and Telegram captain-comms are both armed
+      # this way - name whichever is actually present.
+      poll_need=
+      [ -f "$STATE/x-watch.check.sh" ] && poll_need="X-mode relay polling"
+      if [ -f "$STATE/tg-watch.check.sh" ]; then
+        if [ -n "$poll_need" ]; then
+          poll_need="$poll_need and Telegram captain-comms polling"
+        else
+          poll_need="Telegram captain-comms polling"
+        fi
+      fi
+      [ -n "$poll_need" ] || poll_need="a poll shim"
+      printf '●  %s needs supervision, but no live watcher holds this home lock (last beat: %s).\n' "$poll_need" "$FM_SUP_BEACON_DESC"
     fi
     if [ "$CLAUDE_MODE" -eq 1 ]; then
       printf '●  The Stop-owned auto-arm did not claim this home either, so recovery is NOT already under way.\n'
@@ -402,7 +417,20 @@ if [ "$terminal_status" -eq 0 ]; then
   elif [ "$FM_SUP_SOURCES" -gt 0 ]; then
     NEED_DESC="$FM_SUP_SOURCES process-event source(s) registered"
   else
-    NEED_DESC="X-mode relay polling active"
+    # Same reasoning as block_stop()'s own banner above (a no-mistakes review
+    # finding, 2026-08-23, extended proactively to this identical pattern):
+    # a poll shim alone can be why supervision is needed, and X mode and
+    # Telegram captain-comms are both armed that way.
+    NEED_DESC=
+    [ -f "$STATE/x-watch.check.sh" ] && NEED_DESC="X-mode relay polling active"
+    if [ -f "$STATE/tg-watch.check.sh" ]; then
+      if [ -n "$NEED_DESC" ]; then
+        NEED_DESC="$NEED_DESC and Telegram captain-comms polling active"
+      else
+        NEED_DESC="Telegram captain-comms polling active"
+      fi
+    fi
+    [ -n "$NEED_DESC" ] || NEED_DESC="a poll shim active"
   fi
   printf '{"systemMessage":"FIRSTMATE SUPERVISION IS GENUINELY DOWN: %s, the Stop-owned auto-arm exhausted its bounded retries and one failure notice, no watcher or automatic continuation exists, and the block budget is exhausted. Keep this session attended and diagnose the automatic Stop-hook and watcher startup before relying on unattended supervision."}\n' "$NEED_DESC"
   exit 0

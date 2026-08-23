@@ -83,20 +83,24 @@ printf '%s' "$resp" \
       poll "$IN" "$OFF" "$SCRIPT_DIR/fm-tg-send.sh" 2>"$diag"
 rc=$?
 reason=$(head -n 1 "$diag" 2>/dev/null | tr -d '\r')
-[ "$diag" = /dev/null ] || rm -f -- "$diag"
 
-# fm-tg-fetch.py stamps "surfaced" and state/.tg-last-surfaced itself for
-# exactly the record whose preview the pipe above just printed
-# (mark_surfaced() in bin/fm-tg-fetch.py) - this script does not need to do
-# anything further. An earlier version ran bin/fm-tg-drain.py here instead,
-# with its own stdout discarded, purely for that bookkeeping side effect and
-# purely outside this check's own budget; drain.py surfaces (and marks)
-# EVERY pending inbox record, not just the one this poll actually printed a
-# preview of, so a message that arrived earlier and was never really shown to
-# the model got marked surfaced=1 anyway - and the very next unrelated reply
-# then silently retired it under bin/fm-tg-archive.py's "surfaced -> retire
-# on any reply" rule, with no "retired unsurfaced" notice since it no longer
-# reads as unsurfaced at all (a no-mistakes review finding, 2026-08-23).
+# fm-tg-fetch.py deliberately never marks a record "surfaced" from its poll
+# mode - the pipe above's "N message(s)... : <preview>" line is a truncated
+# watcher wake, not a rendering of the message, so it does not earn the
+# unconditional-retire-on-any-reply treatment bin/fm-tg-archive.py gives a
+# genuinely surfaced record (see mark_surfaced()'s own docstring in
+# bin/fm-tg-fetch.py). An earlier version of this script ran
+# bin/fm-tg-drain.py here to stamp that bookkeeping anyway, with its own
+# stdout discarded purely for the side effect and outside this check's own
+# budget; drain.py surfaces (and marks) EVERY pending inbox record, not just
+# the one this poll actually printed a preview of, so a message that arrived
+# earlier and was never really shown to the model got marked surfaced=1 as
+# collateral damage - and the very next unrelated reply then silently
+# retired it under the same "surfaced -> retire on any reply" rule, with no
+# "retired unsurfaced" notice since it no longer read as unsurfaced at all (a
+# no-mistakes review finding, 2026-08-23). The real, full surfacing this
+# script's own record eventually gets is bin/fm-tg-guard.sh/bin/fm-tg-hook.sh's
+# drain, on Claude's own next turn end.
 
 # A refusal has to be told apart from a quiet channel. A revoked token, a
 # sustained rate limit, or a permanent conflict all return an error body that
@@ -135,9 +139,21 @@ if [ "$rc" -eq 3 ]; then
   [ -n "$reason" ] || reason="unusable reply"
   record_refusal "telegram: the channel refused the poll ($reason)"
 elif [ "$rc" -eq 0 ]; then
+  # A usable poll can still carry an informational-but-worth-surfacing
+  # stderr diagnostic from fetch.py - the captain-impersonation drop notice
+  # (a chat_id mismatch) is exactly this: fetch.py writes it and keeps going,
+  # so rc stays 0. docs/telegram.md promises that notice is "visible (never
+  # silent)", but only $reason's first line ever reached anywhere, and only
+  # in the rc==3/other-nonzero branches below - a drop on an otherwise-
+  # successful poll was captured to $diag and discarded here, unseen (a
+  # no-mistakes review finding, 2026-08-23). Surface the whole file: a
+  # multi-update batch can carry more than one drop notice, not just the
+  # first line $reason holds.
+  [ "$diag" = /dev/null ] || [ ! -s "$diag" ] || cat "$diag" >&2
   rm -f -- "$err"
 else
   [ -n "$reason" ] || reason="exit $rc"
   record_refusal "telegram: the poll failed unexpectedly ($reason)"
 fi
+[ "$diag" = /dev/null ] || rm -f -- "$diag"
 exit 0

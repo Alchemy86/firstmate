@@ -1221,18 +1221,18 @@ test_records_are_private_and_left_whole() {
     esac
   done
 
-  # bin/fm-tg-poll.sh's own fetch success path now runs the drain itself
-  # (tg-poll-path-no-surfaced-stamp), so the record is already surfaced=1
-  # before this test ever calls fm-tg-drain.py directly - a second, genuinely
-  # independent surfacing pass (a Stop hook firing again on an unanswered
-  # message) increments it again rather than leaving it at 1.
-  assert_grep '"surfaced": 1' "$inbox/130.json" "the poll's own fetch path did not stamp the surfaced counter"
+  # bin/fm-tg-poll.sh's own fetch success path never marks the record
+  # surfaced (its "N message(s)... : <preview>" line is a truncated watcher
+  # wake, not a genuine full showing - see bin/fm-tg-fetch.py's own
+  # mark_surfaced() docstring), so the record is still surfaced=0/absent
+  # until a real drain pass actually shows it.
+  assert_no_grep '"surfaced"' "$inbox/130.json" "the poll's own truncated preview must not have stamped the surfaced counter"
 
   # Every record update is staged and swapped, so nothing half-written is ever
   # visible under the name a reader globs.
   out=$(python3 "$ROOT/bin/fm-tg-drain.py" "$inbox" "$home/state/tg-processed") \
     || fail "the drain did not surface the recorded message"
-  assert_grep '"surfaced": 2' "$inbox/130.json" "a second, independent drain pass did not increment the surfaced counter"
+  assert_grep '"surfaced": 1' "$inbox/130.json" "the drain (the first real, full surfacing pass) did not stamp the surfaced counter"
   stray=$(find "$home/state" -name '*.tmp*' | wc -l | tr -d ' ')
   [ "$stray" = 0 ] || fail "a staged write was left behind in state/ ($stray file(s))"
 
@@ -1394,12 +1394,14 @@ test_poll_sh_end_to_end() {
   assert_contains "$out" "telegram: 1 message(s)" "bin/fm-tg-poll.sh (the real watcher check-cycle artifact) did not report the new message"
   assert_present "$inbox/90.json" "bin/fm-tg-poll.sh did not record the message to the inbox"
   assert_grep '"acked": 1' "$inbox/90.json" "bin/fm-tg-poll.sh did not ack on arrival"
-  # The watcher poll wins the getUpdates race just like the waiter's own fetch
-  # path can - it must not skip the same surfaced bookkeeping that path was
-  # fixed to do, or the record stays re-surfacing forever past the archive's
-  # 10s never-surfaced window.
-  assert_grep '"surfaced": 1' "$inbox/90.json" "bin/fm-tg-poll.sh must mark a message it fetches surfaced, same as the waiter's own fetch path"
-  assert_present "$home/state/.tg-last-surfaced" "bin/fm-tg-poll.sh must stamp .tg-last-surfaced, same as the waiter's own fetch path"
+  # The watcher poll's own summary is a truncated (70-char) preview, not a
+  # genuine full showing, so it deliberately does NOT mark the record
+  # surfaced or stamp .tg-last-surfaced (a no-mistakes review finding,
+  # 2026-08-23, on an earlier version of this fix that did mark it) - the
+  # real, full surfacing this record gets is Claude's own next Stop-hook
+  # drain, which runs every turn end regardless of this poll.
+  assert_no_grep '"surfaced"' "$inbox/90.json" "the poll's own truncated preview must not be treated as a full surfacing"
+  assert_absent "$home/state/.tg-last-surfaced" "the poll must not stamp .tg-last-surfaced from its own truncated preview"
 
   # A second run with nothing new must print nothing and touch nothing new.
   out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
@@ -1427,7 +1429,12 @@ test_poll_never_surfaces_an_unrelated_pending_message() {
   # reply then silently retired it under bin/fm-tg-archive.py's
   # "surfaced -> retire on any reply" rule - the exact "no message is lost"
   # regression this whole feature exists to prevent, reopened by the fix for
-  # a different bug.
+  # a different bug. bin/fm-tg-poll.sh's own fetch does not mark ANY record
+  # surfaced any more (a second review finding on the first fix: even the
+  # message this poll actually fetches only gets a 70-char truncated
+  # preview, not a genuine full showing - see bin/fm-tg-fetch.py's own
+  # mark_surfaced() docstring), so this pins the same collateral-damage
+  # invariant under that corrected design.
   printf '{"update_id": 80, "chat_id": 999, "ts": %s, "text": "never shown to anyone"}' \
     "$old_ts" > "$inbox/80.json"
 
@@ -1436,7 +1443,7 @@ test_poll_never_surfaces_an_unrelated_pending_message() {
   out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
   unset FAKE_TG_GETUPDATES_FILE
   assert_contains "$out" "telegram: 1 message(s)" "the poll must still report the new message"
-  assert_grep '"surfaced": 1' "$inbox/81.json" "the message this poll actually fetched must be marked surfaced"
+  assert_no_grep '"surfaced"' "$inbox/81.json" "even the message this poll actually fetches must not be marked surfaced - its own preview is truncated, not a genuine full showing"
   assert_no_grep '"surfaced"' "$inbox/80.json" "an unrelated older message that was never shown must NOT be marked surfaced as collateral damage"
 
   # And the practical consequence: an unrelated reply afterward must not
@@ -1446,10 +1453,10 @@ test_poll_never_surfaces_an_unrelated_pending_message() {
   FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-send.sh" 'an unrelated proactive update' >/dev/null 2>&1
   assert_present "$inbox/80.json" "the never-shown message must still be pending after an unrelated reply"
 
-  pass "telegram: bin/fm-tg-poll.sh marks surfaced only the message it actually fetched, never an unrelated pending one"
+  pass "telegram: bin/fm-tg-poll.sh never marks a pending message surfaced from its own preview, including the one it just fetched"
 }
 
-test_poll_multi_message_batch_only_marks_the_previewed_one() {
+test_poll_multi_message_batch_marks_neither_message_surfaced() {
   local home env inbox out
 
   home="$TMP_ROOT/poll-multi-batch-home"
@@ -1457,19 +1464,24 @@ test_poll_multi_message_batch_only_marks_the_previewed_one() {
   env=$(fm_tg_env "$home")
   inbox="$home/state/tg-inbox"
 
-  # fm-tg-fetch.py's poll-mode summary only ever previews new_texts[0] - the
-  # rest of a multi-message batch is recorded but genuinely not shown by this
-  # call, so only the first must be marked surfaced.
+  # A no-mistakes review finding, 2026-08-23, on an earlier version of this
+  # fix: fm-tg-fetch.py's poll-mode summary previews new_texts[0] truncated
+  # to 70 characters - a watcher wake notifying that a message arrived, not
+  # a rendering of it - so marking even that one record surfaced let
+  # bin/fm-tg-archive.py retire it unconditionally on the next reply before
+  # the model had ever actually read its full text via a real Stop-hook
+  # drain. Neither message of a batch is a genuine full showing, so neither
+  # is marked.
   fm_tg_getupdates_fixture "$TMP_ROOT" \
     '{"ok":true,"result":[{"update_id":82,"message":{"chat":{"id":999},"date":500,"text":"first"}},{"update_id":83,"message":{"chat":{"id":999},"date":501,"text":"second"}}]}'
 
   out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
   unset FAKE_TG_GETUPDATES_FILE
   assert_contains "$out" "telegram: 2 message(s)" "the poll must report both messages recorded"
-  assert_grep '"surfaced": 1' "$inbox/82.json" "the previewed (first) message of a multi-message batch must be marked surfaced"
-  assert_no_grep '"surfaced"' "$inbox/83.json" "the second message of a multi-message batch was never actually shown by the poll's own preview and must not be marked surfaced"
+  assert_no_grep '"surfaced"' "$inbox/82.json" "the previewed (first) message of a multi-message batch must not be marked surfaced by a truncated preview"
+  assert_no_grep '"surfaced"' "$inbox/83.json" "the second message of a multi-message batch was never shown at all and must not be marked surfaced"
 
-  pass "telegram: a multi-message poll batch marks surfaced only the message its own preview actually showed"
+  pass "telegram: a multi-message poll batch marks neither message surfaced - a preview is not a full showing"
 }
 
 test_poll_does_not_ack_on_a_non_claude_harness() {
@@ -1514,6 +1526,33 @@ test_poll_does_not_ack_on_a_non_claude_harness() {
   assert_grep '"acked": 1' "$home/state/tg-inbox/92.json" "a Claude poll on the same home must ack normally"
 
   pass "telegram: bin/fm-tg-poll.sh withholds the arrival ack on a non-Claude harness instead of falsely promising the message will surface"
+}
+
+test_poll_surfaces_the_chat_id_drop_notice() {
+  local home env inbox out
+
+  home="$TMP_ROOT/poll-drop-visible-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")   # TG_CHAT_ID=999
+  inbox="$home/state/tg-inbox"
+
+  # A no-mistakes review finding, 2026-08-23: fm-tg-fetch.py writes the
+  # captain-impersonation drop notice to stderr and keeps going (rc stays 0
+  # for an otherwise-usable poll), but bin/fm-tg-poll.sh captured stderr to a
+  # temp file and deleted it unconditionally before the rc==0 branch ever ran
+  # - the file bin/fm-tg-fetch.py's own tests already prove carries the
+  # notice was never actually surfaced through the real watcher-check
+  # artifact. docs/telegram.md promises this line is "visible (never
+  # silent)".
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":93,"message":{"chat":{"id":424242},"date":430,"text":"i am not the captain"}}]}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh" 2>&1)
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_contains "$out" "dropped update" "the drop notice must reach bin/fm-tg-poll.sh's own real output, not just fetch.py's own stderr"
+  assert_contains "$out" "424242" "the surfaced drop notice must name the offending chat_id"
+  assert_absent "$inbox/93.json" "a mismatched-chat update must still never be recorded, drop notice aside"
+
+  pass "telegram: bin/fm-tg-poll.sh surfaces the captain-impersonation drop notice on an otherwise-successful poll, not just on a refusal"
 }
 
 test_poll_reports_a_refusal_once() {
@@ -1832,8 +1871,9 @@ test_send_retry_labels_ambiguous_empty_reply
 test_send_retry_labels_timeout_as_ambiguous
 test_poll_sh_end_to_end
 test_poll_never_surfaces_an_unrelated_pending_message
-test_poll_multi_message_batch_only_marks_the_previewed_one
+test_poll_multi_message_batch_marks_neither_message_surfaced
 test_poll_does_not_ack_on_a_non_claude_harness
+test_poll_surfaces_the_chat_id_drop_notice
 test_poll_reports_a_refusal_once
 test_poll_preserves_error_record_on_unexpected_exit
 test_poll_without_a_timeout_binary

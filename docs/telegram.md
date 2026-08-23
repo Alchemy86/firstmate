@@ -276,6 +276,12 @@ These do not each map to one of the guarantees above, but explain choices in the
   Both failures surfaced only as `telegram: unparseable reply`, which reads like a corrupt response rather than what actually happened.
   `bin/fm-tg-send.sh --file` now sends anything over 1MB via `sendDocument` instead (original bytes, no re-encoding, a far higher ceiling), and scales the upload timeout with payload size (`180 + size/20000` seconds, capped at 900) instead of a flat 180s, reporting an explicit "upload timed out" when the connection stalls rather than falling through to the JSON parser.
 
+**Known, accepted limitation: an inbox record has no cross-process lock.**
+`bin/fm_tg_records.py`'s atomic write makes every individual write to one record file all-or-nothing, but `bin/fm-tg-fetch.py` and `bin/fm-tg-drain.py` each do their own read-modify-write sequence (read the current record, change one field, write it back) with no lock between them.
+The watcher's poll and a live Stop-hook drain genuinely can run at the same moment (the same underlying condition as the poller/waiter race above), so their read-modify-write sequences on the SAME record can interleave: `fm-tg-fetch.py`'s post-download write (adding the `media` path) can land between drain's read and write of the same record and get silently overwritten, dropping the `surfaced` flag it had just set - the message would re-surface once more despite having genuinely been shown, an extra "did you see this?" rather than a loss.
+The mirror case is real too: drain's write can land between fetch's own read and post-download write, dropping the `media` path fetch had just recorded - the image becomes unreferenced and is pruned as orphaned after `MEDIA_MIN_AGE` (24h).
+This is accepted rather than fixed today: closing it needs a real cross-process lock (or a single-writer redesign) around every record touch across three separate scripts, a new concurrency-safety mechanism this feature does not otherwise have, for a race whose worse-case outcomes are "surfaces one extra time" and "loses one attachment," not a lost message or a lost reply.
+
 ## Upload sizing (`bin/fm-tg-send.sh --file`)
 
 Routing is by extension first, then by size:

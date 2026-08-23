@@ -247,10 +247,14 @@ def refuse(reason):
     return UNUSABLE
 
 
-def mark_surfaced(records, inbox):
+def mark_surfaced(surfaced_records, inbox):
     """Stamp surfaced=1 and state/.tg-last-surfaced for exactly the records
-    whose text is about to be printed to THIS call's own stdout - the real
-    surfacing event.
+    whose FULL text is about to be printed to THIS call's own stdout - a
+    genuine surfacing event, called only from the "wait" branch below (a
+    Claude Stop hook's own long poll, whose "CAPTAIN: <text>" output really
+    is shown to the model). The "poll" branch deliberately never calls this -
+    see its own comment for why a watcher wake's truncated preview does not
+    qualify.
 
     THE BUG THIS REPLACES (a no-mistakes review finding, 2026-08-23).
     bin/fm-tg-wait.sh and bin/fm-tg-poll.sh both used to run
@@ -265,14 +269,11 @@ def mark_surfaced(records, inbox):
     "retired unsurfaced" notice, no trace, exactly the "no message is lost"
     guarantee this whole feature exists to keep. Marking only the records
     whose content is ACTUALLY in this call's own real (non-discarded) output
-    closes that: a poll's own "N message(s)... : <preview>" line only ever
-    shows message 0 of a batch, so callers pass only that one record here,
-    never the rest of a multi-message batch; a wait's "CAPTAIN: <text>" loop
-    prints every new message in full, so callers pass all of them.
+    closes that.
     """
-    if not records:
+    if not surfaced_records:
         return
-    for path, rec in records:
+    for path, rec in surfaced_records:
         rec["surfaced"] = 1
         write_record(path, rec)
     state_dir = os.path.dirname(os.path.normpath(inbox))
@@ -409,10 +410,21 @@ def main():
     if mode == "poll":
         first = new_texts[0].replace("\n", " ")[:70]
         print("telegram: %d message(s) from the captain: %s" % (len(new_texts), first))
-        # Only message 0 of a multi-message batch is actually shown (as a
-        # preview) in this summary line - the rest are recorded but not
-        # surfaced by this call at all, and stay pending for a real drain.
-        mark_surfaced(new_records[:1], inbox)
+        # Deliberately NOT marked surfaced (a no-mistakes review finding,
+        # 2026-08-23, on an earlier version of this fix that did mark it): a
+        # 70-char preview truncated for a watcher wake is a notification that
+        # a message arrived, not a rendering of it. bin/fm-tg-archive.py
+        # treats surfaced>=1 as license to retire the record unconditionally
+        # on any later reply, however much later - correct for a genuine
+        # full-text surfacing (the "wait"/drain branch below), wrong for a
+        # coarse preview the model may never have actually read past. On
+        # Claude, the record still gets a real, full surfacing every turn end
+        # via bin/fm-tg-guard.sh/bin/fm-tg-hook.sh's own drain regardless of
+        # whether this poll ever ran, so nothing here is needed for the one
+        # harness this ever mattered for; leaving it unmarked just means that
+        # drain (or, on a non-Claude harness, nothing at all - by design,
+        # docs/telegram.md "Inbound is Claude-only") is what actually decides
+        # when this record has been shown.
     else:
         for t in new_texts:
             print("CAPTAIN: " + t.replace("\n", " ")[:300])
