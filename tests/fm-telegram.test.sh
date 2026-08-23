@@ -49,6 +49,11 @@ cat > "$FAKEBIN/curl" <<'SH'
 #                        success, when FAKE_CURL_HARD_FAIL_COUNTER points at a
 #                        file holding N (simulates N DEFINITE non-sends -
 #                        connection refused/DNS failure - then recovery)
+#                        or curl's own --max-time timeout exit (28) for the
+#                        first N calls, then success, when
+#                        FAKE_CURL_TIMEOUT_COUNTER points at a file holding N
+#                        (simulates N AMBIGUOUS timeouts - Telegram may have
+#                        already accepted the send - then recovery)
 #   ...getUpdates...  -> content of $FAKE_TG_GETUPDATES_FILE if set and
 #                        present, else an empty result
 # Every invocation's argv is appended to $FAKE_CURL_LOG when set, so a test
@@ -75,6 +80,13 @@ case "$args" in
       if [ "$remaining" -gt 0 ]; then
         echo $(( remaining - 1 )) > "$FAKE_CURL_FAIL_COUNTER"
         exit 0
+      fi
+    fi
+    if [ -n "${FAKE_CURL_TIMEOUT_COUNTER:-}" ] && [ -f "$FAKE_CURL_TIMEOUT_COUNTER" ]; then
+      remaining=$(cat "$FAKE_CURL_TIMEOUT_COUNTER")
+      if [ "$remaining" -gt 0 ]; then
+        echo $(( remaining - 1 )) > "$FAKE_CURL_TIMEOUT_COUNTER"
+        exit 28   # curl's own --max-time timeout exit code
       fi
     fi
     printf '{"ok":true,"result":{"message_id":1}}' ;;
@@ -767,6 +779,31 @@ test_archive_missing_ts_never_retired() {
   pass "telegram: a record with a missing/malformed ts is never retired via the never-surfaced window"
 }
 
+test_archive_survives_non_dict_record() {
+  local home out rc now
+  home="$TMP_ROOT/archive-non-dict-home"
+  mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
+  now=$(date +%s)
+
+  # A record that parses as valid JSON but is not a dict - e.g. an interrupted
+  # write that left a bare number or array - has no .get(), so the raw
+  # json.load() this loop used to call crashed the whole retirement pass
+  # instead of skipping just the one bad record. This script's only caller
+  # discards stderr and runs it with "|| true", so that crash silently
+  # disabled BOTH retirement and pruning on every run from then on.
+  printf '[1, 2, 3]' > "$home/state/tg-inbox/66-corrupt.json"
+  printf '{"update_id": 67, "chat_id": 999, "ts": %s, "text": "a good record after the bad one", "surfaced": 1}' \
+    "$now" > "$home/state/tg-inbox/67.json"
+
+  out=$(python3 "$ROOT/bin/fm-tg-archive.py" "$home/state/tg-inbox" "$home/state/tg-processed" 2>&1)
+  rc=$?
+  expect_code 0 "$rc" "a non-dict record must not crash the archive pass: $out"
+  assert_present "$home/state/tg-inbox/66-corrupt.json" "a non-dict record is skipped, not deleted"
+  assert_absent "$home/state/tg-inbox/67.json" "a good record must still be retired even when a non-dict record sits alongside it"
+  assert_present "$home/state/tg-processed/67.json" "the good record must land in tg-processed"
+  pass "telegram: a non-dict inbox record does not crash retirement or block a good record's retirement"
+}
+
 # --- chat_id filter (a no-mistakes review finding, captain-approved fix) ---
 # --- drop any update whose chat is not the configured TG_CHAT_ID, before ---
 # --- it is ever recorded - otherwise anyone who finds the bot's public   ---
@@ -973,6 +1010,32 @@ SH
     python3 "$ROOT/bin/fm-tg-drain.py" "$inbox" "$home/state/tg-processed" >/dev/null
   assert_absent "$home/state/.tg-last-sent" "the fallback ack must not stamp .tg-last-sent either (it is not a reply)"
   pass "telegram: a failed arrival-time ack is retried as a fallback by drain, and still never counts as a reply"
+}
+
+test_drain_survives_non_dict_record() {
+  local home env inbox done_dir out rc
+  home="$TMP_ROOT/drain-non-dict-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  inbox="$home/state/tg-inbox"
+  done_dir="$home/state/tg-processed"
+  mkdir -p "$inbox" "$done_dir"
+
+  # Same non-dict-record hazard as fm-tg-archive.py: a record that parses as
+  # JSON but is not a dict has no .get(), and the append that read it
+  # (rows.append((rec.get("ts") or 0, ...))) sat outside the try/except that
+  # wraps json.load, so it crashed the whole drain rather than skipping the
+  # one bad record - losing every pending message in the same inbox, not just
+  # the corrupt one.
+  printf '"just a string"' > "$inbox/68-corrupt.json"
+  printf '{"update_id": 69, "chat_id": 999, "ts": %s, "text": "still surfaces"}' "$(date +%s)" > "$inbox/69.json"
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" TG_TOKEN=faketoken \
+    python3 "$ROOT/bin/fm-tg-drain.py" "$inbox" "$done_dir")
+  rc=$?
+  expect_code 0 "$rc" "a non-dict record must not crash the drain: $out"
+  assert_contains "$out" "still surfaces" "the good record must still surface even when a non-dict record sits alongside it"
+  pass "telegram: a non-dict inbox record does not crash the drain or block a good record's surfacing"
 }
 
 # --- upload bugs (amendment 2): large PNG routes to sendDocument, and a --
@@ -1191,6 +1254,27 @@ test_send_retry_labels_ambiguous_empty_reply() {
   pass "telegram: an empty reply from a curl that itself exited 0 is logged as the ambiguous, may-have-already-sent case"
 }
 
+test_send_retry_labels_timeout_as_ambiguous() {
+  local home env counter out
+  home="$TMP_ROOT/retry-timeout-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  counter="$TMP_ROOT/retry-counter-timeout"
+  printf '1' > "$counter"   # curl's own --max-time timeout (exit 28) once, then succeeds
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_TIMEOUT_COUNTER="$counter" \
+    "$ROOT/bin/fm-tg-send.sh" 'curl times out once' 2>&1)
+  expect_code 0 "$?" "fm-tg-send.sh must still succeed once the timeout clears: $out"
+  # A timeout-shaped curl exit (28, or 124/143 from this script's own outer
+  # fm_run_timed bound) means the POST may have been in flight or even
+  # accepted when the clock ran out - the same ambiguous, may-have-already-
+  # sent case as an empty reply from a curl that exited 0, not a definite
+  # non-send. See docs/telegram.md's retry-tradeoff section.
+  assert_contains "$out" "ambiguous - may have already sent" "a curl timeout must be logged as the ambiguous (may-have-sent) case, not a definite non-send"
+  assert_not_contains "$out" "definite non-send" "a curl timeout must not be mislabeled as a definite non-send"
+  pass "telegram: a curl --max-time timeout (exit 28) is logged as the ambiguous, may-have-already-sent case"
+}
+
 # --- end-to-end: the actual watcher check-cycle artifact ---------------------
 
 test_poll_sh_end_to_end() {
@@ -1291,6 +1375,37 @@ test_wait_backs_off_on_error_body() {
 
   unset FAKE_TG_GETUPDATES_FILE FAKE_CURL_LOG
   pass "telegram: an {\"ok\":false} error body is a failed pass and backs the long poll off, not a free full-speed retry"
+}
+
+test_wait_own_fetch_marks_surfaced() {
+  local home env inbox rec_path out
+
+  home="$TMP_ROOT/wait-surfaced-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  inbox="$home/state/tg-inbox"
+
+  # This message reaches the waiter's OWN fetch.py call (bin/fm-tg-fetch.py
+  # wait ...), not the drain-first branch that runs at the top of every pass -
+  # the inbox is empty when this run starts, so that first drain finds nothing
+  # and the long poll is what actually delivers it. That success path used to
+  # print the fetched text and exit without ever running the drain, so the
+  # record it just wrote was left at surfaced=0 and .tg-last-surfaced unset -
+  # indistinguishable, to bin/fm-tg-archive.py's never-surfaced window, from a
+  # message that had not been shown yet, so a reply composed more than 10s
+  # later found it still pending and the message re-surfaced forever.
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":90,"message":{"chat":{"id":999},"date":600,"text":"seen via the waiter itself"}}]}'
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FM_TG_WAIT_MAX=10 "$ROOT/bin/fm-tg-wait.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_contains "$out" "seen via the waiter itself" "the waiter must print the message it just fetched"
+
+  rec_path="$inbox/90.json"
+  assert_present "$rec_path" "the waiter's own fetch must have recorded the message"
+  assert_grep '"surfaced": 1' "$rec_path" "a message delivered through the waiter's own fetch path must be marked surfaced, exactly like the drain-first path"
+  assert_present "$home/state/.tg-last-surfaced" "the waiter's own fetch path must stamp .tg-last-surfaced, same as the drain-first path"
+  pass "telegram: a message delivered through the waiter's own fetch path is marked surfaced, not left to re-surface forever"
 }
 
 # --- one long-poll waiter per home ------------------------------------------
@@ -1435,6 +1550,7 @@ test_retired_records_and_media_are_capped() {
 }
 
 test_wait_backs_off_on_error_body
+test_wait_own_fetch_marks_surfaced
 test_hook_long_poll_is_single_flight
 test_video_note_and_sticker_are_not_dropped
 test_retired_records_and_media_are_capped
@@ -1453,12 +1569,14 @@ test_archive_never_surfaced_old_stays_pending
 test_archive_never_surfaced_boundary
 test_archive_surfaced_always_retires_regardless_of_age
 test_archive_missing_ts_never_retired
+test_archive_survives_non_dict_record
 test_fetch_drops_mismatched_chat_id
 test_fetch_accepts_matching_chat_id
 test_fetch_survives_unusable_update_id
 test_fetch_nonmessage_update_is_not_a_chat_mismatch
 test_multiple_messages_mid_turn_none_swallowed
 test_drain_retries_failed_ack
+test_drain_survives_non_dict_record
 test_large_png_uses_senddocument
 test_small_png_uses_sendphoto
 test_upload_timeout_explicit_message
@@ -1467,6 +1585,7 @@ test_send_does_not_retry_a_real_rejection
 test_send_gives_up_after_3_transient_failures
 test_send_retry_labels_definite_non_send
 test_send_retry_labels_ambiguous_empty_reply
+test_send_retry_labels_timeout_as_ambiguous
 test_poll_sh_end_to_end
 test_poll_reports_a_refusal_once
 test_poll_without_a_timeout_binary

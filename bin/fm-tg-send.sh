@@ -228,16 +228,23 @@ send_part() {
     fi
     if [ "$attempt" -lt 3 ]; then
       # Distinguished only for the retry-notice wording (docs/telegram.md "No
-      # message is answered twice"): a nonzero curl exit is a definite
-      # non-send (connection refused, DNS failure - curl never reached
-      # Telegram), while an empty reply from a curl that itself exited 0 is
-      # ambiguous - Telegram may have already accepted and answered the send
-      # too slowly for --max-time to see the reply. Both retry the same way.
-      if [ "$curl_rc" -ne 0 ]; then
-        echo "telegram: attempt $attempt failed (curl exit $curl_rc, definite non-send), retrying" >&2
-      else
-        echo "telegram: attempt $attempt failed (empty reply, ambiguous - may have already sent), retrying" >&2
-      fi
+      # message is answered twice"): a definite non-send (connection refused,
+      # DNS failure - curl never reached Telegram) is a genuinely different
+      # exit than a TIMEOUT. curl --max-time exits 28 on its own timeout,
+      # fm_run_timed's outer bound returns 124, and a killed child can surface
+      # as 143 - all three mean the POST may well have been in flight or even
+      # accepted when the clock ran out, which is exactly the ambiguous case:
+      # Telegram could have already answered too slowly for the deadline to
+      # see the reply. Only an exit curl itself defines as "never connected"
+      # counts as a definite non-send; every timeout-shaped exit is ambiguous,
+      # same as an empty reply from a curl that exited 0. Both retry the same
+      # way regardless - this only changes which line is logged.
+      case "$curl_rc" in
+        0|28|124|143)
+          echo "telegram: attempt $attempt failed (empty reply, ambiguous - may have already sent), retrying" >&2 ;;
+        *)
+          echo "telegram: attempt $attempt failed (curl exit $curl_rc, definite non-send), retrying" >&2 ;;
+      esac
       sleep 2
     fi
     attempt=$((attempt + 1))

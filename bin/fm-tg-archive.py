@@ -149,9 +149,14 @@ def prune(inbox_dir, done_dir, media_dir):
 now = time.time()
 n = 0
 for path in glob.glob(os.path.join(inbox, "*.json")):
-    try:
-        rec = json.load(open(path))
-    except Exception:
+    # Use the same non-dict-tolerant load() the rest of this file (prune())
+    # already relies on. The raw json.load() this used to call here crashes
+    # on a record that parses but is not a dict (e.g. a bare number or array
+    # from an interrupted write), which - because this script's only caller
+    # discards stderr and takes "|| true" - failed retirement AND pruning
+    # silently on every run from then on.
+    rec = load(path)
+    if rec is None:
         continue
     seen = int(rec.get("surfaced") or 0) >= 1
 

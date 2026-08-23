@@ -174,9 +174,9 @@ A retired message moves into `state/tg-processed/` and its attachment stays in `
 
 **Known, accepted tradeoff: the send retry can rarely deliver a duplicate.**
 `bin/fm-tg-send.sh`'s auto-retry (see "Other defects" below) resends a part whenever a `sendMessage` call comes back empty, on the theory that an empty reply means the request never got through.
-That is true when `curl` itself failed - connection refused, DNS failure, a nonzero exit - a definite non-send, safe to retry.
-It is not always true when `curl` exits `0` with an empty body: Telegram may have already accepted and sent the message, just too slowly for `--max-time 60` to see the reply before curl gave up.
-Only that second, ambiguous case can produce a duplicate; `bin/fm-tg-send.sh` logs which of the two occurred on every retry attempt (`"definite non-send"` vs `"empty reply, ambiguous - may have already sent"`) so the rare case is diagnosable after the fact.
+That is true when `curl` itself failed with a non-timeout error - connection refused, DNS failure, some other nonzero exit - a definite non-send, safe to retry.
+It is not always true when `curl` times out (exit `28`, or `124`/`143` from this script's own outer timeout) or exits `0` with an empty body: Telegram may have already accepted and sent the message, just too slowly for the send to see the reply before curl gave up.
+Only that ambiguous case - a timeout of either kind, or an empty reply from a curl that exited `0` - can produce a duplicate; `bin/fm-tg-send.sh` logs which of the two occurred on every retry attempt (`"curl exit N, definite non-send"` vs `"empty reply, ambiguous - may have already sent"`, the latter covering both a `0` exit and a timeout-shaped exit) so the rare case is diagnosable after the fact.
 Telegram's Bot API has no idempotency key for `sendMessage`, so there is no way to close this from the client side without giving up retrying the ambiguous case too - which would bring back the exact "FAILED mid-send, no retry" failure amendment 5 was written to fix.
 The captain's own call on this tradeoff: a rare duplicate costs him nothing to notice and ignore; a dropped message costs him the answer.
 Retry stays, unconditionally, for both cases.

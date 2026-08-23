@@ -221,6 +221,13 @@ else
 fi
 if [ "$X_MODE" -eq 1 ]; then
   printf '%s%s%s\n' '- X mode: active; source ' "$cadence_env" ' before launching any watcher process so the 30s cadence is inherited.'
+elif [ "$TG_MODE" -eq 1 ]; then
+  # Telegram alone (X mode off) still drives FAST_CADENCE via the shared
+  # cadence_env file, so an unqualified "use the default watcher cadence"
+  # here directly contradicted the very next line's "source ... 30s cadence"
+  # instruction. State X mode's own status without a cadence claim that
+  # belongs to Telegram's line instead.
+  printf '%s\n' '- X mode: inactive.'
 else
   printf '%s\n' '- X mode: inactive; use the default watcher cadence.'
 fi

@@ -104,6 +104,19 @@ while :; do
   [ "$rc" -eq 0 ] || { back_off; continue; }
   fails=0
   if [ -n "$out" ]; then
+    # fm-tg-fetch.py's own record write leaves "surfaced" at 0 - only
+    # fm-tg-drain.py increments it. This success path used to print "$out"
+    # and exit without that bookkeeping, on the false assumption that this
+    # waiter always delegates to the drain to produce its output - it does
+    # NOT here, since fetch.py already produced the text above. Without this,
+    # a reply composed more than 10s later found the record still
+    # surfaced=0, so bin/fm-tg-archive.py could only retire it through the
+    # never-surfaced window (which does not cover >10s), leaving an already-
+    # answered message stuck re-surfacing forever. Run the drain silently
+    # first - its own stdout is discarded, "$out" below is what this waiter
+    # actually prints - so the record picks up the same surfaced stamp and
+    # state/.tg-last-surfaced mark the drain-only path always gave it.
+    python3 "$SCRIPT_DIR/fm-tg-drain.py" "$IN" "$DONE" >/dev/null 2>&1 || true
     printf '%s\n' "$out"
     exit 0
   fi

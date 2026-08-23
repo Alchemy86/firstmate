@@ -44,6 +44,12 @@ for path in glob.glob(os.path.join(inbox, "*.json")):
         rec = json.load(open(path))
     except Exception:
         continue
+    # A record that parses as JSON but is not a dict (e.g. an interrupted
+    # write that left a bare number or array) has no .get() - skip it rather
+    # than crash the whole drain, the same non-dict tolerance every other
+    # reader of these records already has (fm-tg-archive.py's load()).
+    if not isinstance(rec, dict):
+        continue
     rows.append((rec.get("ts") or 0, path, rec))
 rows.sort(key=lambda r: r[0])
 
