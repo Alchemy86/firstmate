@@ -62,6 +62,10 @@ When any diagnostic needs captain attention, report the plain consequence and re
   Only when a running watcher needs the cadence transition applied immediately, restart the home-scoped watcher through the emitted harness supervision protocol; bootstrap deliberately never restarts the watcher itself.
 - `TELEGRAM: on (chat configured) - ...` / `TELEGRAM: off - removed ...` - bootstrap confirmed or removed this machine's Telegram captain-comms poll artifacts (`docs/telegram.md`).
   Both are completed facts and need no action beyond the same optional cadence restart as the Relay line above.
+- `TELEGRAM: inbound is Claude-only on this setup - ...` - Telegram is configured but this primary's detected harness is not Claude, so only the two Claude-registered Stop hooks that surface a captain message and enforce a reply exist; nothing does that on this harness.
+  `bin/fm-tg-fetch.py` already refuses to send the arrival `...` acknowledgement in this case rather than falsely promise the captain his message is being handled, so an unanswered message here correctly looks unhandled instead of silently vanishing.
+  Outbound sends (`bin/fm-tg-send.sh`) are unaffected on every harness.
+  No action needed unless the captain actually wants inbound working on this harness, which is a standing scope decision (`docs/telegram.md` "Inbound is Claude-only"), not something to fix ad hoc.
 - `TELEGRAM: off - missing poll dependencies ...` - `curl` or `python3` is absent, so bootstrap disarmed the Telegram poll and printed the matching `MISSING:` line.
   Handle the `MISSING:` line by the rule at the top of this skill; the poll rearms itself on the next bootstrap once the tool is installed.
 - `TELEGRAM: off - failed to arm ...` / `TELEGRAM: off - failed to remove ...` - bootstrap could not write, register, or clear the poll shim, its byte binding, or the cadence config, so the captain's Telegram channel is NOT being polled.

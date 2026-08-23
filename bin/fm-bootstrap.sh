@@ -1132,6 +1132,20 @@ EOF
   x_mode_write_if_changed "$cadence" "$cadence_body" 600 || { telegram_arm_failed; return 0; }
 
   echo "TELEGRAM: on (chat configured) - poll armed via state/tg-watch.check.sh; 30s watcher cadence in config/tg-mode.env"
+
+  # Inbound is Claude-only (docs/telegram.md "Stop hook registration"): only
+  # .claude/settings.json registers the surface/reply-guard Stop hooks, so on
+  # any other primary a captain message is still recorded and acked by the
+  # watcher poll above, but never actually surfaces to the model or gets a
+  # reply enforced. bin/fm-tg-fetch.py independently refuses to send that ack
+  # at all on a non-Claude harness (the captain's ruling, 2026-08-23: an ack
+  # with nothing behind it is a false promise, worse than none), so this line
+  # exists to say plainly, once per session start, WHY messages will look
+  # unacknowledged rather than leave that silently discovered.
+  case "$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null)" in
+    claude) ;;
+    *) echo "TELEGRAM: inbound is Claude-only on this setup - this primary is not Claude, so a captain message will be recorded but never surfaced or acknowledged; outbound sends still work normally" ;;
+  esac
 }
 
 crew_dispatch_validate() {

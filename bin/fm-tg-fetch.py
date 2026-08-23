@@ -73,6 +73,7 @@ chat he originally paired.
 """
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.request
@@ -86,10 +87,12 @@ import fm_tg_records as records          # noqa: E402
 GETFILE_MAX = 30
 DOWNLOAD_MAX = 120
 ACK_MAX = 25
+HARNESS_CHECK_MAX = 5
 # Below this there is no point starting the call at all.
 GETFILE_MIN = 3
 DOWNLOAD_MIN = 4
 ACK_MIN = 3
+HARNESS_CHECK_MIN = 1
 
 DEADLINE = None
 
@@ -191,15 +194,45 @@ def fetch_media(tok, message, fid, media_dir):
         return None
 
 
+def harness_can_surface():
+    """Only Claude has the Stop-hook drain/guard pair that actually shows a
+    captain message to the model and enforces a reply (docs/telegram.md
+    "Inbound is Claude-only"). Acking a message on any other primary harness
+    would tell the captain it landed and is being worked when nothing will
+    ever surface it - a false promise, worse than no ack at all, and exactly
+    the "ack then silence forever" failure the captain was angriest about
+    (2026-08-23: "that is a FALSE PROMISE... we would be manufacturing it").
+
+    Fails toward "no": an undetectable harness, a missing bin/fm-harness.sh,
+    or a timed-out check all mean this returns False, so a message looks
+    unhandled rather than falsely reassures. The watcher's own poll (running
+    on every primary harness) is the caller that actually needs this - the
+    long-poll path only ever runs from Claude's own Stop hook to begin with,
+    so this check is a no-op there in practice, but it is applied
+    unconditionally rather than keyed on `mode` so the guarantee holds even
+    if that calling context ever changes."""
+    tmo = allot(HARNESS_CHECK_MAX, HARNESS_CHECK_MIN)
+    if tmo is None:
+        return False
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fm-harness.sh")
+    try:
+        result = subprocess.run(
+            [script], timeout=tmo,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return result.stdout.decode("utf-8", "replace").strip() == "claude"
+    except Exception:
+        return False
+
+
 def ack_on_arrival(send_script):
     """Best-effort instant '...' so the captain knows the message landed.
     Returns True on a send that did not raise, so the caller can mark the
-    record acked=1; fm-tg-drain.py retries later if this returns False."""
+    record acked=1; fm-tg-drain.py retries later if this returns False.
+    Caller must gate this on harness_can_surface() first - see there."""
     ack_tmo = allot(ACK_MAX, ACK_MIN)
     if ack_tmo is None:
         return False
     try:
-        import subprocess
         result = subprocess.run(
             [send_script, "..."], timeout=ack_tmo,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -266,6 +299,11 @@ def main():
     new_texts = []
     unusable_updates = 0
     write_failures = 0
+    # Computed at most once per fetch, not per message (the harness cannot
+    # change mid-batch and a batch can carry several new messages), and only
+    # when actually needed - a batch of all-duplicate or all-unusable updates
+    # never reaches the ack point at all.
+    can_surface = None
     for update in results:
         uid = update.get("update_id")
         # Every acknowledgement offset is uid + 1, so an update carrying no
@@ -329,7 +367,9 @@ def main():
             break
         write_offset(offset_file, uid)
 
-        if ack_on_arrival(send_script):
+        if can_surface is None:
+            can_surface = harness_can_surface()
+        if can_surface and ack_on_arrival(send_script):
             rec["acked"] = 1
             write_record(path, rec)
 

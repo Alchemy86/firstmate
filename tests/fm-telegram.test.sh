@@ -131,7 +131,8 @@ fm_tg_scratch_bin() {
   mkdir -p "$sbin"
   for f in "$ROOT"/bin/fm-tg-*.sh "$ROOT"/bin/fm-tg-*.py "$ROOT"/bin/fm_tg_records.py \
     "$ROOT"/bin/fm-primary-scope-lib.sh "$ROOT"/bin/fm-hook-host-lib.sh \
-    "$ROOT"/bin/fm-timeout-lib.sh "$ROOT"/bin/fm-wake-lib.sh; do
+    "$ROOT"/bin/fm-timeout-lib.sh "$ROOT"/bin/fm-wake-lib.sh \
+    "$ROOT"/bin/fm-harness.sh "$ROOT"/bin/fm-cursor-lib.sh; do
     cp "$f" "$sbin/$(basename "$f")"
   done
   cat > "$sbin/fm-tg-isfirstmate.sh" <<'SH'
@@ -248,6 +249,38 @@ test_bootstrap_registers_poll_shim() {
   assert_absent "$home/config/tg-mode.env" "opt-out must remove the cadence config"
   rm -f "$TMP_ROOT/arm-out" "$TMP_ROOT/disarm-out"
   pass "telegram: bootstrap arms AND registers state/tg-watch.check.sh, and opt-out clears the binding too"
+}
+
+test_bootstrap_warns_inbound_claude_only_on_other_harnesses() {
+  local home env
+
+  home="$TMP_ROOT/inbound-scope-home"
+  mkdir -p "$home/state" "$home/config"
+  env=$(fm_tg_env "$home")
+
+  # CURSOR_AGENT wins over both CLAUDECODE and process ancestry in
+  # bin/fm-harness.sh (checked first, deliberately), so this reliably forces
+  # a non-Claude verdict regardless of which harness actually launched this
+  # test suite - see the identical reasoning in
+  # test_poll_does_not_ack_on_a_non_claude_harness above.
+  CURSOR_AGENT=1 FM_BOOTSTRAP_NETWORK=skip FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" \
+    "$ROOT/bin/fm-bootstrap.sh" >"$TMP_ROOT/inbound-scope-out" 2>&1
+  assert_grep "TELEGRAM: on" "$TMP_ROOT/inbound-scope-out" "bootstrap must still arm the (harness-agnostic) poll on a non-Claude primary"
+  assert_grep "TELEGRAM: inbound is Claude-only on this setup" "$TMP_ROOT/inbound-scope-out" \
+    "bootstrap must plainly warn that inbound will not surface when the primary is not Claude"
+
+  # A Claude primary gets the normal arm line and no such warning.
+  home="$TMP_ROOT/inbound-scope-claude-home"
+  mkdir -p "$home/state" "$home/config"
+  env=$(fm_tg_env "$home")
+  FM_BOOTSTRAP_NETWORK=skip FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" \
+    "$ROOT/bin/fm-bootstrap.sh" >"$TMP_ROOT/inbound-scope-claude-out" 2>&1
+  assert_grep "TELEGRAM: on" "$TMP_ROOT/inbound-scope-claude-out" "bootstrap must arm Telegram for a configured Claude home"
+  assert_not_contains "$(cat "$TMP_ROOT/inbound-scope-claude-out")" "inbound is Claude-only" \
+    "a Claude primary must not warn about its own inbound path"
+
+  rm -f "$TMP_ROOT/inbound-scope-out" "$TMP_ROOT/inbound-scope-claude-out"
+  pass "telegram: bootstrap warns plainly when Telegram is configured on a primary whose harness cannot surface inbound messages"
 }
 
 test_cadence_config_is_actually_usable() {
@@ -1365,6 +1398,48 @@ test_poll_sh_end_to_end() {
   pass "telegram: bin/fm-tg-poll.sh (the state/tg-watch.check.sh watcher artifact) fetches, records, and acks end-to-end"
 }
 
+test_poll_does_not_ack_on_a_non_claude_harness() {
+  local home env inbox out log
+
+  home="$TMP_ROOT/poll-no-surface-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  inbox="$home/state/tg-inbox"
+  log="$TMP_ROOT/poll-no-surface-curl.log"
+
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":91,"message":{"chat":{"id":999},"date":410,"text":"nothing will ever surface this"}}]}'
+
+  # bin/fm-harness.sh checks CURSOR_AGENT before both CLAUDECODE and process
+  # ancestry (bin/fm-harness.sh "Cursor is checked BEFORE claude, deliberately"),
+  # so this reliably forces a non-Claude verdict regardless of what harness
+  # actually launched this test suite - unlike unsetting markers alone, which
+  # a real `claude` ancestor process in this environment would still resolve
+  # to "claude" through ancestry.
+  #
+  # THE CAPTAIN'S RULING (2026-08-23): on a harness with no Stop-hook path to
+  # surface a message, acking it is a FALSE PROMISE - it tells the captain his
+  # message landed and is being worked when nothing will ever show it to the
+  # model or demand a reply. An unanswered message with no ack at least looks
+  # broken instead of looking handled.
+  out=$(CURSOR_AGENT=1 FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" "$ROOT/bin/fm-tg-poll.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_contains "$out" "telegram: 1 message(s)" "the poll must still report and record the message on a non-Claude harness"
+  assert_present "$inbox/91.json" "the message must still be recorded on a non-Claude harness - only the ack is withheld"
+  assert_no_grep '"acked": 1' "$inbox/91.json" "a non-Claude harness must not mark the message acked"
+  assert_no_grep sendMessage "$log" "a non-Claude harness must never actually call sendMessage for the arrival ack"
+
+  # A Claude primary polling the SAME home afterward must still ack normally -
+  # this is a per-poll harness check, not a home-wide latch.
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":92,"message":{"chat":{"id":999},"date":420,"text":"claude picks this one up"}}]}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" "$ROOT/bin/fm-tg-poll.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_grep '"acked": 1' "$home/state/tg-inbox/92.json" "a Claude poll on the same home must ack normally"
+
+  pass "telegram: bin/fm-tg-poll.sh withholds the arrival ack on a non-Claude harness instead of falsely promising the message will surface"
+}
+
 test_poll_reports_a_refusal_once() {
   local home env out
 
@@ -1647,6 +1722,7 @@ test_hook_long_poll_is_single_flight
 test_video_note_and_sticker_are_not_dropped
 test_retired_records_and_media_are_capped
 test_bootstrap_registers_poll_shim
+test_bootstrap_warns_inbound_claude_only_on_other_harnesses
 test_cadence_config_is_actually_usable
 test_guard_block_budget_bounded
 test_poll_records_before_slow_work
@@ -1679,6 +1755,7 @@ test_send_retry_labels_definite_non_send
 test_send_retry_labels_ambiguous_empty_reply
 test_send_retry_labels_timeout_as_ambiguous
 test_poll_sh_end_to_end
+test_poll_does_not_ack_on_a_non_claude_harness
 test_poll_reports_a_refusal_once
 test_poll_preserves_error_record_on_unexpected_exit
 test_poll_without_a_timeout_binary

@@ -19,7 +19,11 @@ The acknowledgement is normally fired on ARRIVAL by fm-tg-fetch.py (used by
 bin/fm-tg-poll.sh and bin/fm-tg-wait.sh), which marks the record acked=1. This
 script only sends the "..." as a FALLBACK, on first surfacing, when that flag
 is absent - covering a failed arrival-time send so no message goes fully
-unacknowledged.
+unacknowledged. Like the arrival ack, this fallback never fires on a
+non-Claude primary (harness_can_surface() below) - only Claude's Stop hooks
+ever actually surface a message to the model, so acking one anywhere else
+would promise the captain his message is being handled when nothing will
+ever show it to firstmate.
 
 Usage: fm-tg-drain.py <inbox-dir> <processed-dir>
 Prints nothing and exits 1 when there is nothing pending.
@@ -27,6 +31,7 @@ Prints nothing and exits 1 when there is nothing pending.
 import glob
 import json
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +42,30 @@ inbox, done = sys.argv[1], sys.argv[2]
 os.makedirs(done, exist_ok=True)
 state_dir = os.path.dirname(os.path.normpath(inbox))
 bin_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+def harness_can_surface():
+    """Duplicated from bin/fm-tg-fetch.py's function of the same name (a
+    hyphenated bin/fm-tg-*.py filename is a script, not an importable
+    module, so the two owners cannot share one definition) - keep both in
+    sync on any change. Only Claude has the Stop-hook drain/guard pair that
+    actually shows a captain message to the model and enforces a reply
+    (docs/telegram.md "Inbound is Claude-only"). This script's own fallback
+    ack below used to be reachable from bin/fm-tg-poll.sh's harness-agnostic
+    watcher-poll path too (it now calls this script directly to stamp
+    "surfaced" - see fm-tg-poll.sh), which meant a non-Claude primary's own
+    ack, deliberately withheld by fm-tg-fetch.py, was un-withheld right back
+    by this "fallback" - the same false promise the withholding exists to
+    prevent. Fails toward "no": an undetectable harness or a missing
+    bin/fm-harness.sh means no ack, not a false one."""
+    script = os.path.join(bin_dir, "fm-harness.sh")
+    try:
+        result = subprocess.run(
+            [script], timeout=5,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return result.stdout.decode("utf-8", "replace").strip() == "claude"
+    except Exception:
+        return False
 
 rows = []
 for path in glob.glob(os.path.join(inbox, "*.json")):
@@ -95,9 +124,8 @@ try:
 except Exception:
     pass
 
-if first_surface:
+if first_surface and harness_can_surface():
     try:
-        import subprocess
         env = dict(os.environ, FM_TG_ACK="1")
         subprocess.run([os.path.join(bin_dir, "fm-tg-send.sh"), "..."],
                        timeout=25, stdout=subprocess.DEVNULL,

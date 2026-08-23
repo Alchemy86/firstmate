@@ -39,7 +39,7 @@ A host where other local users are not trusted should not hold `~/.config/fm-tel
 ## What it does
 
 - The captain sends the bot a Telegram message at any time, including mid-turn.
-- Firstmate's Stop hooks surface it, acknowledge it instantly with a bare `...`, and demand a real reply before the turn is allowed to end quietly.
+- Firstmate's Stop hooks surface it, acknowledge it instantly with a bare `...`, and demand a real reply before the turn is allowed to end quietly - on a Claude primary; see "Inbound is Claude-only" below for every other harness.
 - Long or multi-thousand-character answers auto-split into a numbered thread; images, documents, and other files send as attachments.
 - The captain can send images too; captionless ones still land (with their local path recorded) instead of being silently dropped.
 
@@ -99,6 +99,26 @@ Cursor loads `<project>/.claude/settings.json` as well as its own registration a
 Both also check for usable configuration before they touch the filesystem at all.
 An ungated `mkdir` in `bin/fm-tg-hook.sh` used to create `state/tg-inbox` and `state/tg-processed` on every turn end of every firstmate primary, including one that had never configured Telegram, which broke this file's opening promise that an unconfigured home is left byte-for-byte unchanged.
 
+### Inbound is Claude-only
+
+**Outbound and inbound are genuinely different here, not two halves of one feature - a reader who assumes both work, or neither does, will be wrong either way.**
+
+Outbound (`bin/fm-tg-send.sh`) works on every verified harness: it is a plain script call with no dependency on which harness is running.
+
+Inbound does not. `bin/fm-tg-poll.sh` itself - the watcher check that fetches and records a captain message - is harness-agnostic and runs the same on every primary, because the watcher that drives it is.
+But *surfacing* a recorded message to the model and *enforcing* a reply is done entirely by the two Stop hooks above, and those are registered only in `.claude/settings.json`.
+On any primary other than Claude, nothing ever drains `state/tg-inbox/`, nothing ever prints `CAPTAIN: <text>` to the model, and nothing ever refuses a quiet turn end over it.
+
+**Defect this would have been (caught before ship, 2026-08-23).** The obvious naive behavior - poll, record, and instantly ack every message the same way regardless of harness - would have told the captain his message landed and was being worked, on a primary where nothing will ever actually show it to firstmate.
+That is a false promise: an ack that is never followed by anything is indistinguishable, from the captain's side, from the exact "acknowledged then silence forever" failure this whole feature exists to end.
+
+**Fix.** `bin/fm-tg-fetch.py`'s `harness_can_surface()` checks the running primary's own harness (`bin/fm-harness.sh`) before ever sending the arrival ack, and `bin/fm-tg-drain.py`'s fallback ack (for a failed arrival-time send) checks the identical thing before firing.
+On a non-Claude primary, a captain message is still recorded - nothing is lost, it is simply never shown - but it gets no `...`, so an unanswered message correctly looks unhandled instead of falsely reassuring.
+Both checks fail toward "no": an undetectable harness, a timeout, or a missing `bin/fm-harness.sh` all withhold the ack rather than risk a false one.
+Session start's bootstrap prints `TELEGRAM: inbound is Claude-only on this setup - ...` once, plainly, whenever Telegram is configured on a primary bootstrap detects as anything other than Claude, so this is never a silent surprise.
+
+Building real inbound coverage for the other verified harnesses - a Stop-hook or extension equivalent of `bin/fm-tg-guard.sh`/`bin/fm-tg-hook.sh` for Codex, Pi, OpenCode, Cursor, and Grok - is a real, multi-day expansion (five structurally distinct hook/extension systems, each needing its own drain-and-guard logic, tests, and review) and is a deliberate, standing scope decision to defer, not an oversight.
+
 ## Guarantees
 
 Each of these was a real, captain-visible failure before the fix that now guarantees it cannot recur.
@@ -135,6 +155,7 @@ If the harness did not actually surface that print - which happened repeatedly -
 **Fix.** `bin/fm-tg-archive.py` retires a message ONLY after a real reply has actually been sent (`bin/fm-tg-send.sh` calls it on every send that is not an ack).
 An unanswered message re-surfaces on every subsequent Stop hook firing via `bin/fm-tg-drain.py` instead of disappearing, so a wake the model missed simply tries again next turn.
 A later, subtler version of this same guarantee - a proactive/unrelated send must never sweep up a message that was never actually shown to the model - is covered under "No message is answered twice" below, since the fix for both lives in the same file.
+"Not lost" is not "surfaced": on a non-Claude primary a message is recorded and held here just the same, but nothing ever surfaces it (see "Inbound is Claude-only" above), so this guarantee alone does not mean the captain gets an answer.
 
 Every write to a record is also all-or-nothing, through `bin/fm_tg_records.py`.
 A record is the only copy of what the captain sent, and a plain truncating write leaves invalid JSON behind if the process dies mid-write - which every reader then skips for ever, while the offset file has already advanced past that update id, so it is never refetched either.
