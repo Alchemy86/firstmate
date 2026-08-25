@@ -712,6 +712,50 @@ test_scout_and_secondmate_scaffold() {
   pass "fm-brief: scout and secondmate code paths still scaffold well-formed briefs"
 }
 
+# The standing-rules block (AGENTS.md-repeated engineering practice: existing
+# tooling first, never bend a test/baseline, measure over quoting a doc,
+# report faithfully, no AI attribution, the shared-stash ban) must reach every
+# ship and scout brief so it is never dependent on being retyped into {TASK}.
+# Ship additionally gets the fetched-remote branch rule; scout must not, since
+# it never branches; secondmate charters touch no project worktree directly,
+# so they must carry none of it - their own crewmates get it from their own
+# generated briefs.
+test_standing_rules_scoped_by_kind() {
+  local home ship scout charter
+  home="$TMP_ROOT/standing-rules-home"
+  mkdir -p "$home/data"
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" standing-ship-s1 some-proj --mode no-mistakes >/dev/null 2>&1 \
+    || fail "fm-brief.sh ship scaffold exited non-zero"
+  ship="$home/data/standing-ship-s1/brief.md"
+  assert_grep "# Standing rules" "$ship" "ship brief missing the standing-rules section"
+  assert_grep "Use the existing tooling" "$ship" "ship brief missing the existing-tooling rule"
+  assert_grep "Never weaken, disable, special-case, or re-bless a test or a baseline" "$ship" \
+    "ship brief missing the never-bend-a-test/baseline rule"
+  assert_grep "Measure, do not quote a doc figure" "$ship" "ship brief missing the measure-not-quote rule"
+  assert_grep "an honest negative is worth more than a fake win" "$ship" "ship brief missing the report-faithfully rule"
+  assert_grep "No AI attribution anywhere you write" "$ship" "ship brief missing the no-AI-attribution rule"
+  assert_grep "\`git stash\` is banned" "$ship" "ship brief missing the shared-stash ban"
+  assert_grep "Branch from the freshly fetched remote default branch" "$ship" \
+    "ship brief missing the fetched-remote branch rule"
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" standing-scout-s1 some-proj --scout >/dev/null 2>&1 \
+    || fail "fm-brief.sh scout scaffold exited non-zero"
+  scout="$home/data/standing-scout-s1/brief.md"
+  assert_grep "# Standing rules" "$scout" "scout brief missing the standing-rules section"
+  assert_grep "\`git stash\` is banned" "$scout" "scout brief missing the shared-stash ban"
+  assert_no_grep "Branch from the freshly fetched remote default branch" "$scout" \
+    "scout brief must not carry the branch rule - it never branches"
+
+  FM_SECONDMATE_CHARTER='Supervise the alpha domain.' \
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" standing-sm-s1 --secondmate alpha >/dev/null 2>&1 \
+    || fail "fm-brief.sh secondmate scaffold exited non-zero"
+  charter="$home/data/standing-sm-s1/brief.md"
+  assert_no_grep "# Standing rules" "$charter" \
+    "secondmate charter must not carry the standing-rules block - it touches no project worktree directly"
+  pass "fm-brief.sh: standing rules reach ship and scout, scoped correctly, and secondmate charters carry none"
+}
+
 test_script_parses
 test_no_heredoc_in_command_substitution
 test_help_includes_entire_header
@@ -732,3 +776,4 @@ test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
+test_standing_rules_scoped_by_kind
