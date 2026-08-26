@@ -54,6 +54,14 @@
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
 # over copied detail) and has the crewmate add the fm-ensure-agents-md.sh
 # self-governance section when a touched project AGENTS.md lacks it.
+# Ship and scout briefs also carry a fixed "# Standing rules" block, so the
+# rules firstmate has been retyping from memory into every {TASK} body (and
+# sometimes missing) are guaranteed present instead: existing tooling first,
+# never bend a test or baseline, measure rather than quote a doc, report
+# faithfully, no AI attribution, and the shared-stash ban; ship briefs get one
+# further rule about branching from a freshly fetched remote. A secondmate
+# charter does not touch a project worktree itself, so it carries none of this -
+# its own crewmates get it from their own generated briefs.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -298,6 +306,26 @@ EOF
 HERDR_SECTION=${HERDR_SECTION%$'\n'}
 fi
 
+# Standing rules: engineering practice that is always true, never situational,
+# and repeated in hand-written brief after hand-written brief until it earned a
+# fixed place in the scaffold instead of depending on being retyped correctly
+# every time. Keep this list tight - a wall of boilerplate gets skimmed and
+# defeats its own purpose.
+# shellcheck disable=SC2016  # single quotes are deliberate: these lines are literal brief text whose backtick-wrapped code spans must reach the reading agent verbatim, not expand at scaffold time.
+STANDING_RULES=$(printf '%s\n' \
+  '# Standing rules' \
+  'These hold on every task here, no exception:' \
+  '- **Use the existing tooling.** Check the project'\''s CLI `--help`, its `Makefile`, its `tools/` directory, and its docs before building anything. These repos are mature and tooled; building a worse duplicate of something that already exists is the single most common failure here. If you cannot find a tool for the job, say so explicitly before building one.' \
+  '- Never weaken, disable, special-case, or re-bless a test or a baseline to make a number look better.' \
+  '- Measure, do not quote a doc figure - a number in a document is a hypothesis; verify it and cite what you ran.' \
+  '- Report faithfully: an honest negative is worth more than a fake win, and a gap you name is worth more than one you paper over.' \
+  '- No AI attribution anywhere you write - no `Co-Authored-By`, no "Generated with", no robot emoji, in any commit, PR, or doc.' \
+  '- `git stash` is banned - this worktree pool is shared and a stash can eat another task'\''s work. Use a WIP commit instead.')
+if [ "$KIND" = ship ]; then
+STANDING_RULES=$(printf '%s\n%s\n' "$STANDING_RULES" \
+  '- Branch from the freshly fetched remote default branch, not a stale pooled-clone ref, and say how far behind you started - a stale base can revert everything merged since it was cut.')
+fi
+
 if [ "$KIND" = scout ]; then
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -335,6 +363,8 @@ The report is the only thing that survives, so anything worth keeping must be in
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+
+$STANDING_RULES
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -452,6 +482,8 @@ $RULE1
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+
+$STANDING_RULES
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
