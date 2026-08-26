@@ -238,6 +238,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/captain-hold-lifecycle.md",
+      "audience": "maintainer-architecture"
+    },
+    {
       "path": "docs/cd-guard.md",
       "audience": "maintainer-architecture"
     },
@@ -252,10 +256,6 @@
     {
       "path": "docs/configuration.md",
       "audience": "operator-current"
-    },
-    {
-      "path": "docs/captain-hold-lifecycle.md",
-      "audience": "maintainer-architecture"
     },
     {
       "path": "docs/documentation-audiences.md",
@@ -287,6 +287,10 @@
     },
     {
       "path": "docs/herdr-backend.md",
+      "audience": "operator-current"
+    },
+    {
+      "path": "docs/host-memory.md",
       "audience": "operator-current"
     },
     {
