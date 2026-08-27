@@ -1662,6 +1662,38 @@ test_poll_preserves_error_record_on_unexpected_exit() {
   pass "telegram: an unexpected poll exit (neither refused nor successful) is reported and does not erase the standing failure record"
 }
 
+test_poll_silently_absorbs_a_409_conflict() {
+  local home env out
+
+  home="$TMP_ROOT/poll-409-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+
+  # 409 is Telegram's own signal that a SECOND concurrent getUpdates caller on
+  # this token was refused - the exact collision bin/fm-tg-hook.sh's own long
+  # poll and this watcher check produce when both are live at once. It is
+  # never a channel problem and clears itself the moment the other caller's
+  # own poll ends, so it must not be reported as a wake even here, past the
+  # waiter-deferral guard this fixture does not exercise (that guard is
+  # covered separately below).
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request"}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  [ -z "$out" ] || fail "a 409 conflict was reported as a wake: $out"
+  assert_absent "$home/state/.tg-poll-error" "a 409 must not even be recorded as a standing refusal - it carries no information about the channel's actual health"
+
+  # A GENUINE refusal on the very same channel must still surface loudly -
+  # this carve-out must never widen into swallowing every error.
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":false,"error_code":401,"description":"Unauthorized"}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  assert_contains "$out" "refused the poll" "a non-409 refusal must still be reported"
+  assert_contains "$out" "401" "the report must still carry Telegram's own reason"
+
+  unset FAKE_TG_GETUPDATES_FILE
+  pass "telegram: a 409 (concurrent getUpdates conflict) is absorbed silently while every other refusal still surfaces loudly"
+}
+
 # --- an unusable answer is not a good pass -----------------------------------
 
 test_wait_backs_off_on_error_body() {
@@ -1814,6 +1846,86 @@ test_hook_long_poll_is_single_flight() {
   pass "telegram: at most one long-poll waiter is ever live per home, and its claim is released on exit"
 }
 
+test_poll_defers_to_a_live_hook_waiter() {
+  local home env sbin log out held waited
+
+  home="$TMP_ROOT/poll-defers-home"
+  mkdir -p "$home/state/tg-inbox" "$home/state/tg-processed"
+  env=$(fm_tg_env "$home")
+  sbin=$(fm_tg_scratch_bin "$home/scratch")
+
+  # THE COLLISION THIS FIX REMOVES: bin/fm-tg-hook.sh's own long-poll waiter
+  # is the one actually receiving the captain's messages while it is alive,
+  # so the watcher's short poll calling in on the same token at the same time
+  # only earns a 409 from Telegram and a wasted wake - nothing is ever missed
+  # by skipping the call outright. The poll under test runs the REAL
+  # bin/fm-tg-poll.sh (it never calls fm-tg-isfirstmate.sh, so needs no
+  # scratch stub); only the waiter side needs the scratch bin.
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":950,"message":{"chat":{"id":999},"date":900,"text":"should never reach the short poll"}}]}'
+  ( FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FM_TG_HOOK_MAX=6 \
+    "$sbin/fm-tg-hook.sh" >/dev/null 2>&1 </dev/null ) &
+  held=$!
+  waited=0
+  while [ ! -e "$home/state/.tg-hook.lock" ] && [ "$waited" -lt 40 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  [ -e "$home/state/.tg-hook.lock" ] || fail "the live waiter never published its claim"
+
+  log="$TMP_ROOT/poll-defers-curl.log"
+  : > "$log"
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" "$ROOT/bin/fm-tg-poll.sh")
+  [ -z "$out" ] || fail "the short poll produced output while a live waiter held the claim: $out"
+  [ ! -s "$log" ] || fail "the short poll called curl at all while a live waiter held the claim: $(cat "$log")"
+
+  wait "$held" 2>/dev/null || true
+  unset FAKE_TG_GETUPDATES_FILE
+  pass "telegram: the watcher's short poll defers entirely (no output, no getUpdates call) to a live long-poll waiter"
+}
+
+test_poll_ignores_a_stale_waiter_lock() {
+  local home env lockdir out pid waited
+
+  home="$TMP_ROOT/poll-stale-lock-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  lockdir="$home/state/.tg-hook.lock"
+
+  # A claim left behind by a waiter that died without releasing it (a crash,
+  # a kill -9) must NOT be mistaken for a live one - fail open on doubt,
+  # since silently disabling the captain's inbound channel is far worse than
+  # the noise this fix removes. Acquire the real claim with the repo's own
+  # lock helper, in a process this test then kills outright so the claim
+  # directory is left exactly as a crash would leave it: present, pid
+  # recorded, nothing alive to answer for it.
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$home/state" bash -c "
+    . '$ROOT/bin/fm-wake-lib.sh'
+    fm_lock_try_acquire '$lockdir' || exit 1
+    exec sleep 300
+  " &
+  pid=$!
+  waited=0
+  while [ ! -e "$lockdir" ] && [ "$waited" -lt 40 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  [ -e "$lockdir" ] || fail "test setup could not create the waiter claim"
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  kill -0 "$pid" 2>/dev/null && fail "test setup's fake waiter did not actually die"
+  [ -e "$lockdir" ] || fail "test setup's stale claim disappeared on its own - not exercising the case under test"
+
+  fm_tg_getupdates_fixture "$TMP_ROOT" \
+    '{"ok":true,"result":[{"update_id":960,"message":{"chat":{"id":999},"date":910,"text":"a stale lock must not silence this"}}]}'
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" "$ROOT/bin/fm-tg-poll.sh")
+  unset FAKE_TG_GETUPDATES_FILE
+  assert_contains "$out" "telegram: 1 message(s)" "a stale (dead-owner) waiter lock must not suppress the short poll"
+  assert_present "$home/state/tg-inbox/960.json" "the message must still be recorded despite the stale lock"
+
+  pass "telegram: a stale long-poll waiter claim (owner process dead) does not suppress the watcher's short poll"
+}
+
 # --- every kind of message the captain can send is recorded ------------------
 
 test_video_note_and_sticker_are_not_dropped() {
@@ -1904,6 +2016,8 @@ test_wait_backs_off_on_error_body
 test_wait_own_fetch_marks_surfaced
 test_wait_does_not_truncate_a_real_telegram_message_before_marking_surfaced
 test_hook_long_poll_is_single_flight
+test_poll_defers_to_a_live_hook_waiter
+test_poll_ignores_a_stale_waiter_lock
 test_video_note_and_sticker_are_not_dropped
 test_retired_records_and_media_are_capped
 test_bootstrap_registers_poll_shim
@@ -1947,6 +2061,7 @@ test_poll_surfaces_the_chat_id_drop_notice
 test_poll_reports_a_refusal_once
 test_poll_dedups_a_sustained_rate_limit_despite_the_countdown
 test_poll_preserves_error_record_on_unexpected_exit
+test_poll_silently_absorbs_a_409_conflict
 test_poll_without_a_timeout_binary
 test_records_are_private_and_left_whole
 test_isolation_default_survives_every_earlier_test

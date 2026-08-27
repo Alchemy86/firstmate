@@ -21,10 +21,12 @@
 # built from what this script has not already spent.
 #
 # A channel that refuses us is reported, not mistaken for a quiet one: a
-# revoked token, a lasting conflict with the Stop hook's long poll, and a rate
-# limit all arrive as an error body curl transfers perfectly. state/.tg-poll-error
-# holds the last reported reason so one standing failure is reported once
-# rather than every cycle, and a usable poll clears it.
+# revoked token and a rate limit both arrive as an error body curl transfers
+# perfectly. state/.tg-poll-error holds the last reported reason so one
+# standing failure is reported once rather than every cycle, and a usable
+# poll clears it. A getUpdates conflict (409) with the Stop hook's own long
+# poll is the one exception - see the waiter-deferral and 409 handling below
+# for why that one is never a standing failure.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,8 +54,35 @@ if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then exit 0; fi
 
 # The captain's message bodies, the offset, and any downloaded media are
 # private state, so everything this poll creates is owner-only (the same
-# umask 077 bin/fm-check-register.sh uses for its trust records).
+# umask 077 bin/fm-check-register.sh uses for its trust records). Set before
+# anything below touches the filesystem, including the waiter-deferral guard's
+# own lock lookup.
 umask 077
+
+# --- defer to a live long-poll waiter ---------------------------------------
+# bin/fm-tg-hook.sh holds a single-flight claim (state/.tg-hook.lock) for as
+# long as its own long poll runs (up to FM_TG_HOOK_MAX, default 1800s; see its
+# own comments on why exactly one waiter exists per home). Telegram allows
+# exactly one getUpdates caller per bot token, so calling in here while that
+# waiter is alive only earns a 409 - and nothing is lost by skipping the call:
+# the waiter is the one actually receiving the captain's messages. Testing the
+# lock PATH's existence would be wrong - a claim left behind by a waiter that
+# died without releasing it must never silence this poll (fail open on doubt,
+# the same bar bin/fm-tg-hook.sh's own claim-acquire path holds itself to) -
+# so this reads the claim's own recorded pid and asks the process, via
+# fm_pid_alive, rather than trusting the filesystem. Sourced here rather than
+# up top with fm-timeout-lib.sh: this poll promises to be completely inert
+# with no Telegram config (this script's own header), and fm-wake-lib.sh's own
+# mkdir -p "$STATE" at source time must not run before the TG_TOKEN/TG_CHAT_ID
+# check above has already confirmed that promise does not apply here.
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+WAIT_LOCK="$STATE/.tg-hook.lock"
+waiter_pid=$(cat "$WAIT_LOCK/pid" 2>/dev/null || true)
+if [ -n "$waiter_pid" ] && fm_pid_alive "$waiter_pid"; then
+  exit 0
+fi
+
 IN="$STATE/tg-inbox"
 OFF="$STATE/.tg-offset"
 mkdir -p "$IN"
@@ -155,7 +184,29 @@ record_refusal() {
 # actually ran to completion and judged the reply usable) clears the record;
 # every other outcome, expected or not, is reported and remembered the same
 # dedup'd way so one broken condition does not wake firstmate every cycle.
+#
+# A 409 specifically is carved out of that "every other outcome" rule. It is
+# Telegram's own signal that a second concurrent getUpdates caller on this
+# token was refused - the waiter-deferral guard above closes the ordinary
+# case, but a waiter that claims the lock AFTER this script already passed
+# that check (or any other timing this repo has not foreseen) can still land
+# one here. It is never a channel problem: it is self-correcting the moment
+# the other caller's own poll ends, and it carries no information about
+# whether a genuine standing refusal (401, 403, 429, ...) is open, so it is a
+# pure no-op - not printed, not recorded, $err left exactly as it was. Matched
+# on the leading error code the same way record_refusal's own dedup key
+# already leaves that code untouched, so this stays a narrow carve-out for
+# this one code rather than a step toward swallowing errors in general.
+is_409=0
 if [ "$rc" -eq 3 ]; then
+  case "$reason" in
+    409\ *) is_409=1 ;;
+  esac
+fi
+
+if [ "$is_409" -eq 1 ]; then
+  :
+elif [ "$rc" -eq 3 ]; then
   [ -n "$reason" ] || reason="unusable reply"
   record_refusal "telegram: the channel refused the poll ($reason)"
 elif [ "$rc" -eq 0 ]; then
