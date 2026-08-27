@@ -72,5 +72,14 @@
         ]
       }
     ]
+  },
+  "worktree": {
+    "bgIsolation": "none"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(/home/aaron/.local/bin/fm-handover-mobile.sh)",
+      "Bash(/home/aaron/.local/bin/fm-handover-mobile.sh:*)"
+    ]
   }
 }
