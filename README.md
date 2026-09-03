@@ -205,6 +205,7 @@ Firstmate's skills live in two separate places with different audiences:
 - [docs/calm.md](docs/calm.md) - current Pi `/calm` behavior and supported presentation limits.
 - [docs/voice-relay.md](docs/voice-relay.md) - the optional spoken interface: setup on both machines, measured round-trip cost, what a spoken answer may read, and what this build does not do yet.
 - [docs/telegram.md](docs/telegram.md) - the optional two-way Telegram captain-comms channel: setup, architecture, and its current guarantees - only the first mate talks to the captain, no message is lost, and none is answered twice.
+- [docs/discord.md](docs/discord.md) - the optional outbound-only Discord channel for fleet updates: setup, the colour-coded kind table, attachment sizing, and why it never accepts inbound instructions.
 - [docs/wedge-alarm.md](docs/wedge-alarm.md) - configure the active alert for an away-mode escalation delivery that gets stuck.
 - [docs/tmux-backend.md](docs/tmux-backend.md) - current setup and limits for the tmux reference backend.
 - [docs/herdr-backend.md](docs/herdr-backend.md) - current setup, safety boundaries, and limits for the experimental Herdr backend.

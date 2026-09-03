@@ -26,6 +26,7 @@
   "readmeSetupTargets": [
     "docs/configuration.md",
     "docs/telegram.md",
+    "docs/discord.md",
     "docs/wedge-alarm.md",
     "docs/tmux-backend.md",
     "docs/herdr-backend.md",
@@ -159,6 +160,10 @@
     },
     {
       "path": ".agents/skills/harness-adapters/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
+      "path": ".agents/skills/human-writeups/SKILL.md",
       "audience": "agent-runtime"
     },
     {
@@ -340,6 +345,14 @@
     {
       "path": "docs/supervision-protocols/unknown.md",
       "audience": "agent-runtime"
+    },
+    {
+      "path": "docs/discord.md",
+      "audience": "operator-current"
+    },
+    {
+      "path": "docs/examples/discord-layout.json",
+      "audience": "operator-example"
     },
     {
       "path": "docs/telegram.md",

@@ -515,6 +515,18 @@ When it is configured, the locked session-start bootstrap step writes `state/tg-
 The `FM_TG_*` knobs are listed under "Environment variables" below with the rest of the runtime tuning; [telegram.md](telegram.md) owns the behavior they tune, along with the feature's guarantees, its Stop hook registrations, and its runtime state.
 This section owns only where its configuration lives and what bootstrap generates from it.
 
+## Discord fleet updates (~/.config/firstmate/discord.env / config/discord-channels.env)
+
+Discord fleet updates are presence-gated on `~/.config/firstmate/discord.env`, which lives outside this repo and outside `FM_HOME` by design - one bot per machine regardless of how many firstmate homes exist - and must set `DISCORD_BOT_TOKEN`.
+Absent or partial configuration is silent and inert: nothing is written and nothing about firstmate's behavior changes.
+Unlike Telegram, nothing generates a cadence file or a watcher shim for Discord, and no bootstrap step touches it, because the channel is outbound only and polls nothing.
+
+`bin/fm-dc-setup.sh` generates `config/discord-channels.env`, holding `DC_GUILD_ID`, the measured `DC_MAX_UPLOAD` attachment ceiling, and one `DC_CHANNEL_<NAME>` per resolved channel.
+That file is local, gitignored with the rest of `config/`, and holds channel ids only, never a credential.
+
+The `FM_DC_*` knobs are listed under "Environment variables" below with the rest of the runtime tuning; [discord.md](discord.md) owns the behavior they tune, along with the kind table, the upload sizing, and the feature's guarantees.
+This section owns only where its configuration lives and what setup generates from it.
+
 ## Process-to-event sources (state/procevent)
 
 A long-polling external process is registered as a *source* through its adapter, whose header and `--help` own the commands and flags.
@@ -708,6 +720,13 @@ FM_COMPOSER_IDLE_RE=    # optional fleet-wide idle-placeholder regex override (b
 FM_COMPOSER_CAPTURE_LINES=20   # fleet-wide bound for tail-capture composer reads; tmux instead supplies its bounded visible pane, while the other adapters use this small window so stale scrollback banners stay out of the candidate set
 FM_COMPOSER_PI_MAX_LINES=8     # fleet-wide: maximum rows admitted between Pi's identity-corroborated separator pair; taller or ambiguous candidates stay unknown
 FM_COMPOSER_GHOST_LUMA_MAX=128   # fleet-wide: max perceived luminance (0.299R+0.587G+0.114B, 0-255) for a TRUECOLOR foreground to count as de-emphasised ghost/placeholder text and be stripped; dim/faint (SGR 2) is stripped regardless. Assumes a dark terminal theme (bin/fm-composer-lib.sh's fm_composer_strip_ghost, used by styled tmux, herdr, and Zellij reads)
+# Discord fleet updates; outbound only, presence-gated on ~/.config/firstmate/discord.env (docs/discord.md)
+FM_DC_ENV_OVERRIDE=      # alternate Discord credential file; default ~/.config/firstmate/discord.env, mainly for tests
+FM_DC_CHANNELS_OVERRIDE= # alternate generated channel map; default $FM_HOME/config/discord-channels.env
+FM_DC_API_OVERRIDE=      # alternate API base; default https://discord.com/api/v10, for tests only
+FM_DC_MAX_UPLOAD=        # override the attachment ceiling in bytes; default is the tier measured by fm-dc-setup.sh
+FM_DC_FORCE=             # set to bypass the crew-worktree refusal; firstmate's own maintenance only
+
 # Telegram captain-comms; presence-gated on ~/.config/fm-telegram.env (docs/telegram.md)
 FM_TG_ENV_OVERRIDE=     # alternate Telegram config file; default ~/.config/fm-telegram.env, mainly for tests
 FM_TG_HOOK_MAX=1800     # seconds the Stop hook's long poll may live; must stay under its registered hook timeout

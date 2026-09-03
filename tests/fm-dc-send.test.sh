@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# Behavioral regressions for the outbound-only Discord channel.
+#
+# Every check drives the real scripts. Network calls go to a local stub over
+# FM_DC_API_OVERRIDE, so this runs with no credentials and no Discord.
+set -u
+
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+SEND="$ROOT/bin/fm-dc-send.sh"
+EMBED="$ROOT/bin/fm-dc-embed.py"
+TMP_ROOT=$(fm_test_tmproot fm-dc-send)
+
+# A stub Discord: one python http server that records the last request body and
+# answers like the real API. Started per test group so a failure cannot leak a
+# listener into the next one.
+stub_start() {
+  local dir=$1 port
+  mkdir -p "$dir"
+  python3 - "$dir" >"$dir/port" 2>"$dir/stub.err" <<'PY' &
+import http.server, json, os, sys, threading
+d = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n else b""
+    def do_GET(self):
+        # The channel list the resolver reads.
+        if self.path.endswith("/channels"):
+            out = [{"id": "900000000000000001", "name": "ready", "type": 0, "parent_id": None},
+                   {"id": "900000000000000002", "name": "gallery", "type": 0, "parent_id": None}]
+        else:
+            out = {"id": "1", "name": "stub", "premium_tier": 0, "features": []}
+        b = json.dumps(out).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_POST(self):
+        raw = self._body()
+        with open(os.path.join(d, "last-request"), "wb") as f:
+            f.write(raw)
+        with open(os.path.join(d, "last-ua"), "w") as f:
+            f.write(self.headers.get("User-Agent") or "")
+        b = json.dumps({"id": "555000111222333444"}).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PY
+  echo $! > "$dir/pid"
+  local tries=0
+  while [ ! -s "$dir/port" ] && [ "$tries" -lt 100 ]; do sleep 0.05; tries=$((tries + 1)); done
+  port=$(cat "$dir/port" 2>/dev/null)
+  [ -n "$port" ] || fail "stub Discord never reported a port"
+  printf 'http://127.0.0.1:%s\n' "$port"
+}
+
+stub_stop() {
+  local dir=$1
+  [ -f "$dir/pid" ] && kill "$(cat "$dir/pid")" 2>/dev/null
+  return 0
+}
+
+# --- inertness --------------------------------------------------------------
+# The promise is two-shaped: an explicit call must fail loudly so a caller
+# learns its message did not go, while --if-configured must be silently
+# harmless for anything automatic. One behaviour cannot serve both.
+test_unconfigured_is_inert_but_loud() {
+  local out rc missing="$TMP_ROOT/nope/discord.env"
+
+  out=$(FM_DC_FORCE=1 FM_DC_ENV_OVERRIDE="$missing" \
+        "$SEND" --kind note --plain hello 2>&1); rc=$?
+  expect_code 1 "$rc" "an explicit send with no config must fail"
+  assert_contains "$out" "not configured" \
+    "an explicit send with no config must say so"
+
+  out=$(FM_DC_FORCE=1 FM_DC_ENV_OVERRIDE="$missing" \
+        "$SEND" --kind note --plain hello --if-configured 2>&1); rc=$?
+  expect_code 0 "$rc" "--if-configured with no config must exit 0"
+  assert_contains "|$out|" "||" \
+    "--if-configured with no config must print nothing at all"
+
+  # A file that exists but carries no token is not configuration either.
+  mkdir -p "$TMP_ROOT/partial"
+  echo 'DISCORD_CLIENT_ID=123' > "$TMP_ROOT/partial/discord.env"
+  out=$(FM_DC_FORCE=1 FM_DC_ENV_OVERRIDE="$TMP_ROOT/partial/discord.env" \
+        "$SEND" --kind note --plain hello 2>&1); rc=$?
+  expect_code 1 "$rc" "a tokenless config file must not count as configured"
+  assert_contains "$out" "DISCORD_BOT_TOKEN" \
+    "a tokenless config file must name the missing field"
+
+  pass "unconfigured is inert for automatic callers and loud for explicit ones"
+}
+
+# --- the kind table ---------------------------------------------------------
+test_kinds_drive_colour_and_routing() {
+  local out
+  out=$(python3 "$EMBED" --print-kinds)
+  for k in ready blocked needs-decision broken landed milestone note gallery; do
+    assert_contains "$out" "$k" "kind '$k' is missing from the kind table"
+  done
+  # THE DELIBERATE OMISSION. A `progress` kind would give routine no-change
+  # chatter somewhere to land, which is the exact noise the channel exists to
+  # stay free of. Its absence is a designed guarantee, so it is asserted.
+  assert_not_contains "$out" "progress" \
+    "a 'progress' kind appeared; routine progress must have nowhere to go"
+
+  assert_contains "$(python3 "$EMBED" --print-channel ready)" "ready" \
+    "kind 'ready' must route to #ready"
+  assert_contains "$(python3 "$EMBED" --print-channel blocked)" "ready" \
+    "a blocker must reach the captain in #ready"
+  assert_contains "$(python3 "$EMBED" --print-channel broken)" "broken" \
+    "kind 'broken' must route to #broken"
+  assert_contains "$(python3 "$EMBED" --print-channel milestone)" "landed" \
+    "a milestone must route to #landed"
+
+  local rc
+  python3 "$EMBED" --print-channel invented >/dev/null 2>&1; rc=$?
+  expect_code 2 "$rc" "an unknown kind must be refused, not routed somewhere"
+
+  # Colours must actually differ, or the whole at-a-glance premise is void.
+  local cg cr
+  cg=$(python3 "$EMBED" --kind landed --title x | python3 -c 'import json,sys; print(json.load(sys.stdin)["embeds"][0]["color"])')
+  cr=$(python3 "$EMBED" --kind broken --title x | python3 -c 'import json,sys; print(json.load(sys.stdin)["embeds"][0]["color"])')
+  [ "$cg" != "$cr" ] || fail "landed and broken must not share a colour"
+  pass "kinds drive distinct colours and the channel each one belongs in"
+}
+
+# --- payload safety ---------------------------------------------------------
+# The reason the payload is built in Python at all. A title carrying quotes,
+# a newline and a backslash must survive as DATA, and the result must still
+# parse as JSON.
+test_payload_survives_hostile_text() {
+  local nasty payload
+  nasty='O'"'"'Brien said "ship it" \ then <b>left</b>
+second line; with a semicolon'
+  payload=$(python3 "$EMBED" --kind ready --title "$nasty" --text "$nasty" \
+              --field "Odd=a\"b'c" --url 'https://example.invalid/pr/1')
+  printf '%s' "$payload" | python3 -c 'import json,sys; json.load(sys.stdin)' \
+    || fail "a hostile title must still produce parseable JSON"
+  # Round-trip the value rather than grepping the encoding, so the assertion is
+  # about what Discord receives and not about how json.dumps escapes it.
+  printf '%s' "$payload" | FM_EXP="$nasty" python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)["embeds"][0]
+want = os.environ["FM_EXP"]
+assert want in d["title"] or d["title"].endswith("…"), "title lost its text"
+assert d["description"] == want, "description was altered in transit"
+' || fail "hostile text did not survive the round trip intact"
+
+  # A malformed field is refused rather than posted half-built.
+  local rc
+  python3 "$EMBED" --kind ready --field 'novalue' >/dev/null 2>&1; rc=$?
+  expect_code 2 "$rc" "a --field without name=value must be refused"
+  pass "hostile captain-facing text round-trips as data, not as markup"
+}
+
+test_long_values_are_clipped_not_rejected() {
+  local long payload len
+  long=$(python3 -c 'print("x" * 9000)')
+  payload=$(python3 "$EMBED" --kind note --title "$long" --text "$long")
+  len=$(printf '%s' "$payload" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["embeds"][0]
+print("%d %d" % (len(d["title"]), len(d["description"])))')
+  assert_contains "$len" "256 4096" \
+    "an over-long title and body must be clipped to Discord's limits, not sent whole"
+  pass "over-long text is clipped locally instead of failing the whole message"
+}
+
+# --- attachments ------------------------------------------------------------
+test_attachment_declaration_and_inline_image() {
+  local payload
+  payload=$(python3 "$EMBED" --kind gallery --title shot --attach-name shot.png)
+  # Discord answers "Invalid Form Body" with no field named if the attachments
+  # array is missing, so its presence is pinned.
+  printf '%s' "$payload" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["attachments"] == [{"id": 0, "filename": "shot.png"}], "attachments array missing"
+assert d["embeds"][0]["image"]["url"] == "attachment://shot.png", "image not wired to the upload"
+' || fail "an image upload must be declared and wired to the embed"
+
+  payload=$(python3 "$EMBED" --kind gallery --title film --attach-name film.mp4)
+  printf '%s' "$payload" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["attachments"], "a video upload must still be declared"
+assert "image" not in d["embeds"][0], "a video must not be wired as an embed image"
+' || fail "a video must not be given a broken inline image frame"
+  pass "uploads are declared, and only still images become the inline image"
+}
+
+test_oversize_file_is_refused_before_upload() {
+  local dir out rc big api
+  dir="$TMP_ROOT/oversize"; mkdir -p "$dir"
+  api=$(stub_start "$dir/stub")
+  big="$dir/big.png"
+  python3 -c 'open("'"$big"'","wb").write(b"\0" * (3 * 1024 * 1024))'
+
+  mkdir -p "$dir/cfg"
+  echo 'DISCORD_BOT_TOKEN=stub-token-not-a-secret' > "$dir/cfg/discord.env"
+  printf 'DC_GUILD_ID=1\nDC_MAX_UPLOAD=1048576\nDC_CHANNEL_GALLERY=900000000000000002\n' \
+    > "$dir/cfg/channels.env"
+
+  out=$(FM_DC_FORCE=1 FM_DC_API_OVERRIDE="$api" \
+        FM_DC_ENV_OVERRIDE="$dir/cfg/discord.env" \
+        FM_DC_CHANNELS_OVERRIDE="$dir/cfg/channels.env" \
+        "$SEND" --kind gallery --file "$big" 2>&1); rc=$?
+  stub_stop "$dir/stub"
+  expect_code 1 "$rc" "a file over the ceiling must be refused"
+  assert_contains "$out" "over this server's" \
+    "the refusal must name the server's own limit"
+  assert_contains "$out" "30fps" \
+    "the refusal must tell the caller how to make a film fit"
+  assert_absent "$dir/stub/last-request" \
+    "an oversize file must be refused BEFORE anything is uploaded"
+  pass "an oversize attachment is refused up front, naming the limit and the way out"
+}
+
+# --- transport --------------------------------------------------------------
+# The semicolon case is a regression, not a hypothetical: curl -F parses ';' in
+# a field value as the start of a parameter, so a caption containing one used to
+# corrupt the multipart body and Discord rejected the message naming no field.
+test_semicolon_payload_survives_multipart_upload() {
+  local dir api out rc img
+  dir="$TMP_ROOT/semicolon"; mkdir -p "$dir"
+  api=$(stub_start "$dir/stub")
+  img="$dir/shot.png"
+  python3 -c 'open("'"$img"'","wb").write(b"\0" * 64)'
+  mkdir -p "$dir/cfg"
+  echo 'DISCORD_BOT_TOKEN=stub-token-not-a-secret' > "$dir/cfg/discord.env"
+  printf 'DC_GUILD_ID=1\nDC_CHANNEL_GALLERY=900000000000000002\n' > "$dir/cfg/channels.env"
+
+  out=$(FM_DC_FORCE=1 FM_DC_API_OVERRIDE="$api" \
+        FM_DC_ENV_OVERRIDE="$dir/cfg/discord.env" \
+        FM_DC_CHANNELS_OVERRIDE="$dir/cfg/channels.env" \
+        "$SEND" --kind gallery --title "Colour key" \
+        --file "$img" "good or bad; act or not" 2>&1); rc=$?
+  expect_code 0 "$rc" "an upload whose caption contains ';' must succeed: $out"
+  assert_contains "$out" "555000111222333444" "the created message id must be printed"
+  # The whole payload must arrive, semicolon and all - a truncated one is the
+  # exact shape of the original defect.
+  python3 - "$dir/stub/last-request" <<'PY' || fail "the multipart payload arrived truncated at the semicolon"
+import re, sys
+raw = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+m = re.search(r'name="payload_json"\r?\n(?:[^\r\n]*\r?\n)*?\r?\n(\{.*?\})\r?\n--', raw, re.S)
+assert m, "no payload_json part found in the request"
+import json
+d = json.loads(m.group(1))
+desc = d["embeds"][0]["description"]
+assert desc == "good or bad; act or not", "payload_json was corrupted: %r" % desc
+PY
+  assert_contains "$(cat "$dir/stub/last-ua")" "DiscordBot (" \
+    "every request must carry the DiscordBot User-Agent Cloudflare demands"
+  stub_stop "$dir/stub"
+  pass "a semicolon in a caption survives the upload, and the UA is always sent"
+}
+
+# --- the crew boundary ------------------------------------------------------
+# Crewmates must never address the captain (AGENTS.md hard rule 4). bin/fm-tg-send.sh
+# had to be retrofitted with this after crews really did message him.
+test_crew_worktree_is_refused() {
+  local dir out rc
+  dir="$TMP_ROOT/crew"; mkdir -p "$dir"
+  mkdir -p "$dir/cfg"
+  echo 'DISCORD_BOT_TOKEN=stub-token-not-a-secret' > "$dir/cfg/discord.env"
+
+  # A real linked worktree is the shape the guard keys on, so build one rather
+  # than a directory that merely looks like a crew location.
+  ( cd "$dir" && git init -q main-repo && cd main-repo \
+    && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m base \
+    && git worktree add -q ../child-wt HEAD ) >/dev/null 2>&1 \
+    || { pass "git worktree unavailable in this sandbox; crew guard case skipped"; return 0; }
+
+  out=$(cd "$dir/child-wt" && FM_DC_ENV_OVERRIDE="$dir/cfg/discord.env" \
+        "$SEND" --kind note --plain "from a crew" 2>&1); rc=$?
+  expect_code 3 "$rc" "a send from inside a crew worktree must be refused"
+  assert_contains "$out" "REFUSED" "the crew refusal must be unmistakable"
+  assert_contains "$out" "status file" "the refusal must name the correct route"
+  pass "a crewmate cannot address the captain through Discord"
+}
+
+test_unconfigured_is_inert_but_loud
+test_kinds_drive_colour_and_routing
+test_payload_survives_hostile_text
+test_long_values_are_clipped_not_rejected
+test_attachment_declaration_and_inline_image
+test_oversize_file_is_refused_before_upload
+test_semicolon_payload_survives_multipart_upload
+test_crew_worktree_is_refused
