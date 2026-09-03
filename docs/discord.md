@@ -130,6 +130,12 @@ A `payload_json` containing a semicolon is silently cut in half, and Discord ans
 A semicolon in captain-facing prose is completely ordinary - the caption that first hit this was "colour tells you good or bad; the channel tells you whether you must act" - so this is a routine input rather than an edge case.
 The payload is therefore written to a private temporary file and passed as `-F name=<file`, which does no such parsing.
 
+**A rate-limit reply is an object where a list was expected.**
+Discord answers a burst with HTTP 429 and a JSON body carrying `retry_after`.
+Code that parses that body as its own success shape reads it as "nothing exists" and duplicates everything it was converging; on the first real layout run this produced four duplicate categories and four duplicate channels before it was caught.
+Two independent fixes hold it closed: `fm_dc_api` honours `retry_after` and backs off, and every channel lookup treats an unreadable list as a hard stop rather than as an empty one.
+A created channel is now folded into the in-memory list instead of re-fetching the whole list per create, which is what provoked the limit to begin with.
+
 **An upload must be declared as well as sent.**
 An embed referencing `attachment://<name>` with no matching entry in the payload's `attachments` array is rejected as `Invalid Form Body` (50035), again naming no field.
 The file part alone is not enough.
@@ -144,21 +150,70 @@ bin/fm-dc-setup.sh --layout docs/examples/discord-layout.json --dry-run
 ```
 
 Channel `type` is `text` (default), `voice`, `announcement`, or `forum`.
-**Announcement and forum channels require the server to be a Community server**, which is a server-posture change rather than a channel: enabling it adds a rules screen, sets discovery eligibility, and changes default notification behaviour.
-It is deliberately not done by any script here.
-When the server is not a Community server, `bin/fm-dc-setup.sh` reports and skips those channels by name and creates the rest, instead of failing the whole run or forwarding an opaque API error.
+**Announcement and forum channels require the server to be a Community server**, which is a server-posture change rather than a channel: enabling it adds a rules screen, raises the verification floor, forces the explicit-content filter on, sets discovery eligibility, and moves default notifications to mentions-only.
+Because of that it happens only under the explicit `--enable-community` flag, never as a side effect of converging a layout.
+Discord requires a rules channel and a moderator-updates channel to exist first, and requires every prerequisite to be set in the same request as the feature itself; `bin/fm-dc-setup.sh --enable-community` does all of that in one call and is a no-op once the feature is on.
+When the server is not a Community server, a layout run reports and skips announcement and forum channels by name and creates the rest, instead of failing the whole run or forwarding an opaque API error.
 
-## Rank roles, and what they actually cost
+## Progression badges: the eight gym badges
 
-Progressive rank roles - awarded automatically as members take part - are two separate things, priced very differently, and it is worth not conflating them.
+The ladder lives in [examples/discord-badges.json](examples/discord-badges.json), which is editable data rather than settings buried in a web UI.
+Apply it with `bin/fm-dc-setup.sh --badges docs/examples/discord-badges.json`, which creates the roles and syncs their colours, and is a no-op on a second run.
 
-- **Role names and thresholds are free.** Any levelling bot that does role rewards can grant a named role at a chosen threshold, so eight custom rank names cost nothing. Role *colours* are free too, so eight visibly distinct ranks are achievable at no cost.
-- **Role ICONS are behind Discord's own paywall, not a bot's.** A small badge image beside a member's name is a Level 2 Server Boost perk, which needs 7 boosts. Icons must be 64x64 and under 256kb, and if the server drops below Level 2 the uploaded icons stay but stop displaying.
+| Badge | Gym | Colour | Level |
+| --- | --- | --- | --- |
+| Boulder | Pewter City | grey | 3 |
+| Cascade | Cerulean City | blue | 7 |
+| Thunder | Vermilion City | yellow | 12 |
+| Rainbow | Celadon City | green | 18 |
+| Soul | Fuchsia City | pink | 25 |
+| Marsh | Saffron City | purple | 35 |
+| Volcano | Cinnabar Island | red | 50 |
+| Earth | Viridian City | teal | 70 |
 
-A **Server Tag** is a different feature again and is often mistaken for a rank badge: it is a 4-character label plus a badge icon, unlocked with 3 boosts, and each member displays at most one at a time by their own choice of which server to represent.
+Every badge role carries an empty permission set on purpose: a badge records what someone did, never what they may do.
+Each is hoisted, so holders group together in the member list and the badge is actually visible.
+
+### What is live in that file, and what is only intent
+
+This distinction matters, because half the file is applied and half is not.
+
+- **Live.** `name`, `colour`, and the order of the list. `bin/fm-dc-setup.sh --badges` creates and updates the real Discord roles from them.
+- **Intent only.** `level` and everything under `earning_rules`. The levelling bot keeps the XP-to-role mapping in its own dashboard and does not read this file, so each number must be entered there once to take effect.
+
+Keeping both in step is the reason the intent is recorded here at all: without it, the only record of what was meant lives in a web UI that nobody diffs.
+
+### What a level actually costs
+
+The threshold is a **levelling level**, not a message count and not days active.
+With Lurkr a member earns a random 15 to 40 XP for a message and then earns nothing for 60 seconds, so the practical unit is **one qualifying message per minute of real conversation**.
+Reactions earn nothing, and voice time earns separately only if voice XP is switched on.
+A level is a total-XP milestone whose message cost depends on the XP curve preset chosen in the bot, so use the [Lurkr level calculator](https://lurkr.gg/levels/calculator) to convert a level into an expected message count once the curve is set.
+
+### Anti-farming, and why the Fleet channels are locked rather than excluded
+
+`earning_rules.no_xp_channels` records the channels that must earn nothing.
+The private Fleet channels are additionally locked so `@everyone` cannot view them at all, which makes "firstmate's automated posts earn no badges" a structural fact rather than a bot setting that can be switched off by accident.
+Level-up announcements are recorded as `off`: a promotion notice on every level is the noise that makes a channel unread, and the role appearing beside the name is the reward.
+
+### Turning on the icons later
+
+`icon` is empty on every row because custom role icons are a **Boost Level 2** perk, needing **7 boosts**.
+Names and colours work today with no boosts at all, so the ladder is fully functional without spending anything.
+
+To add the images later: drop a 64x64 PNG under 256kb beside the badge file, put its path in that badge's `icon`, and re-run with `--badges`.
+No role is recreated and no threshold moves.
+Until the server reaches Level 2 the script says so and applies the colours alone, so running it early is harmless.
+
+A **Server Tag** is a different feature that is often mistaken for a rank badge: a 4-character label plus a badge icon, unlocked with 3 boosts, of which each member displays at most one, chosen by which server they want to represent.
 That makes it a server-identity marker rather than a progression rank, so it cannot express a ladder of eight.
 
-Standard anti-farming settings matter more than the bot choice: a per-message XP cooldown (60 seconds is the usual default), a minimum message length, no-XP channels for bot-command and off-topic rooms, and level-up announcements routed to one channel or disabled rather than fired into conversation.
+### The one part that needs the captain
+
+Creating the roles is done.
+**Granting them automatically requires a levelling bot, and inviting a third-party bot needs an OAuth authorisation in a browser**, which no API token can perform.
+The recommendation is [Lurkr](https://lurkr.gg): message XP, voice XP, leaderboards and role rewards are all on its free tier, where MEE6 paywalls role rewards - the one feature actually needed.
+Self-hosting this on the existing bot was considered and rejected: it would mean rebuilding XP tracking, cooldowns, a leaderboard and a dashboard, and it needs a persistent gateway connection that this outbound-only integration deliberately does not have.
 
 ## Not built, deliberately
 

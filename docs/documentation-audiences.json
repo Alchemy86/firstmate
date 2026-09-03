@@ -351,6 +351,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/examples/discord-badges.json",
+      "audience": "operator-example"
+    },
+    {
       "path": "docs/examples/discord-layout.json",
       "audience": "operator-example"
     },

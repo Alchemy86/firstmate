@@ -141,14 +141,57 @@ if isinstance(d, dict) and d.get("code") and not d.get("id"):
 '
 }
 
+# One bounded, authenticated, UA-carrying call, with Discord's rate limit
+# honoured rather than discovered.
+#
+# WHY THE RETRY IS NOT OPTIONAL: Discord answers a burst with HTTP 429 and a
+# JSON body carrying retry_after. That body is an OBJECT where a list was
+# expected, so a caller that parses it as its own success shape silently reads
+# "no channels exist" and creates duplicates of everything it was converging.
+# That is not hypothetical - it produced four duplicate categories and four
+# duplicate channels on the first real layout run. Backing off here, and
+# failing loudly in the callers, are the two halves of that fix.
 fm_dc_api() {
-  local method=$1 path=$2
+  local method=$1 path=$2 attempt=1 resp wait
   shift 2
-  fm_run_timed 60 curl -sS --max-time 60 \
-    -X "$method" "$FM_DC_API_BASE$path" \
-    -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
-    -H "User-Agent: $FM_DC_UA" \
-    "$@"
+  while [ "$attempt" -le 6 ]; do
+    resp=$(fm_run_timed 60 curl -sS --max-time 60 \
+      -X "$method" "$FM_DC_API_BASE$path" \
+      -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+      -H "User-Agent: $FM_DC_UA" \
+      "$@")
+    case "$resp" in
+      *'"retry_after"'*)
+        wait=$(printf '%s' "$resp" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(max(1, int(float(d.get("retry_after", 2)) + 1)))
+except Exception:
+    print(3)
+' 2>/dev/null || echo 3)
+        [ "$attempt" -ge 6 ] && { printf '%s' "$resp"; return 0; }
+        echo "discord: rate limited, waiting ${wait}s (attempt $attempt)" >&2
+        sleep "$wait"
+        attempt=$((attempt + 1))
+        continue ;;
+    esac
+    printf '%s' "$resp"
+    return 0
+  done
+  return 1
+}
+
+# Assert a response really is the JSON array the caller expects. An error
+# object must never be mistaken for an empty collection.
+fm_dc_is_list() {
+  printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    sys.exit(0 if isinstance(json.load(sys.stdin), list) else 1)
+except Exception:
+    sys.exit(1)
+' 2>/dev/null
 }
 
 # Resolve a channel name or id to an id. A bare numeric string is already an

@@ -283,7 +283,40 @@ test_crew_worktree_is_refused() {
   pass "a crewmate cannot address the captain through Discord"
 }
 
+# --- the badge ladder -------------------------------------------------------
+# The shipped badge file is a contract with the captain: eight Kanto badges in
+# game order, strictly increasing thresholds, distinct colours, and no
+# privileges. A silent edit breaking any of those would stay invisible until
+# somebody earned the wrong thing.
+test_badge_ladder_is_wellformed() {
+  local f="$ROOT/docs/examples/discord-badges.json"
+  assert_present "$f" "the badge ladder file must ship with the repo"
+  python3 - "$f" <<'BADGEPY' || fail "the badge ladder is malformed"
+import json, sys
+d = json.load(open(sys.argv[1]))
+b = d["badges"]
+order = ["Boulder", "Cascade", "Thunder", "Rainbow", "Soul", "Marsh", "Volcano", "Earth"]
+assert len(b) == 8, "expected 8 badges, got %d" % len(b)
+assert [x["name"].split()[0] for x in b] == order, "badges are not in Kanto gym order"
+levels = [x["level"] for x in b]
+assert levels == sorted(levels) and len(set(levels)) == 8, \
+    "thresholds must strictly increase: %r" % levels
+cols = [x["colour"].lower() for x in b]
+assert len(set(cols)) == 8, "two badges share a colour, defeating the at-a-glance point"
+for x in b:
+    int(x["colour"].lstrip("#"), 16)
+    assert "icon" in x, "%s has no icon field to fill in later" % x["name"]
+r = d["earning_rules"]
+assert r["cooldown_seconds"] >= 30, "a short cooldown lets messages be farmed"
+assert r["level_up_announcement"] == "off", "promotion announcements must default off"
+for ch in ("ready", "broken", "landed", "gallery"):
+    assert ch in r["no_xp_channels"], "%s must earn no points; it is automated output" % ch
+BADGEPY
+  pass "the badge ladder is eight ordered gym badges with rising thresholds and no farming"
+}
+
 test_unconfigured_is_inert_but_loud
+test_badge_ladder_is_wellformed
 test_kinds_drive_colour_and_routing
 test_payload_survives_hostile_text
 test_long_values_are_clipped_not_rejected

@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "The eight Kanto gym badges as progression roles, in game order.",
+    "",
+    "WHAT `level` MEANS. It is a LEVELLING LEVEL, not a message count and not days active.",
+    "With the recommended bot (Lurkr) a member earns 15-40 XP for a message, then cannot",
+    "earn again for 60 seconds - so the practical unit is ONE QUALIFYING MESSAGE PER MINUTE",
+    "of real conversation. Reactions earn nothing. Voice time can earn separately if enabled.",
+    "A level is a total-XP milestone, and how many messages a level costs depends on the XP",
+    "curve preset chosen in the bot; use https://lurkr.gg/levels/calculator to convert a",
+    "level into an expected message count once the curve is set.",
+    "",
+    "WHICH PARTS OF THIS FILE ARE LIVE. `name`, `colour` and the order of this list are",
+    "APPLIED FOR REAL by `bin/fm-dc-setup.sh --badges docs/examples/discord-badges.json`,",
+    "which creates and updates the Discord roles themselves. `level` is NOT live: the",
+    "levelling bot owns the XP-to-role mapping in its own dashboard, so the number here is",
+    "the recorded intent and must be entered once in the bot to take effect. Change it here",
+    "too, so the file and the bot never disagree about what was intended.",
+    "",
+    "ICONS, LATER. `icon` is empty on every row because custom role icons need Discord",
+    "Boost Level 2 (7 boosts). Drop a 64x64 PNG under 256kb beside this file, put its path",
+    "in `icon`, re-run with --badges, and the icons attach. Nothing else changes: no roles",
+    "are recreated and no thresholds move. Until the server reaches Level 2 the script says",
+    "so and applies the colours alone."
+  ],
+  "badges": [
+    { "name": "Boulder Badge",  "gym": "Pewter City",    "colour": "#9E9E9E", "level": 3,  "icon": "" },
+    { "name": "Cascade Badge",  "gym": "Cerulean City",  "colour": "#3498DB", "level": 7,  "icon": "" },
+    { "name": "Thunder Badge",  "gym": "Vermilion City", "colour": "#F1C40F", "level": 12, "icon": "" },
+    { "name": "Rainbow Badge",  "gym": "Celadon City",   "colour": "#2ECC71", "level": 18, "icon": "" },
+    { "name": "Soul Badge",     "gym": "Fuchsia City",   "colour": "#E91E63", "level": 25, "icon": "" },
+    { "name": "Marsh Badge",    "gym": "Saffron City",   "colour": "#9B59B6", "level": 35, "icon": "" },
+    { "name": "Volcano Badge",  "gym": "Cinnabar Island","colour": "#E74C3C", "level": 50, "icon": "" },
+    { "name": "Earth Badge",    "gym": "Viridian City",  "colour": "#16A085", "level": 70, "icon": "" }
+  ],
+  "earning_rules": {
+    "_comment": [
+      "Recorded intent for the bot's own settings; entered once in its dashboard.",
+      "no_xp_channels lists channels where activity must earn nothing - the private Fleet",
+      "channels are automated posts, and a bot farming its own badges is the failure mode",
+      "this exists to prevent."
+    ],
+    "xp_per_message_min": 15,
+    "xp_per_message_max": 40,
+    "cooldown_seconds": 60,
+    "minimum_message_length": 4,
+    "no_xp_channels": ["ready", "broken", "landed", "gallery", "github", "moderator-updates"],
+    "level_up_announcement": "off",
+    "level_up_announcement_note": "Off deliberately. A promotion every level in a busy channel is the noise that makes a channel unread; the role appearing beside the name is the reward."
+  }
+}

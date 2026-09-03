@@ -6,56 +6,118 @@
     "Run it with --dry-run first. Nothing here is destructive: the script creates what",
     "is missing and never deletes, renames or reorders what exists.",
     "Channels marked announcement need the server to be a Community server; the script",
-    "reports and skips them until it is, rather than failing the whole run."
+    "reports and skips them until it is, rather than failing the whole run.",
+    "rules and moderator-updates are required by Discord before Community mode can be enabled; create them with a normal run, then re-run with --enable-community."
   ],
   "channels": [
-    { "name": "voice-chat", "type": "voice" },
-    { "name": "dev-chat", "type": "voice" }
+    {
+      "name": "voice-chat",
+      "type": "voice"
+    },
+    {
+      "name": "dev-chat",
+      "type": "voice"
+    }
   ],
   "categories": [
     {
       "name": "Meta",
       "channels": [
-        { "name": "welcome", "type": "text",
-          "topic": "Start here: what this server is, who it is for, and where to go." },
-        { "name": "announcements", "type": "announcement",
-          "topic": "Results, releases and milestones. Low volume, followable by other servers." },
-        { "name": "github", "type": "text",
-          "topic": "Commit and release feed for the public repos." },
-        { "name": "news-and-resources", "type": "announcement",
-          "topic": "Papers, emulator research, Game Boy documentation and other people's work worth reading." },
-        { "name": "research-discussion", "type": "text",
-          "topic": "Method, training, reward shaping, evaluation. The thinking-out-loud channel." },
-        { "name": "help", "type": "text",
-          "topic": "Ask here: running the emulator, reproducing a result, getting set up." },
-        { "name": "general", "type": "text",
-          "topic": "Everything else." }
+        {
+          "name": "rules",
+          "type": "text",
+          "topic": "What this server is and the handful of rules that keep it good. Read once."
+        },
+        {
+          "name": "welcome",
+          "type": "text",
+          "topic": "Start here: what this server is, who it is for, and where to go."
+        },
+        {
+          "name": "moderator-updates",
+          "type": "text",
+          "topic": "Discord posts community and moderation notices for this server here."
+        },
+        {
+          "name": "announcements",
+          "type": "announcement",
+          "topic": "Results, releases and milestones. Low volume, followable by other servers."
+        },
+        {
+          "name": "github",
+          "type": "text",
+          "topic": "Commit and release feed for the public repos."
+        },
+        {
+          "name": "news-and-resources",
+          "type": "announcement",
+          "topic": "Papers, emulator research, Game Boy documentation and other people's work worth reading."
+        },
+        {
+          "name": "research-discussion",
+          "type": "text",
+          "topic": "Method, training, reward shaping, evaluation. The thinking-out-loud channel."
+        },
+        {
+          "name": "help",
+          "type": "text",
+          "topic": "Ask here: running the emulator, reproducing a result, getting set up."
+        },
+        {
+          "name": "general",
+          "type": "text",
+          "topic": "Everything else."
+        }
       ]
     },
     {
       "name": "Projects",
       "channels": [
-        { "name": "agentgb", "type": "text",
-          "topic": "The network that plays: training runs, goals, certified results, failures." },
-        { "name": "terminalgb", "type": "text",
-          "topic": "The emulator: accuracy work, test-suite scores, the two picture engines." },
-        { "name": "atlasgb", "type": "text",
-          "topic": "The reference resource: evidence-only descriptions and cartridge verification." },
-        { "name": "tooling", "type": "text",
-          "topic": "The fleet tooling itself - firstmate, harnesses, automation." }
+        {
+          "name": "agentgb",
+          "type": "text",
+          "topic": "The network that plays: training runs, goals, certified results, failures."
+        },
+        {
+          "name": "terminalgb",
+          "type": "text",
+          "topic": "The emulator: accuracy work, test-suite scores, the two picture engines."
+        },
+        {
+          "name": "atlasgb",
+          "type": "text",
+          "topic": "The reference resource: evidence-only descriptions and cartridge verification."
+        },
+        {
+          "name": "tooling",
+          "type": "text",
+          "topic": "The fleet tooling itself - firstmate, harnesses, automation."
+        }
       ]
     },
     {
       "name": "Fleet",
       "channels": [
-        { "name": "ready", "type": "text",
-          "topic": "Needs the captain: work ready for review, a decision, a credential. Read this one." },
-        { "name": "broken", "type": "text",
-          "topic": "Failures only: a red pipeline, a failed payment run, a wedged job." },
-        { "name": "landed", "type": "text",
-          "topic": "Merged, done, and milestones. Catch up here when you feel like it." },
-        { "name": "gallery", "type": "text",
-          "topic": "Artefacts: films, training montages, screenshots." }
+        {
+          "name": "ready",
+          "type": "text",
+          "topic": "Needs the captain: work ready for review, a decision, a credential. Read this one."
+        },
+        {
+          "name": "broken",
+          "type": "text",
+          "topic": "Failures only: a red pipeline, a failed payment run, a wedged job."
+        },
+        {
+          "name": "landed",
+          "type": "text",
+          "topic": "Merged, done, and milestones. Catch up here when you feel like it."
+        },
+        {
+          "name": "gallery",
+          "type": "text",
+          "topic": "Artefacts: films, training montages, screenshots."
+        }
       ]
     }
   ]
