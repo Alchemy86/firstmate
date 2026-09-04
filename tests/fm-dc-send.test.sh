@@ -259,6 +259,54 @@ PY
   pass "a semicolon in a caption survives the upload, and the UA is always sent"
 }
 
+# --- channel mentions --------------------------------------------------------
+# A `{{name}}` token in --text/--plain must become a clickable channel mention
+# through the same lookup --channel uses, which is what lets member- or
+# captain-facing copy (the welcome message, above all) name a room instead of
+# carrying a raw id.
+test_channel_mentions_resolve_in_text() {
+  local dir api out rc
+  dir="$TMP_ROOT/mentions"; mkdir -p "$dir"
+  api=$(stub_start "$dir/stub")
+  mkdir -p "$dir/cfg"
+  echo 'DISCORD_BOT_TOKEN=stub-token-not-a-secret' > "$dir/cfg/discord.env"
+  printf 'DC_GUILD_ID=1\nDC_CHANNEL_READY=900000000000000001\nDC_CHANNEL_GALLERY=900000000000000002\n' \
+    > "$dir/cfg/channels.env"
+
+  out=$(FM_DC_FORCE=1 FM_DC_API_OVERRIDE="$api" \
+        FM_DC_ENV_OVERRIDE="$dir/cfg/discord.env" \
+        FM_DC_CHANNELS_OVERRIDE="$dir/cfg/channels.env" \
+        "$SEND" --kind note --channel ready --plain "see {{ready}} and {{gallery}}" 2>&1); rc=$?
+  stub_stop "$dir/stub"
+  expect_code 0 "$rc" "a send with resolvable mentions must succeed: $out"
+  python3 - "$dir/stub/last-request" <<'PY' || fail "the sent content did not carry resolved mentions"
+import json, sys
+d = json.loads(open(sys.argv[1]).read())
+assert d["content"] == "see <#900000000000000001> and <#900000000000000002>", \
+    "mentions were not resolved into the message: %r" % d["content"]
+PY
+  pass "{{name}} tokens in --text become real channel mentions"
+}
+
+test_unresolvable_mention_fails_loudly() {
+  local dir api out rc
+  dir="$TMP_ROOT/mentions-bad"; mkdir -p "$dir"
+  api=$(stub_start "$dir/stub")
+  mkdir -p "$dir/cfg"
+  echo 'DISCORD_BOT_TOKEN=stub-token-not-a-secret' > "$dir/cfg/discord.env"
+  printf 'DC_GUILD_ID=1\nDC_CHANNEL_READY=900000000000000001\n' > "$dir/cfg/channels.env"
+
+  out=$(FM_DC_FORCE=1 FM_DC_API_OVERRIDE="$api" \
+        FM_DC_ENV_OVERRIDE="$dir/cfg/discord.env" \
+        FM_DC_CHANNELS_OVERRIDE="$dir/cfg/channels.env" \
+        "$SEND" --kind note --channel ready --plain "see {{nonexistent-channel}}" 2>&1); rc=$?
+  stub_stop "$dir/stub"
+  expect_code 1 "$rc" "a mention naming no real channel must fail rather than post a dead literal"
+  assert_contains "$out" "nonexistent-channel" \
+    "the failure must name which mention could not resolve"
+  pass "a mention that cannot resolve fails loudly instead of posting {{literal}} text"
+}
+
 # --- the crew boundary ------------------------------------------------------
 # Crewmates must never address the captain (AGENTS.md hard rule 4). bin/fm-tg-send.sh
 # had to be retrofitted with this after crews really did message him.
@@ -315,12 +363,64 @@ BADGEPY
   pass "the badge ladder is eight ordered gym badges with rising thresholds and no farming"
 }
 
+# --- the welcome message and starting role -----------------------------------
+# The welcome message's {{name}} tokens must all resolve against the real
+# layout, and the starting role must exist with a colour no badge shares -
+# a drifted channel name or a badge-colour clash would only surface at send
+# time otherwise, against the live server.
+test_welcome_message_mentions_are_real_channels() {
+  local msg="$ROOT/docs/examples/discord-welcome-message.md"
+  local layout="$ROOT/docs/examples/discord-layout.json"
+  assert_present "$msg" "the welcome message must ship with the repo"
+  assert_present "$layout" "the reference layout must ship with the repo"
+  python3 - "$msg" "$layout" <<'WELCOMEPY' || fail "the welcome message mentions a channel the layout does not define"
+import json, re, sys
+msg = open(sys.argv[1]).read()
+layout = json.load(open(sys.argv[2]))
+names = set()
+for ch in layout.get("channels", []):
+    names.add(ch["name"])
+for cat in layout.get("categories", []):
+    for ch in cat.get("channels") or []:
+        names.add(ch["name"])
+tokens = set(re.findall(r"\{\{([a-z0-9-]+)\}\}", msg))
+assert tokens, "the welcome message names no channels at all"
+missing = tokens - names
+assert not missing, "welcome message mentions channels missing from the layout: %r" % missing
+WELCOMEPY
+  pass "every {{name}} in the welcome message is a real channel in the reference layout"
+}
+
+test_starting_role_is_wellformed_and_distinct() {
+  local f="$ROOT/docs/examples/discord-starting-role.json"
+  local badges="$ROOT/docs/examples/discord-badges.json"
+  assert_present "$f" "the starting-role file must ship with the repo"
+  python3 - "$f" "$badges" <<'ROLEPY' || fail "the starting role is malformed or clashes with a badge"
+import json, sys
+d = json.load(open(sys.argv[1]))
+roles = d.get("roles") or d.get("badges") or []
+assert len(roles) == 1, "expected exactly one starting role, got %d" % len(roles)
+r = roles[0]
+assert r["name"], "the starting role needs a name"
+colour = r["colour"].lower()
+int(colour.lstrip("#"), 16)
+badge_cols = {b["colour"].lower() for b in json.load(open(sys.argv[2]))["badges"]}
+assert colour not in badge_cols, \
+    "the starting role's colour must not match any badge, or it reads as an earned rank"
+ROLEPY
+  pass "the starting role is one well-formed role with a colour no badge shares"
+}
+
 test_unconfigured_is_inert_but_loud
 test_badge_ladder_is_wellformed
+test_welcome_message_mentions_are_real_channels
+test_starting_role_is_wellformed_and_distinct
 test_kinds_drive_colour_and_routing
 test_payload_survives_hostile_text
 test_long_values_are_clipped_not_rejected
 test_attachment_declaration_and_inline_image
 test_oversize_file_is_refused_before_upload
 test_semicolon_payload_survives_multipart_upload
+test_channel_mentions_resolve_in_text
+test_unresolvable_mention_fails_loudly
 test_crew_worktree_is_refused

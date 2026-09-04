@@ -359,6 +359,14 @@
       "audience": "operator-example"
     },
     {
+      "path": "docs/examples/discord-starting-role.json",
+      "audience": "operator-example"
+    },
+    {
+      "path": "docs/examples/discord-welcome-message.md",
+      "audience": "operator-example"
+    },
+    {
       "path": "docs/telegram.md",
       "audience": "operator-current"
     },

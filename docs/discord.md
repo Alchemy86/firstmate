@@ -215,6 +215,52 @@ Creating the roles is done.
 The recommendation is [Lurkr](https://lurkr.gg): message XP, voice XP, leaderboards and role rewards are all on its free tier, where MEE6 paywalls role rewards - the one feature actually needed.
 Self-hosting this on the existing bot was considered and rejected: it would mean rebuilding XP tracking, cooldowns, a leaderboard and a dashboard, and it needs a persistent gateway connection that this outbound-only integration deliberately does not have.
 
+## Welcome experience: message, starting role, and auto-role
+
+Discord's built-in join notice - one random line plus a wave button, no custom text, no channel pointers, no role - is the ceiling of what the system channel alone gives a new member.
+Getting past it needs two separate things: our own wording posted somewhere a new member actually sees, and a starting role assigned without anyone remembering to do it by hand.
+
+### The welcome message
+
+A one-time post to `#welcome`, not an automated one: there is no cadence file or hook driving it, matching this integration's outbound-only design.
+The canonical wording lives in [`examples/discord-welcome-message.md`](examples/discord-welcome-message.md), edited like any other tracked file rather than in a web UI.
+Post or refresh it with:
+
+```
+bin/fm-dc-send.sh --kind note --channel welcome --plain "$(cat docs/examples/discord-welcome-message.md)"
+```
+
+`{{name}}` tokens in that file resolve to clickable channel mentions - `fm-dc-send.sh --text` and `--plain` run any `{{name}}` through the same channel lookup `--channel` uses, so wording can point at a room by name without anyone hand-typing a channel id.
+Pin the result in `#welcome` so it survives being pushed down by later join notices; there is no upsert, so updating the wording means unpinning and deleting the old message by hand before posting the new one.
+
+### The starting role
+
+`Trainer` is the floor the eight gym badges promote from, defined in [`examples/discord-starting-role.json`](examples/discord-starting-role.json) with its own colour, distinct from all eight badge colours so it never reads as an earned rank.
+Create or sync it with `bin/fm-dc-setup.sh --roles docs/examples/discord-starting-role.json`, the same idempotent role-sync machinery `--badges` uses under a name that fits a role outside the gym-badge ladder.
+Its `icon` is empty for the identical Boost Level 2 reason as the badges - see "Turning on the icons later" above.
+
+### Granting it automatically: the decision, and what still needs the captain
+
+Creating the role is not the same as assigning it on join, and Discord gives exactly two ways to do the second part.
+
+**Chosen: Lurkr's own "On Join Roles" feature.**
+[Lurkr](https://lurkr.gg/docs/guides/automatically-added-roles-with-timeout) can assign one or more roles to a member automatically after joining, configured entirely in Lurkr's own dashboard and running on Lurkr's own persistent connection - never ours, so this asks nothing new of firstmate's outbound-only architecture or its uptime.
+It piggybacks on the Lurkr invite already needed for badge role rewards above rather than adding a second captain-facing dependency.
+**This still needs the captain**, in Lurkr's dashboard, after the invite: add `Trainer` as an on-join role, and confirm Lurkr's own role sits above `Trainer` in the role list so it is actually permitted to assign it - Lurkr's invite flow normally places its role near the top already, but it is worth a glance.
+
+**Considered and not built: enabling Community mode for onboarding's default roles.**
+Discord's own default-role assignment lives behind Community mode, which is a server-posture change - a rules screen, a raised verification floor, a forced explicit-content filter, discovery eligibility, and mentions-only default notifications - not a channel setting.
+`bin/fm-dc-setup.sh --enable-community` already exists and already refuses to run implicitly for exactly this reason; this task does not invoke it, and doing so needs the captain's explicit say-so first.
+
+**Considered and not built: a bot of ours listening for join events.**
+That is the same persistent-gateway-connection cost already rejected for self-hosting XP tracking above, for the same reason: this integration is deliberately outbound-only, and a join listener is a process that must stay running, not a one-shot command.
+Building it would be a real operational commitment the captain should see before it exists, not after, so it was not built.
+
+**Does any of this need our bot running persistently? No.**
+The welcome message is one send.
+The role is one idempotent create.
+The join-time assignment runs on Lurkr's process, not firstmate's.
+
 ## Not built, deliberately
 
 - **No inbound anything.** See the top of this file.

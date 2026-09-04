@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "The starting role: the floor every new member has, and what the gym-badge",
+    "ladder in discord-badges.json promotes FROM. It is not a ninth badge, so it",
+    "lives in its own file with its own colour, clearly distinct from all eight",
+    "badge colours so it never reads as an earned rank.",
+    "",
+    "Apply with: bin/fm-dc-setup.sh --roles docs/examples/discord-starting-role.json",
+    "That flag shares the exact role-sync machinery --badges uses (see",
+    "fm-dc-setup.sh's apply_role_file), so this file is idempotent the same way:",
+    "a second run updates the colour if it drifted and creates nothing new.",
+    "",
+    "Granting this role automatically, on join, is NOT done by this file or by",
+    "fm-dc-setup.sh - creating the role and assigning it to new members are two",
+    "different actions. See docs/discord.md's welcome-experience section for",
+    "which of Discord's own mechanisms grants it and what that needs from the",
+    "captain."
+  ],
+  "roles": [
+    { "name": "Trainer", "colour": "#7F8C8D", "icon": "" }
+  ]
+}

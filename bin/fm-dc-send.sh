@@ -10,7 +10,11 @@
 #                     Run --list-kinds for the set. There is no `progress`
 #                     kind and that is deliberate - see fm-dc-embed.py.
 #   --title 'T'       embed title; defaults to the kind's own label.
-#   --text 'T'        embed body (or the message, with --plain).
+#   --text 'T'        embed body (or the message, with --plain). A `{{name}}`
+#                     token is resolved to a clickable channel mention through
+#                     the same fm_dc_channel lookup --channel uses, so captain-
+#                     or member-facing copy can point at a room by name
+#                     without the caller ever handling a raw channel id.
 #   --url U           makes the title clickable - use it for the PR link.
 #   --field 'k=v'     repeatable; short values render side by side.
 #   --project P       footer, so a glance says which project this is.
@@ -76,6 +80,24 @@ done
 
 [ -n "$KIND" ] || { echo "fm-dc-send: --kind is required (--list-kinds to see them)" >&2; exit 2; }
 
+# Resolve `{{name}}` tokens in --text to `<#channel-id>` mentions, one lookup
+# per distinct token. Same resolver --channel uses, so a name that does not
+# exist fails the same way here as it would there, rather than posting a
+# message with a dead literal `{{name}}` sitting in it.
+resolve_mentions() {
+  local text=$1 tok name cid
+  while case "$text" in *'{{'*'}}'*) true ;; *) false ;; esac; do
+    tok=$(printf '%s' "$text" | grep -oE '\{\{[A-Za-z0-9_-]+\}\}' | head -1)
+    [ -n "$tok" ] || break
+    name=${tok#\{\{}; name=${name%\}\}}
+    cid=$(fm_dc_channel "$name") || {
+      echo "fm-dc-send: --text mentions {{$name}}, which does not resolve to a channel" >&2
+      exit 1; }
+    text=${text//"$tok"/<#$cid>}
+  done
+  printf '%s' "$text"
+}
+
 if [ -n "$IFCONF" ]; then
   fm_dc_load --if-configured; rc=$?
   [ "$rc" -eq 2 ] && exit 0
@@ -89,6 +111,10 @@ if [ -z "$CHANNEL" ]; then
   CHANNEL=$(python3 "$SCRIPT_DIR/fm-dc-embed.py" --print-channel "$KIND") || exit 2
 fi
 CH_ID=$(fm_dc_channel "$CHANNEL") || exit 1
+
+if [ -n "$TEXT" ]; then
+  TEXT=$(resolve_mentions "$TEXT") || exit 1
+fi
 
 # ---- attachment sizing -------------------------------------------------
 # Refused BEFORE the upload, naming the size and the way out. Discord rejects

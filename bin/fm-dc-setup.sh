@@ -9,6 +9,12 @@
 #   fm-dc-setup.sh --guild <id>        the guild to converge, first run only
 #   fm-dc-setup.sh --enable-community  turn the server into a Community server
 #   fm-dc-setup.sh --badges <file>     create or update the progression roles
+#   fm-dc-setup.sh --roles <file>      create or update plain roles (same file
+#                                       shape and machinery as --badges, for a
+#                                       role that is not part of the gym-badge
+#                                       ladder - e.g. the starting role every
+#                                       new member needs; see
+#                                       docs/examples/discord-starting-role.json)
 #
 # Idempotent by identity, not by bookkeeping: it lists the guild's real
 # categories and channels and creates only what is genuinely missing, so a
@@ -41,16 +47,17 @@ FM_HOME="${FM_HOME:-$FM_ROOT}"
 # shellcheck source=bin/fm-dc-lib.sh
 . "$SCRIPT_DIR/fm-dc-lib.sh"
 
-DRY=""; LAYOUT=""; MAP_ONLY=""; GUILD_ARG=""; ENABLE_COMMUNITY=""; BADGES=""
+DRY=""; LAYOUT=""; MAP_ONLY=""; GUILD_ARG=""; ENABLE_COMMUNITY=""; BADGES=""; ROLES=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)  DRY=1; shift ;;
     --guild)    GUILD_ARG=${2:?--guild needs an id}; shift 2 ;;
     --enable-community) ENABLE_COMMUNITY=1; shift ;;
     --badges)   BADGES=${2:?--badges needs a file}; shift 2 ;;
+    --roles)    ROLES=${2:?--roles needs a file}; shift 2 ;;
     --layout)   LAYOUT=${2:?--layout needs a file}; shift 2 ;;
     --map-only) MAP_ONLY=1; shift ;;
-    -h|--help)  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "fm-dc-setup: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -218,16 +225,20 @@ if [ -n "$ENABLE_COMMUNITY" ]; then
   enable_community || exit 1
 fi
 
-# ---- progression roles from the badge file -----------------------------
-# The file owns name, colour and ladder order, and those are applied here for
-# real. It does NOT own the XP threshold: the levelling bot keeps that in its
-# own dashboard, so `level` is recorded intent that a human enters once. The
-# doc says so plainly rather than letting the file look live when it is not.
-apply_badges() {
+# ---- role sync from a role file -----------------------------------------
+# Shared by --badges and --roles: the file owns name, colour and list order,
+# and those are applied here for real, whether the file is the eight-badge
+# progression ladder or a single plain role such as the starting role every
+# new member needs. A badge file's `level` and `earning_rules` are NOT owned
+# here: the levelling bot keeps the XP threshold in its own dashboard, so
+# `level` is recorded intent that a human enters once, and this function never
+# reads it. Top-level key is "badges" or "roles" - either name works, so an
+# existing badge file needs no edit to keep working under the shared name.
+apply_role_file() {
   local file=$1 roles resp created=0 updated=0
-  [ -f "$file" ] || { echo "fm-dc-setup: no such badge file: $file" >&2; return 1; }
+  [ -f "$file" ] || { echo "fm-dc-setup: no such role file: $file" >&2; return 1; }
   python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$file" 2>/dev/null \
-    || { echo "fm-dc-setup: the badge file is not valid JSON" >&2; return 1; }
+    || { echo "fm-dc-setup: the role file is not valid JSON" >&2; return 1; }
 
   roles=$(fm_dc_api GET "/guilds/$DC_GUILD_ID/roles") || return 1
   fm_dc_is_list "$roles" || {
@@ -290,19 +301,24 @@ sys.stdout.write(json.dumps({
   done < <(python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
-for b in d.get("badges", []):
+for b in d.get("badges") or d.get("roles") or []:
     sys.stdout.write("%s\t%s\t%s\n" % (b["name"], b["colour"], b.get("icon", "")))
 ' "$file")
   [ -n "$DRY" ] && return 0
-  echo "badges: $created created, $updated already present"
+  echo "roles: $created created, $updated already present"
   if [ -z "$has_icons" ]; then
-    echo "badges: role ICONS need Boost Level 2 (7 boosts); names and colours are live now"
+    echo "roles: role ICONS need Boost Level 2 (7 boosts); names and colours are live now"
   fi
   return 0
 }
 
 if [ -n "$BADGES" ]; then
-  apply_badges "$BADGES" || exit 1
+  apply_role_file "$BADGES" || exit 1
+  [ -z "$LAYOUT" ] && [ -z "$ENABLE_COMMUNITY" ] && [ -z "$ROLES" ] && exit 0
+fi
+
+if [ -n "$ROLES" ]; then
+  apply_role_file "$ROLES" || exit 1
   [ -z "$LAYOUT" ] && [ -z "$ENABLE_COMMUNITY" ] && exit 0
 fi
 
