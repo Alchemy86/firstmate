@@ -1109,6 +1109,110 @@ test_drain_survives_non_dict_record() {
   pass "telegram: a non-dict inbox record does not crash the drain or block a good record's surfacing"
 }
 
+# --- flag guard: a stray unrecognised flag must never become message text --
+
+test_send_refuses_unknown_flag() {
+  local home env log out rc
+  home="$TMP_ROOT/flag-guard-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  log="$TMP_ROOT/curl-flag-guard.log"
+
+  # THE REGRESSION THIS PINS. Firstmate called this script as
+  # `fm-tg-send.sh --text 'message'` all day on 2026-09-04 - --text is not a
+  # real flag - and the bare positional parsing sent the literal word "--text"
+  # to the captain as the message. An unrecognised leading flag must be
+  # refused loudly, with nothing sent to Telegram at all.
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-tg-send.sh" --text 'message' 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-tg-send.sh accepted the unknown flag --text instead of refusing it"
+  assert_contains "$out" "unrecognised flag" "refusal must name what went wrong"
+  [ ! -s "$log" ] || fail "fm-tg-send.sh must never call curl for an unrecognised flag: $(cat "$log")"
+  rm -f "$log" "$TMP_ROOT/flag-guard-out"
+  pass "telegram: an unrecognised leading flag is refused and sends nothing"
+}
+
+test_send_help_prints_usage_and_sends_nothing() {
+  local home env log out rc
+  home="$TMP_ROOT/help-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  log="$TMP_ROOT/curl-help.log"
+
+  # A --help probe used to be sent to the captain as a literal message, the
+  # same bug as the --text case above. --help must print usage and exit 0
+  # without touching Telegram at all.
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-tg-send.sh" --help 2>&1)
+  rc=$?
+  expect_code 0 "$rc" "fm-tg-send.sh --help must exit 0: $out"
+  assert_contains "$out" "fm-tg-send.sh" "--help must print usage, not silence"
+  [ ! -s "$log" ] || fail "fm-tg-send.sh --help must never call curl: $(cat "$log")"
+
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-tg-send.sh" -h 2>&1)
+  rc=$?
+  expect_code 0 "$rc" "fm-tg-send.sh -h must exit 0: $out"
+  assert_contains "$out" "fm-tg-send.sh" "-h must print usage, not silence"
+  [ ! -s "$log" ] || fail "fm-tg-send.sh -h must never call curl: $(cat "$log")"
+
+  rm -f "$log"
+  pass "telegram: --help and -h print usage to stdout and exit 0 without sending"
+}
+
+test_send_end_of_options_allows_dash_leading_text() {
+  local home env log
+  home="$TMP_ROOT/dash-text-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  log="$TMP_ROOT/curl-dash-text.log"
+
+  # The conventional `--` separator must still let a message that genuinely
+  # starts with a dash through, rather than being refused as a flag.
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-tg-send.sh" -- '-5 degrees and holding' >"$TMP_ROOT/dash-text-out" 2>&1
+  expect_code 0 "$?" "fm-tg-send.sh -- '-5 degrees...' failed: $(cat "$TMP_ROOT/dash-text-out")"
+  assert_grep "-5 degrees" "$log" "the dash-leading text must actually reach the sendMessage call"
+
+  rm -f "$log" "$TMP_ROOT/dash-text-out"
+  pass "telegram: -- end-of-options still lets a message that starts with a dash send"
+}
+
+test_send_ordinary_message_still_sends() {
+  local home env log
+  home="$TMP_ROOT/ordinary-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  log="$TMP_ROOT/curl-ordinary.log"
+
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-tg-send.sh" 'shipshape, captain' >"$TMP_ROOT/ordinary-out" 2>&1
+  expect_code 0 "$?" "an ordinary positional message failed: $(cat "$TMP_ROOT/ordinary-out")"
+  assert_grep "shipshape" "$log" "the ordinary message text must reach the sendMessage call"
+
+  rm -f "$log" "$TMP_ROOT/ordinary-out"
+  pass "telegram: an ordinary positional message still sends"
+}
+
+test_send_file_flag_still_works() {
+  local home env f log
+  home="$TMP_ROOT/file-flag-home"
+  mkdir -p "$home/state"
+  env=$(fm_tg_env "$home")
+  f="$TMP_ROOT/flag-guard.txt"
+  printf 'evidence\n' > "$f"
+  log="$TMP_ROOT/curl-file-flag.log"
+
+  FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-tg-send.sh" --file "$f" 'a caption' >"$TMP_ROOT/file-flag-out" 2>&1
+  expect_code 0 "$?" "--file failed: $(cat "$TMP_ROOT/file-flag-out")"
+  assert_grep "sendDocument" "$log" "a plain-text file must upload via sendDocument"
+
+  rm -f "$log" "$TMP_ROOT/file-flag-out"
+  pass "telegram: --file still works after the flag guard"
+}
+
 # --- upload bugs (amendment 2): large PNG routes to sendDocument, and a --
 
 test_large_png_uses_senddocument() {
@@ -2044,6 +2148,11 @@ test_fetch_nonmessage_update_is_not_a_chat_mismatch
 test_multiple_messages_mid_turn_none_swallowed
 test_drain_retries_failed_ack
 test_drain_survives_non_dict_record
+test_send_refuses_unknown_flag
+test_send_help_prints_usage_and_sends_nothing
+test_send_end_of_options_allows_dash_leading_text
+test_send_ordinary_message_still_sends
+test_send_file_flag_still_works
 test_large_png_uses_senddocument
 test_small_png_uses_sendphoto
 test_upload_timeout_explicit_message

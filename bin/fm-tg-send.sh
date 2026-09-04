@@ -2,6 +2,9 @@
 # Send a message to the captain on Telegram.
 #   fm-tg-send.sh 'text'                      send text (auto-split if long)
 #   fm-tg-send.sh --file <path> ['caption']   send a photo/video/document
+#   fm-tg-send.sh -- 'text'                   end-of-options: send text that
+#                                              itself starts with a dash
+#   fm-tg-send.sh -h | --help                 print this usage and exit
 #
 # TWO BUGS THIS FIXES, both found 2026-08-21 after the captain had to chase
 # repeatedly for answers he never received:
@@ -69,6 +72,33 @@ else
   fi
 fi
 # ------------------------------------------------------------------------
+
+# ---- FLAG GUARD (added 2026-09-04) ---------------------------------------
+# The only flag this script implements is --file. Firstmate spent all of
+# 2026-09-04 calling it as `fm-tg-send.sh --text 'message'` - a flag that
+# does not exist - and the bare-positional-argument parsing below sent the
+# literal string "--text" to the captain as the first word of every message,
+# same for a --help probe. This is the same silent-mangling class of bug the
+# header above already documents, in a new place: refuse any leading
+# argument that looks like a flag unless it is one actually implemented, so
+# a typo'd invocation fails loudly instead of texting garbage. `--` is the
+# conventional end-of-options separator, for the legitimate case of a
+# message that itself starts with a dash.
+case "${1:-}" in
+  -h|--help)
+    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+  --)
+    shift ;;
+  --file) : ;;
+  -*)
+    echo "fm-tg-send: unrecognised flag '$1'" >&2
+    echo "  the only flag is --file <path> ['caption']" >&2
+    echo "  to send text that itself starts with a dash, use: fm-tg-send.sh -- '$1...'" >&2
+    echo "  run 'fm-tg-send.sh --help' for full usage" >&2
+    exit 2 ;;
+esac
+# ---------------------------------------------------------------------------
 
 ENVF="${FM_TG_ENV_OVERRIDE:-$HOME/.config/fm-telegram.env}"
 [ -f "$ENVF" ] || { echo "no telegram config" >&2; exit 1; }
