@@ -394,6 +394,51 @@ The sweep must finish inside `FM_CHECK_TIMEOUT` (default 30), because a run the 
 So a budget larger than that timeout allows is cut down to what fits instead of being refused, and the cut is reported in the report line.
 A budget that is not a whole number from 1 to 120 is still refused outright.
 
+## PR review triggers (config/pr-watch.env)
+
+`config/pr-watch.env` is a local, gitignored file holding the per-machine values [`bin/fm-pr-watch.sh`](../bin/fm-pr-watch.sh) needs to watch pull requests.
+When it is present and the checks are armed, three separate triggers report three separate things:
+
+- `comments` reports a new review comment on one of our own open PRs.
+- `new` reports a non-draft PR opened by someone else, which needs reviewing.
+- `ours` reports a non-draft PR we opened, so it is reviewed before a human is asked to look at it.
+
+This section is the single owner of the file's schema.
+`bin/fm-pr-watch.sh` owns the poll mechanics, the bounds, the seen lists, and the report records.
+What a review actually says, and where it is posted, is the `pr-review` skill's, and the voice it is written in stays in this home's own `data/captain.md`.
+
+```sh
+# Required. The forge owner or organisation the repositories live under.
+FM_PR_WATCH_OWNER=your-org
+# Required. The repositories this home watches, space separated, names only.
+FM_PR_WATCH_REPOS="service-one service-two web-app"
+# Required. The account logins that count as ours.
+FM_PR_WATCH_OURS="your-work-login your-personal-login"
+# Optional per-mode repository lists, each falling back to FM_PR_WATCH_REPOS.
+FM_PR_WATCH_REPOS_COMMENTS="service-one service-two"
+FM_PR_WATCH_REPOS_NEW="service-one service-two"
+FM_PR_WATCH_REPOS_OURS="service-one service-two web-app infra"
+```
+
+All three required values must be present, and every owner, repository, and login must be a plain forge name.
+A missing file, a missing value, or a value that is not a name refuses to arm and names the exact requirement it is missing, and an armed check whose config later goes missing reports that as its one line.
+That refusal is the point of the file: a check watching zero repositories reports nothing on every poll and is indistinguishable from a check with nothing to report.
+The per-mode lists exist because a home does not always want the same breadth for every trigger; watching our own PRs across every repository we push to is cheap, while reviewing everyone else's is a choice.
+See [`docs/examples/pr-watch.env`](examples/pr-watch.env) for a starting point to copy into local `config/pr-watch.env`.
+
+Arm the checks once per home with `bin/fm-pr-watch.sh arm`, which acts on all three modes unless one is named.
+That writes `state/pr-<mode>.check.sh` and binds each shim's bytes with `bin/fm-check-register.sh`, so the existing watcher polls them on its normal cadence and turns each one line into a `check:` wake; no separate schedule is involved.
+`bin/fm-pr-watch.sh disarm` removes the shims, their trust bindings, their seen lists, and their report records, and refuses rather than removing anything when the state directory or a named mode cannot be proven.
+Because `state/` is local and gitignored, a reinstall loses the shims and the seen lists; the durable logic and this configuration survive, and one `arm` restores all three.
+
+Each mode keeps its own `state/.pr-<mode>-seen` list so a PR or comment is reported once rather than on every poll, and its own `state/.pr-watch-<mode>` record holding the line it last reported.
+A finding is retired only once it is actually in a line that goes out, so a report too long for one line holds the rest for the next poll instead of losing them.
+A line identical to the last one is reported again only after `FM_PR_WATCH_REPEAT_SECS` (default 3600), which keeps a standing problem visible without waking firstmate on every poll.
+`FM_PR_WATCH_PROBE_SECS` (default 8) bounds one forge call and `FM_PR_WATCH_BUDGET_SECS` (default 20) bounds a whole sweep.
+The sweep must finish inside `FM_CHECK_TIMEOUT` (default 30), so a budget larger than that allows is cut down to what fits and the cut is reported in the line, rather than letting the watcher kill a run that would then print nothing.
+A sweep that runs out of budget says which repository it did not reach rather than reporting the rest as clear.
+Every call this check makes is a read; it never comments, approves, merges, or writes to a forge.
+
 ## Relay (.env)
 
 Relay lets a firstmate instance answer public mentions and act on normal reversible mention requests through firstmate's normal lifecycle.

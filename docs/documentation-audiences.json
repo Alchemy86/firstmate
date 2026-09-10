@@ -167,6 +167,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": ".agents/skills/pr-review/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": ".agents/skills/process-event-sources/SKILL.md",
       "audience": "agent-runtime"
     },
@@ -268,6 +272,10 @@
     },
     {
       "path": "docs/examples/crew-dispatch.json",
+      "audience": "operator-example"
+    },
+    {
+      "path": "docs/examples/pr-watch.env",
       "audience": "operator-example"
     },
     {
