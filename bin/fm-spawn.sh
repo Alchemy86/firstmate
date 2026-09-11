@@ -456,7 +456,7 @@ fm_refuse_if_gate_agent
 fm_memory_guard() {
   [ -z "${FM_SPAWN_FORCE:-}" ] || return 0
   local cap="${FM_MAX_CREWS:-8}" minfree="${FM_MIN_FREE_MB:-6000}" live avail
-  live=$(ls "$STATE"/*.meta 2>/dev/null | wc -l | tr -d ' ')
+  live=$(find "$STATE" -maxdepth 1 -name '*.meta' 2>/dev/null | wc -l | tr -d ' ')
   if [ "${live:-0}" -ge "$cap" ]; then
     printf 'refusing to spawn: %s crews already live (cap %s).
 ' "$live" "$cap" >&2
