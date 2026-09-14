@@ -329,10 +329,14 @@ gh_run() {
 
 # --- report record ----------------------------------------------------------
 #
-# The record holds the epoch and the exact line last reported for this mode. A
-# line identical to the last one is reported again only after REPEAT_SECS, so a
-# standing problem stays visible without waking firstmate every poll, and a
-# changed line is always reported at once.
+# The record holds the epoch, a dedup key, and the exact line last reported for
+# this mode. A key identical to the last one is reported again only after
+# REPEAT_SECS, so a standing problem stays visible without waking firstmate
+# every poll, and a changed key is always reported at once. The key is usually
+# the line itself; a caller with a class of report whose text varies in a way
+# that does not change what standing problem it is (an incomplete sweep naming
+# whichever repo happened to be next) passes a fixed key instead, so the class
+# dedups even though the printed line still names the specific repo.
 
 record_path() {
   local mode=$1
@@ -342,21 +346,21 @@ record_path() {
 }
 
 record_should_report() {
-  local mode=$1 line=$2 path last_epoch last_line now
+  local mode=$1 key=$2 path last_epoch last_key now
   path=$(record_path "$mode") || return 0
   [ -f "$path" ] || return 0
-  IFS=$(printf '\t') read -r last_epoch last_line < "$path" 2>/dev/null || return 0
-  [ "$last_line" = "$line" ] || return 0
+  IFS=$(printf '\t') read -r last_epoch last_key _ < "$path" 2>/dev/null || return 0
+  [ "$last_key" = "$key" ] || return 0
   case "$last_epoch" in ''|*[!0-9]*) return 0 ;; esac
   now=$(now_epoch)
   [ "$((now - last_epoch))" -ge "$REPEAT_SECS" ]
 }
 
 record_write() {
-  local mode=$1 line=$2 path tmp
+  local mode=$1 key=$2 line=$3 path tmp
   path=$(record_path "$mode") || return 0
   tmp=$(umask 077; mktemp "$STATE/.fm-pr-watch-record.XXXXXX" 2>/dev/null) || return 0
-  printf '%s\t%s\n' "$(now_epoch)" "$line" > "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 0; }
+  printf '%s\t%s\t%s\n' "$(now_epoch)" "$key" "$line" > "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 0; }
   mv -f -- "$tmp" "$path" 2>/dev/null || rm -f -- "$tmp"
   return 0
 }
@@ -557,19 +561,20 @@ headline() {
 
 # One line out, and only when it is worth waking firstmate for. A problem is
 # always written to stderr as well, so an operator running this by hand sees it
-# even on a poll the repeat gate is holding quiet.
+# even on a poll the repeat gate is holding quiet. key defaults to the line
+# itself when the caller has no reason to dedup on anything else.
 emit() {
-  local mode=$1 line=$2
+  local mode=$1 line=$2 key=${3:-$2}
   fm_cap_line_var "$line" "$MAX_LINE"
   line=$FM_LINE_CAP_LINE
-  if record_should_report "$mode" "$line"; then
+  if record_should_report "$mode" "$key"; then
     printf '%s\n' "$line"
   fi
-  record_write "$mode" "$line"
+  record_write "$mode" "$key" "$line"
 }
 
 action_check() {
-  local mode=$1 line
+  local mode=$1 line key=
   mkdir -p "$STATE" 2>/dev/null || true
   if ! config_load; then
     printf 'fm-pr-watch: %s\n' "$CONFIG_PROBLEM" >&2
@@ -588,6 +593,10 @@ action_check() {
     line="$line; $DEFERRED more held for the next poll"
   fi
   if [ -n "$INCOMPLETE" ]; then
+    # The repo named here varies every cycle even though it is the same
+    # standing problem (not enough budget for the repo count), so this class
+    # dedups on a fixed key rather than the line's own varying repo name.
+    key="budget-exhausted:$mode"
     if [ -n "$line" ]; then
       line="$line; budget spent, $INCOMPLETE and later not checked"
     else
@@ -598,7 +607,7 @@ action_check() {
     line="$line; sweep budget cut from ${BUDGET_CUT_FROM}s to ${BUDGET_SECS}s by FM_CHECK_TIMEOUT"
   fi
   [ -n "$line" ] || return 0
-  emit "$mode" "$line"
+  emit "$mode" "$line" "$key"
   return 0
 }
 

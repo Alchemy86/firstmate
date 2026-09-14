@@ -79,6 +79,18 @@ run_check() {
   ERR=$(cat "$TMP_ROOT/err")
 }
 
+# Like run_check, but also sets FM_PR_WATCH_BUDGET_SECS in the process
+# environment: the sweep budget is read once at script start, before the
+# config file is sourced, so a per-poll budget only takes effect this way.
+run_check_with_budget() {
+  local home=$1 mode=$2 budget=$3
+  OUT=$(FM_HOME="$home" FIXTURES="$home/fixtures" FM_PR_WATCH_GH="$home/gh" \
+    FM_PR_WATCH_BUDGET_SECS="$budget" \
+    "$WATCH" check "$mode" 2>"$TMP_ROOT/err")
+  RC=$?
+  ERR=$(cat "$TMP_ROOT/err")
+}
+
 run_arm() {
   local home=$1
   shift
@@ -217,6 +229,50 @@ test_a_cut_report_holds_the_rest_for_the_next_poll() {
   pass "pr-watch: a report too long for one line holds the rest instead of losing them"
 }
 
+# An incomplete sweep names whichever repo it happened to reach last, so a
+# different repo every cycle must not read as a new problem: it is the same
+# standing one (not enough budget for the repo count). A slow gh forces the
+# budget to run out partway through a two-repo sweep; reversing the repo order
+# between polls changes which repo is named without changing the problem.
+test_budget_exhaustion_dedups_by_class_not_by_the_named_repo() {
+  local home first second third
+  home=$(make_home budget-class)
+  cp "$home/gh" "$home/gh.fast"
+  cat > "$home/gh" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  pr) sleep 2 ;;
+esac
+exit 0
+SH
+  chmod +x "$home/gh"
+
+  write_config "$home" 'FM_PR_WATCH_OWNER=acme' 'FM_PR_WATCH_REPOS="one two"' \
+    'FM_PR_WATCH_OURS="us-work"'
+  run_check_with_budget "$home" new 1
+  first=$OUT
+  assert_contains "$first" "ran out of budget before two" \
+    "the first report must name the actual repo the sweep did not reach"
+
+  write_config "$home" 'FM_PR_WATCH_OWNER=acme' 'FM_PR_WATCH_REPOS="two one"' \
+    'FM_PR_WATCH_OURS="us-work"'
+  run_check_with_budget "$home" new 1
+  second=$OUT
+  [ -z "$second" ] || fail "pr-watch: a repeat budget-exhaustion report naming a different repo must be suppressed as the same standing problem, got: $second"
+
+  cp "$home/gh.fast" "$home/gh"
+  chmod +x "$home/gh"
+  write_config "$home" 'FM_PR_WATCH_OWNER=acme' 'FM_PR_WATCH_REPOS="one two"' \
+    'FM_PR_WATCH_OURS="us-work"'
+  pr_line 41 outsider "a real finding after the suppressed budget noise" > "$home/fixtures/prs.one"
+  : > "$home/fixtures/prs.two"
+  run_check_with_budget "$home" new 20
+  third=$OUT
+  assert_contains "$third" "outsider" \
+    "a genuine new finding must still surface even though the budget-exhaustion class was just suppressed"
+  pass "pr-watch: budget exhaustion dedups by class, not by which repo it happened to name, and genuine findings still surface"
+}
+
 # --- arming, trust, and reinstall -------------------------------------------
 
 # The watcher runs a custom check only through its own trust binding, so that
@@ -345,6 +401,7 @@ test_new_reports_other_peoples_prs_only
 test_ours_reports_our_prs_only
 test_comments_reports_other_peoples_comments_on_our_prs
 test_a_cut_report_holds_the_rest_for_the_next_poll
+test_budget_exhaustion_dedups_by_class_not_by_the_named_repo
 test_arm_registers_every_trigger
 test_a_tampered_shim_loses_its_binding
 test_reinstall_rearms_every_trigger
