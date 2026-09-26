@@ -215,6 +215,102 @@ test_non_main_default_branch_refreshes_before_branching() {
   pass "a stale pooled worktree resolves and refreshes a non-main default branch"
 }
 
+# register_local_only_project <home> <project-dir>
+# Registers project-dir's basename as [local-only] in the home's project
+# registry, the same data/projects.md annotation bin/fm-project-mode.sh reads.
+register_local_only_project() {
+  local home=$1 project=$2 name
+  name=$(basename "$project")
+  mkdir -p "$home/data"
+  printf -- '- %s [local-only] - fm-spawn-pool-base-freshen fixture (added 2026-09-27)\n' "$name" \
+    >> "$home/data/projects.md"
+}
+
+# A [local-only] project's real work lives only on its own local default
+# branch; data/projects.md registers this deliberately because origin can be
+# a small, stale, unrelated snapshot (AGENTS.md project-management posture).
+# This proves the pooled worktree resets to the project's own local tip,
+# never to origin's tip, and never fetches origin at all.
+test_local_only_project_resets_to_local_branch_ignoring_stale_origin() {
+  local rec id out status local_head origin_head
+  id='pool-local-only-r14'
+  rec=$(make_case local-only-diverge "$id")
+  read_case_record "$rec"
+  register_local_only_project "$HOME_DIR" "$PROJECT_DIR"
+
+  printf 'real local-only work, never pushed\n' > "$PROJECT_DIR/local-work.txt"
+  git -C "$PROJECT_DIR" add local-work.txt
+  git -C "$PROJECT_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm local-work
+  local_head=$(git -C "$PROJECT_DIR" rev-parse "refs/heads/$DEFAULT_BRANCH")
+  origin_head=$(git -C "$PROJECT_DIR" rev-parse "refs/remotes/origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+  [ -n "$origin_head" ] && [ "$origin_head" != "$local_head" ] \
+    || fail "fixture did not prove origin and the local default branch diverged"
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  expect_code 0 "$status" "spawn should launch a [local-only] project from its own local default branch"$'\n'"$out"
+  assert_contains "$out" "spawned $id" "spawn did not report success for the local-only project"
+  [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$local_head" ] \
+    || fail "spawn did not reset the local-only pooled worktree to the project's own local $DEFAULT_BRANCH tip"
+  [ -e "$POOL_DIR/local-work.txt" ] \
+    || fail "spawn did not carry the project's own unpushed local work into the pooled worktree"
+  [ ! -e "$POOL_DIR/advanced-main.txt" ] \
+    || fail "spawn pulled origin's stale snapshot into a [local-only] pooled worktree"
+  [ ! -e "$POOL_DIR/.git/FETCH_HEAD" ] \
+    || fail "spawn fetched origin for a [local-only] pooled worktree"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed local-only spawn: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+    printf '# local %s=%s origin/%s=%s pool HEAD=%s\n' \
+      "$DEFAULT_BRANCH" "$local_head" "$DEFAULT_BRANCH" "$origin_head" "$(git -C "$POOL_DIR" rev-parse HEAD)"
+  fi
+  pass "a [local-only] project's pooled worktree resets to its own local default branch tip, never origin's"
+}
+
+# An unresolvable local default branch must refuse loudly, exactly like the
+# origin-facing refusals above, rather than silently proceeding on whatever
+# stale ref the pooled worktree's HEAD already carried.
+test_local_only_project_with_unresolvable_default_branch_refuses() {
+  local case_dir home project pool fakebin id out status before
+  case_dir="$TMP_ROOT/local-only-unresolvable"
+  home="$case_dir/home"
+  project="$case_dir/project"
+  pool="$case_dir/pool"
+  fakebin=$(make_spawn_fakebin "$case_dir/fake")
+  id='pool-local-only-unresolved-r15'
+
+  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config"
+  printf 'codex\n' > "$home/config/crew-harness"
+  fm_test_spawn_brief "$home" "$id"
+  touch "$home/state/.last-watcher-beat"
+
+  git init --quiet -b trunk "$project"
+  printf 'base\n' > "$project/README.md"
+  git -C "$project" add README.md
+  git -C "$project" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
+  git -C "$project" worktree add --quiet --detach "$pool" HEAD
+
+  HOME_DIR=$home
+  PROJECT_DIR=$project
+  POOL_DIR=$pool
+  FAKEBIN_DIR=$fakebin
+  register_local_only_project "$HOME_DIR" "$PROJECT_DIR"
+  before=$(git -C "$POOL_DIR" rev-parse HEAD)
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn succeeded despite an unresolvable local default branch (neither main nor master)"
+  assert_contains "$out" "could not determine the local default branch" \
+    "spawn did not clearly refuse an unresolvable local default branch"
+  [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$before" ] \
+    || fail "spawn moved HEAD after failing to resolve the local default branch"
+  [ ! -e "$home/state/$id.meta" ] || fail "refused spawn published task metadata"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed local-only unresolved-default refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+  fi
+  pass "a [local-only] project whose local default branch cannot be resolved refuses rather than guessing"
+}
+
 make_originless_case() {  # <name> <id>
   local name=$1 id=$2 case_dir home project pool fakebin initial
   case_dir="$TMP_ROOT/$name"
@@ -680,6 +776,8 @@ test_remote_seeded_home_spawns_from_treehouse_pool
 test_linked_spawning_home_rejects_primary_before_refresh
 test_stale_pool_base_refreshes_before_branching
 test_non_main_default_branch_refreshes_before_branching
+test_local_only_project_resets_to_local_branch_ignoring_stale_origin
+test_local_only_project_with_unresolvable_default_branch_refuses
 test_direct_pr_and_scout_refresh_before_launch
 test_dirty_pool_refuses_without_discarding_work
 test_unresolved_remote_default_refuses_pool

@@ -2466,8 +2466,8 @@ spawn_worktree_has_origin_config() {  # <worktree>
   return 1
 }
 
-freshen_spawn_worktree_base() {  # <worktree>
-  local worktree=$1 default target expected actual status
+freshen_spawn_worktree_base() {  # <worktree> <project-name>
+  local worktree=$1 project=$2 default target expected actual status mode
   status=$(git -C "$worktree" -c core.quotePath=false status --porcelain) || {
     echo "error: could not inspect pooled worktree '$worktree' before refreshing its base" >&2
     return 1
@@ -2479,6 +2479,34 @@ freshen_spawn_worktree_base() {  # <worktree>
       echo "error: pooled worktree '$worktree' is not clean; refusing to discard uncommitted work while refreshing its base" >&2
     fi
     return 1
+  fi
+  # A [local-only] project's real, current work lives only on ITS OWN local
+  # default branch, never on origin (data/projects.md registers this posture
+  # deliberately: origin can be a small, stale, unrelated snapshot). Resetting
+  # such a worktree to origin/<default> below would silently discard the
+  # authoritative local history, so this project class skips the origin fetch
+  # and reset entirely and instead resets to its own local branch tip.
+  mode=$("$FM_ROOT/bin/fm-project-mode.sh" --raw "$project" 2>/dev/null | cut -d' ' -f1) || mode=
+  if [ "$mode" = local-only ]; then
+    default=$(default_branch "$worktree") || {
+      echo "error: could not determine the local default branch for pooled worktree '$worktree' (project '$project' is registered [local-only]); refusing to launch from an unresolved base" >&2
+      return 1
+    }
+    target="refs/heads/$default"
+    expected=$(git -C "$worktree" rev-parse --verify --quiet "$target^{commit}" 2>/dev/null) || {
+      echo "error: '$target' is not a commit for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
+      return 1
+    }
+    if ! git -C "$worktree" reset --hard "$target" >/dev/null; then
+      echo "error: could not reset pooled worktree '$worktree' to local branch '$target'; refusing to launch from a potentially stale base" >&2
+      return 1
+    fi
+    actual=$(git -C "$worktree" rev-parse --verify --quiet HEAD 2>/dev/null || true)
+    if [ "$actual" != "$expected" ]; then
+      echo "error: pooled worktree '$worktree' is at '${actual:-unknown}', not local '$target' ('$expected'); refusing to launch" >&2
+      return 1
+    fi
+    return 0
   fi
   if ! spawn_worktree_has_origin_config "$worktree"; then
     return 0
@@ -3163,7 +3191,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   validate_spawn_worktree "treehouse get" "$T"
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
-  freshen_spawn_worktree_base "$WT" || exit 1
+  freshen_spawn_worktree_base "$WT" "$(basename "$PROJ_ABS")" || exit 1
 fi
 
 # Pre-register Claude's workspace trust for the worktree, at the first point the
