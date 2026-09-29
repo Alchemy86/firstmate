@@ -329,10 +329,16 @@ gh_run() {
 
 # --- report record ----------------------------------------------------------
 #
-# The record holds the epoch and the exact line last reported for this mode. A
-# line identical to the last one is reported again only after REPEAT_SECS, so a
-# standing problem stays visible without waking firstmate every poll, and a
-# changed line is always reported at once.
+# The record holds the epoch and a signature for the line last reported for
+# this mode. A signature identical to the last one is reported again only
+# after REPEAT_SECS, so a standing problem stays visible without waking
+# firstmate every poll, and a changed signature is always reported at once.
+#
+# The signature is normally the line itself, but a caller may pass a distinct
+# one for a line that embeds a detail that varies poll to poll for the same
+# underlying condition - such as which repo a budget-exhausted sweep happened
+# to stall on - so the same standing problem is still recognised as the same
+# problem across polls even though the printed line differs each time.
 
 record_path() {
   local mode=$1
@@ -342,21 +348,21 @@ record_path() {
 }
 
 record_should_report() {
-  local mode=$1 line=$2 path last_epoch last_line now
+  local mode=$1 key=$2 path last_epoch last_key now
   path=$(record_path "$mode") || return 0
   [ -f "$path" ] || return 0
-  IFS=$(printf '\t') read -r last_epoch last_line < "$path" 2>/dev/null || return 0
-  [ "$last_line" = "$line" ] || return 0
+  IFS=$(printf '\t') read -r last_epoch last_key < "$path" 2>/dev/null || return 0
+  [ "$last_key" = "$key" ] || return 0
   case "$last_epoch" in ''|*[!0-9]*) return 0 ;; esac
   now=$(now_epoch)
   [ "$((now - last_epoch))" -ge "$REPEAT_SECS" ]
 }
 
 record_write() {
-  local mode=$1 line=$2 path tmp
+  local mode=$1 key=$2 path tmp
   path=$(record_path "$mode") || return 0
   tmp=$(umask 077; mktemp "$STATE/.fm-pr-watch-record.XXXXXX" 2>/dev/null) || return 0
-  printf '%s\t%s\n' "$(now_epoch)" "$line" > "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 0; }
+  printf '%s\t%s\n' "$(now_epoch)" "$key" > "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 0; }
   mv -f -- "$tmp" "$path" 2>/dev/null || rm -f -- "$tmp"
   return 0
 }
@@ -558,18 +564,21 @@ headline() {
 # One line out, and only when it is worth waking firstmate for. A problem is
 # always written to stderr as well, so an operator running this by hand sees it
 # even on a poll the repeat gate is holding quiet.
+#
+# key is the repeat-suppression signature; it defaults to the line itself, so
+# every caller that does not pass one keeps the previous exact-line behavior.
 emit() {
-  local mode=$1 line=$2
+  local mode=$1 line=$2 key=${3:-$2}
   fm_cap_line_var "$line" "$MAX_LINE"
   line=$FM_LINE_CAP_LINE
-  if record_should_report "$mode" "$line"; then
+  if record_should_report "$mode" "$key"; then
     printf '%s\n' "$line"
   fi
-  record_write "$mode" "$line"
+  record_write "$mode" "$key"
 }
 
 action_check() {
-  local mode=$1 line
+  local mode=$1 line key
   mkdir -p "$STATE" 2>/dev/null || true
   if ! config_load; then
     printf 'fm-pr-watch: %s\n' "$CONFIG_PROBLEM" >&2
@@ -583,6 +592,7 @@ action_check() {
   build_report
   seen_trim
   line=
+  key=
   [ -z "$FINDINGS" ] || line="$(headline "$mode"): $FINDINGS"
   if [ -n "$line" ] && [ "$DEFERRED" -gt 0 ]; then
     line="$line; $DEFERRED more held for the next poll"
@@ -591,14 +601,19 @@ action_check() {
     if [ -n "$line" ]; then
       line="$line; budget spent, $INCOMPLETE and later not checked"
     else
+      # Pure budget exhaustion, no findings: which repo the sweep stalled on
+      # varies almost every poll with forge response times, so the repeat-
+      # suppression key drops it and normalizes on the standing condition -
+      # the printed line still names the repo for whoever reads it.
       line="pr watch ($mode) ran out of budget before $INCOMPLETE"
+      key="pr watch ($mode) ran out of budget"
     fi
   fi
   if [ -n "$BUDGET_CUT_FROM" ] && [ -n "$line" ]; then
     line="$line; sweep budget cut from ${BUDGET_CUT_FROM}s to ${BUDGET_SECS}s by FM_CHECK_TIMEOUT"
   fi
   [ -n "$line" ] || return 0
-  emit "$mode" "$line"
+  emit "$mode" "$line" "${key:-$line}"
   return 0
 }
 

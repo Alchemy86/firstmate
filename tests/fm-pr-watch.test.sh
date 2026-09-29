@@ -217,6 +217,74 @@ test_a_cut_report_holds_the_rest_for_the_next_poll() {
   pass "pr-watch: a report too long for one line holds the rest instead of losing them"
 }
 
+# --- budget-exhaustion repeat suppression -----------------------------------
+#
+# Which repo a sweep happens to run out of budget before varies almost every
+# poll with forge response times, so the repeat-suppression key for that line
+# must normalize on the standing condition rather than the repo name, or the
+# suppression window never engages and every poll wakes firstmate again. A
+# genuine finding must still report immediately regardless.
+
+# A fake gh whose Nth invocation (across the whole test, not per poll) sleeps
+# for the Nth number in $FIXTURES/gh_sleep_plan (space separated seconds),
+# so the test controls precisely which repo in a sweep is slow without
+# depending on real timing.
+write_budget_gh() {
+  local home=$1
+  cat > "$home/gh" <<'SH'
+#!/usr/bin/env bash
+count_file="$FIXTURES/gh_call_count"
+n=$(cat "$count_file" 2>/dev/null || echo 0)
+n=$((n + 1))
+printf '%s\n' "$n" > "$count_file"
+secs=$(awk -v i="$n" '{print $i}' "$FIXTURES/gh_sleep_plan" 2>/dev/null)
+case "$secs" in ''|0) : ;; *) sleep "$secs" ;; esac
+repo=
+case "${1:-}" in
+  pr)
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -R ]; then repo=${2##*/}; break; fi
+      shift
+    done
+    f="$FIXTURES/prs.$repo"
+    ;;
+  *) exit 0 ;;
+esac
+[ -n "$repo" ] && [ -f "$f" ] && cat "$f"
+exit 0
+SH
+  chmod +x "$home/gh"
+}
+
+test_budget_exhaustion_repeat_suppression_normalizes_across_repos() {
+  local home
+  home=$(make_home budget-repeat)
+  write_budget_gh "$home"
+  write_config "$home" 'FM_PR_WATCH_OWNER=acme' 'FM_PR_WATCH_REPOS="a b c"' \
+    'FM_PR_WATCH_OURS="us-work"'
+  : > "$home/fixtures/prs.a"
+  : > "$home/fixtures/prs.b"
+  : > "$home/fixtures/prs.c"
+  printf '0\n' > "$home/fixtures/gh_call_count"
+  # call 1 (poll 1, repo a) slow; call 2 (poll 2, repo a) fast, call 3 (poll 2,
+  # repo b) slow; calls 4-6 (poll 3, repos a/b/c) all fast.
+  printf '2 0 2 0 0 0\n' > "$home/fixtures/gh_sleep_plan"
+
+  FM_PR_WATCH_BUDGET_SECS=1 run_check "$home" new
+  assert_contains "$OUT" "ran out of budget before b" \
+    "the first budget-exhaustion poll must report which repo it stalled before"
+
+  FM_PR_WATCH_BUDGET_SECS=1 run_check "$home" new
+  [ -z "$OUT" ] || fail "pr-watch: a second budget-exhaustion poll that stalled on a DIFFERENT repo (c, not b) must still be suppressed as the same standing problem, got: $OUT"
+
+  pr_line 41 outsider "a real finding in between" >> "$home/fixtures/prs.a"
+  FM_PR_WATCH_BUDGET_SECS=1 run_check "$home" new
+  assert_contains "$OUT" "a #41 outsider" \
+    "a genuine finding must report immediately regardless of the budget-exhaustion suppression window"
+
+  pass "pr-watch: budget exhaustion on a different repo each poll is still recognized as the same standing problem, while a real finding always reports"
+}
+
 # --- arming, trust, and reinstall -------------------------------------------
 
 # The watcher runs a custom check only through its own trust binding, so that
@@ -345,6 +413,7 @@ test_new_reports_other_peoples_prs_only
 test_ours_reports_our_prs_only
 test_comments_reports_other_peoples_comments_on_our_prs
 test_a_cut_report_holds_the_rest_for_the_next_poll
+test_budget_exhaustion_repeat_suppression_normalizes_across_repos
 test_arm_registers_every_trigger
 test_a_tampered_shim_loses_its_binding
 test_reinstall_rearms_every_trigger
