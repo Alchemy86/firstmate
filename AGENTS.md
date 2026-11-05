@@ -144,6 +144,7 @@ Route durable knowledge to its most specific owner:
 
 Firstmate never writes a project's `AGENTS.md` directly: a crewmate creates or updates it lazily through the project's selected delivery path, using `bin/fm-ensure-agents-md.sh` and preferring pointers to authoritative sources over copied detail.
 Keep fleet delivery posture and captain-private strategy out of project memory.
+Where the Situation Room Claude Work board is configured, the wake drain publishes fleet state to it and routes the team's written responses into captain holds or new backlog items on its own ([`docs/situation-room-board.md`](docs/situation-room-board.md)).
 On `/stow`, load the `stow` skill; it files and corrects only the open work the session is holding, and never reconciles the backlog against repository or PR reality.
 
 ## 7. Task lifecycle

@@ -207,6 +207,24 @@ case "${1:-}" in
   *) echo "usage: fm-wake-drain.sh [--ack-through SEQUENCE --recovery-generation GENERATION]" >&2; exit 2 ;;
 esac
 
+# Situation Room Claude Work board, the fleet's shared read/write surface.
+# Inert unless this home has the operator config: a home that never opted in
+# behaves exactly as before. When it IS configured, a failure is printed by the
+# script itself and never changes this drain's exit status, because supervision
+# must survive an OpenSearch outage. The answers drain runs at the top of the
+# wake-handling turn, before the queue lock, so a network call never holds it;
+# the board publish runs at the end of the acknowledgement step, which is the
+# point where fleet state has just finished changing.
+situationroom_hook() { # <publish|drain>
+  local script="$SCRIPT_DIR/fm-situationroom-$1.sh"
+  [ -f "${FM_SR_ENV_OVERRIDE:-$HOME/.config/fm-situationroom.env}" ] || return 0
+  [ -x "$script" ] || return 0
+  "$script" >/dev/null || echo "wake drain: situation room $1 did not complete" >&2
+  return 0
+}
+
+[ -n "$ACK_THROUGH" ] || situationroom_hook drain
+
 [ "$ACTOR" != branch ] || require_branch_eligible_rows || exit 1
 
 # Defense in depth for the supervision chain: this script runs at the top of
@@ -757,6 +775,7 @@ if [ -n "$ACK_THROUGH" ]; then
     printf 'wake drain: acknowledged wakes through %s (%s row(s) consumed), but a newer recovery episode is pending; re-run bin/fm-wake-drain.sh and use the new WAKE_ACK_REQUIRED command\n' \
       "$ACK_THROUGH" "$ACK_REMOVED" >&2
   fi
+  situationroom_hook publish
   exit 0
 fi
 
