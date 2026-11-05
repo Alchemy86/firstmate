@@ -407,6 +407,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/situation-room-board.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/subagent-guard.md",
       "audience": "maintainer-architecture"
     },
