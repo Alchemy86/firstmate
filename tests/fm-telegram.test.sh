@@ -174,7 +174,7 @@ fm_tg_under_cursor() {  # <command> [arg...]
 
 # POSIX-safe single-quoting for the command fm_tg_under_cursor re-parses.
 fm_tg_shell_quote() {
-  local out= arg
+  local out='' arg
   for arg in "$@"; do
     out="$out '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"
   done
