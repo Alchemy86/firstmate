@@ -494,6 +494,7 @@ MODE_SET=0
 YOLO_SET=0
 TRACEPARENT_SET=0
 RELAUNCH=0
+RELAUNCH_WINDOW_MISSING=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -1318,10 +1319,20 @@ if [ "$RELAUNCH" -eq 1 ]; then
     exit 1
   }
   RELAUNCH_STATE=$(fm_backend_agent_state "$BACKEND" "$RELAUNCH_TARGET")
-  [ "$RELAUNCH_STATE" = dead ] || {
-    echo "error: task $ID's endpoint reads '$RELAUNCH_STATE'; a relaunch requires a positively agent-free endpoint (stop the agent first with bin/fm-control.sh $ID exit)" >&2
-    exit 1
-  }
+  case "$BACKEND:$RELAUNCH_STATE" in
+    *:dead) ;;
+    tmux:missing)
+      # The window itself is gone (a bare pane-close, or the whole tmux server
+      # died), not just its agent. Still positive death evidence per
+      # fm-crew-state.sh's classifier contract, and tmux alone can recreate the
+      # missing window below rather than adopting a target that does not exist.
+      RELAUNCH_WINDOW_MISSING=1
+      ;;
+    *)
+      echo "error: task $ID's endpoint reads '$RELAUNCH_STATE'; a relaunch requires a positively agent-free endpoint (stop the agent first with bin/fm-control.sh $ID exit)" >&2
+      exit 1
+      ;;
+  esac
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   [ -n "$KIND" ] || KIND=ship
@@ -2646,8 +2657,19 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # A secondmate's home already resolved WT above through the same validation a
   # fresh secondmate spawn uses; every other kind takes the recorded worktree.
   [ "$KIND" = secondmate ] || WT=$RELAUNCH_WT
-  WT_TARGET=$T
   SES=${T%%:*}
+  W=${T#*:}
+  if [ "$RELAUNCH_WINDOW_MISSING" -eq 1 ]; then
+    # The recorded window (or its whole session/server) is gone. Recreate it
+    # in the SAME session name and SAME window name, cd'd straight into the
+    # existing worktree rather than the project - there is no new local copy
+    # to allocate, only a new pane to run the replacement in.
+    tmux has-session -t "$SES" 2>/dev/null || tmux new-session -d -s "$SES"
+    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$WT") || exit 1
+    WT_TARGET="$WID"
+  else
+    WT_TARGET=$T
+  fi
 else
 case "$BACKEND" in
   tmux)

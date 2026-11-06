@@ -451,12 +451,14 @@ do_exit() {
   require_state_verified_backend exit
   state=$(agent_state)
   case "$state" in
-    dead)
+    dead|missing)
+      # missing is positive death evidence too (fm-crew-state.sh's classifier
+      # contract): the whole window/session is gone, not just its agent, so
+      # there is nothing more final to prove before reporting the agent stopped.
       printf 'already-stopped'
       return 0
       ;;
     alive) ;;
-    missing) die "task $ID's recorded endpoint is gone, so there is no agent to stop; reconcile the task before any further control action" ;;
     *) die "task $ID's endpoint reads '$state' rather than a positively classified state; refusing to send a lifecycle command into an unattributed endpoint" ;;
   esac
   # A busy agent is interrupted first before the exit command is submitted.

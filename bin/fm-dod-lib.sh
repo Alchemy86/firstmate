@@ -199,7 +199,16 @@ fm_dod_block() {  # <mode> <task-id>
 Delivery contract: mode=direct-PR
 This task ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
-When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
+
+**Mandatory pre-push rule check, no exception:** before pushing or opening the PR, run
+\`git log --format=%B <base>..HEAD | grep -iE "captain"\` and separately grep your drafted PR
+title and body for the same pattern. This repo's hard rule: never put "captain" or any other
+direct address into a commit message, PR title, or PR body - that address is chat-only, between
+you and firstmate, never a non-chat artifact. If the grep matches anything, rewrite the offending
+commit message (\`git commit --amend\` before you've pushed) and/or the PR title/body into plain
+What/Why/Proof language with zero address before proceeding. Confirm the grep is clean, then push.
+When it is implemented, committed, and that check is clean, push your branch and open a PR with
+\`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
 Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
 EOF
       ;;
@@ -210,7 +219,13 @@ Delivery contract: mode=local-only
 This task ships **local-only**: no remote, no PR, no pipeline.
 The task is complete only when committed on your branch \`fm/$id\`. Do NOT push, do NOT open a PR, do NOT merge.
 Keep your branch a clean fast-forward onto the current default branch - if \`main\` has advanced, rebase onto it so the eventual merge stays a fast-forward.
-When it is implemented and committed, append \`done: ready in branch fm/$id\` to the status file and stop.
+
+**Mandatory pre-done rule check, no exception:** before reporting done, run
+\`git log --format=%B <base>..HEAD | grep -iE "captain"\`. This repo's hard rule: never put "captain"
+or any other direct address into a commit message - that address is chat-only, between you and
+firstmate, never a non-chat artifact. If it matches, \`git commit --amend\` the offending message
+into plain language with zero address before reporting done.
+When it is implemented, committed, and that check is clean, append \`done: ready in branch fm/$id\` to the status file and stop.
 The configured merge authority approves the ready branch, then firstmate merges it into local \`main\` through the guarded fast-forward path.
 EOF
       ;;
@@ -244,6 +259,13 @@ Two firstmate-specific rules layer on top of that guidance:
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
 - NEVER pass \`--yes\` (or \`-y\`) to \`no-mistakes axi run\` or \`no-mistakes axi respond\`. It is banned fleet-wide.
   It auto-resolves every gate including ask-user findings with no escalation, and answering your own ask-user finding is a hard rule violation.
+
+**Mandatory pre-PR rule check, no exception:** before /no-mistakes opens its PR (or before any
+gate response that would let it push), run \`git log --format=%B <base>..HEAD | grep -iE "captain"\`
+against your own commits and check any PR title/body text you supply to the pipeline. This repo's
+hard rule: never put "captain" or any other direct address into a commit message, PR title, or PR
+body - that address is chat-only, between you and firstmate, never a non-chat artifact. If it
+matches, fix the offending commit message or PR text before letting the pipeline proceed.
 
 After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
 EOF
