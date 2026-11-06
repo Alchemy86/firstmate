@@ -150,7 +150,7 @@
 # further rule about branching from a freshly fetched remote. A secondmate
 # charter does not touch a project worktree itself, so it carries none of this -
 # its own crewmates get it from their own generated briefs.
-
+#
 # A home may carry standing worker instructions without editing this tracked
 # script: when config/brief-include.md exists under the active home, ship and
 # scout scaffolds append its text verbatim as their last section, "# Home brief

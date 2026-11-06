@@ -129,10 +129,16 @@ export PATH="$FAKEBIN:$PATH"
 fm_tg_scratch_bin() {
   local dir=$1 sbin="$1/bin" f
   mkdir -p "$sbin"
+  # Copy every shared library rather than naming the handful this hook reached
+  # through when the case was written. The named list silently rotted the moment
+  # a library grew a new dependency of its own: fm-wake-lib.sh gained
+  # fm-path-lib.sh, the scratch bin had no copy of it, and the hook died while
+  # sourcing instead of long-polling - so the case failed with "no firing ran
+  # the long poll at all", naming the symptom and not the missing file.
+  # Libraries are side-effect-free on source by convention, so copying all of
+  # them costs nothing and removes that whole class of fixture rot.
   for f in "$ROOT"/bin/fm-tg-*.sh "$ROOT"/bin/fm-tg-*.py "$ROOT"/bin/fm_tg_records.py \
-    "$ROOT"/bin/fm-primary-scope-lib.sh "$ROOT"/bin/fm-hook-host-lib.sh \
-    "$ROOT"/bin/fm-timeout-lib.sh "$ROOT"/bin/fm-wake-lib.sh \
-    "$ROOT"/bin/fm-harness.sh "$ROOT"/bin/fm-cursor-lib.sh; do
+    "$ROOT"/bin/*lib*.sh "$ROOT"/bin/fm-harness.sh; do
     cp "$f" "$sbin/$(basename "$f")"
   done
   cat > "$sbin/fm-tg-isfirstmate.sh" <<'SH'
@@ -142,6 +148,37 @@ exit 0
 SH
   chmod +x "$sbin"/*.sh "$sbin"/*.py
   printf '%s' "$sbin"
+}
+
+# Run <command...> under a real process NAMED for a non-Claude harness, with
+# every harness marker but CURSOR_AGENT cleared, and echo its combined output.
+#
+# Forcing a non-Claude verdict needs BOTH layers of bin/fm-harness.sh to agree,
+# not the marker alone: detect_own lets a comm-strength ancestor outrank a
+# contradicting marker, and this suite's own ancestor is whatever harness
+# launched it - a real claude process on this fleet - so CURSOR_AGENT=1 by
+# itself still resolved to "claude". Running under a harness-named process is
+# the technique tests/fm-harness-precedence.test.sh owns (its under_process
+# helper). The name must be cursor-agent, not cursor: fm_cursor_process_matches
+# in bin/fm-cursor-lib.sh keys on the real executable name. The inner command
+# substitution is load-bearing in both places - a bare -c lets the shell exec
+# the command in place and replace the very process the ancestry walk must find.
+fm_tg_under_cursor() {  # <command> [arg...]
+  local bin="$TMP_ROOT/cursor-agent-bin" quoted=
+  mkdir -p "$bin"
+  [ -x "$bin/cursor-agent" ] || cp "$(command -v bash)" "$bin/cursor-agent"
+  quoted=$(fm_tg_shell_quote "$@")
+  env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT \
+    CURSOR_AGENT=1 "$bin/cursor-agent" -c "r=\$($quoted 2>&1); printf '%s\\n' \"\$r\""
+}
+
+# POSIX-safe single-quoting for the command fm_tg_under_cursor re-parses.
+fm_tg_shell_quote() {
+  local out= arg
+  for arg in "$@"; do
+    out="$out '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"
+  done
+  printf '%s' "${out# }"
 }
 
 # fm_tg_env <dir>: write a valid telegram env file in <dir>, echo its path.
@@ -258,13 +295,10 @@ test_bootstrap_warns_inbound_claude_only_on_other_harnesses() {
   mkdir -p "$home/state" "$home/config"
   env=$(fm_tg_env "$home")
 
-  # CURSOR_AGENT wins over both CLAUDECODE and process ancestry in
-  # bin/fm-harness.sh (checked first, deliberately), so this reliably forces
-  # a non-Claude verdict regardless of which harness actually launched this
-  # test suite - see the identical reasoning in
-  # test_poll_does_not_ack_on_a_non_claude_harness above.
-  CURSOR_AGENT=1 FM_BOOTSTRAP_NETWORK=skip FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" \
-    "$ROOT/bin/fm-bootstrap.sh" >"$TMP_ROOT/inbound-scope-out" 2>&1
+  # fm_tg_under_cursor forces the non-Claude verdict through both layers of
+  # bin/fm-harness.sh; CURSOR_AGENT alone no longer does it. See its comment.
+  FM_BOOTSTRAP_NETWORK=skip FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" \
+    fm_tg_under_cursor "$ROOT/bin/fm-bootstrap.sh" >"$TMP_ROOT/inbound-scope-out" 2>&1
   assert_grep "TELEGRAM: on" "$TMP_ROOT/inbound-scope-out" "bootstrap must still arm the (harness-agnostic) poll on a non-Claude primary"
   assert_grep "TELEGRAM: inbound is Claude-only on this setup" "$TMP_ROOT/inbound-scope-out" \
     "bootstrap must plainly warn that inbound will not surface when the primary is not Claude"
@@ -1600,19 +1634,16 @@ test_poll_does_not_ack_on_a_non_claude_harness() {
   fm_tg_getupdates_fixture "$TMP_ROOT" \
     '{"ok":true,"result":[{"update_id":91,"message":{"chat":{"id":999},"date":410,"text":"nothing will ever surface this"}}]}'
 
-  # bin/fm-harness.sh checks CURSOR_AGENT before both CLAUDECODE and process
-  # ancestry (bin/fm-harness.sh "Cursor is checked BEFORE claude, deliberately"),
-  # so this reliably forces a non-Claude verdict regardless of what harness
-  # actually launched this test suite - unlike unsetting markers alone, which
-  # a real `claude` ancestor process in this environment would still resolve
-  # to "claude" through ancestry.
+  # fm_tg_under_cursor forces the non-Claude verdict through both layers of
+  # bin/fm-harness.sh; CURSOR_AGENT alone no longer does it. See its comment.
   #
   # THE CAPTAIN'S RULING (2026-08-23): on a harness with no Stop-hook path to
   # surface a message, acking it is a FALSE PROMISE - it tells the captain his
   # message landed and is being worked when nothing will ever show it to the
   # model or demand a reply. An unanswered message with no ack at least looks
   # broken instead of looking handled.
-  out=$(CURSOR_AGENT=1 FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" "$ROOT/bin/fm-tg-poll.sh")
+  out=$(FM_HOME="$home" FM_TG_ENV_OVERRIDE="$env" FAKE_CURL_LOG="$log" \
+    fm_tg_under_cursor "$ROOT/bin/fm-tg-poll.sh")
   unset FAKE_TG_GETUPDATES_FILE
   assert_contains "$out" "telegram: 1 message(s)" "the poll must still report and record the message on a non-Claude harness"
   assert_present "$inbox/91.json" "the message must still be recorded on a non-Claude harness - only the ack is withheld"

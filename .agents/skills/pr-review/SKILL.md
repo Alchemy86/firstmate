@@ -1,10 +1,8 @@
 ---
 name: pr-review
 description: >-
-  Agent-only standard for reviewing a pull request and posting the review.
-  Use before reviewing any pull request, ours or someone else's, and before posting review findings.
-  Owns what counts as a finding, what is never worth reporting, how our own PRs are reviewed harder than other people's, and the rule that a review is posted on the PR rather than reported into chat.
-  The voice a review is written in is not this skill's: it belongs to the home's own captain preferences.
+  Single owner of what a firstmate PR review reports and where it goes.
+  Load before reviewing any pull request, ours or someone else's, and before posting review findings.
 user-invocable: false
 metadata:
   internal: true
