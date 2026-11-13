@@ -44,7 +44,7 @@ SH
   cat > "$fakebin/no-mistakes" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = --version ]; then
-  printf '%s\n' 'no-mistakes version v1.46.0 (fake)'
+  printf '%s\n' 'no-mistakes version v1.31.2 (fake)'
 fi
 SH
   cat > "$fakebin/tasks-axi" <<'SH'
@@ -240,10 +240,6 @@ latest_reread_instruction() {
   printf '%s\n' "$latest"
 }
 
-inbox_record_body() {  # <record>
-  bash -c '. "$1"; fm_task_inbox_body "$2"' _ "$ROOT/bin/fm-task-inbox-lib.sh" "$1"
-}
-
 run_config_push() {
   local root=$1 home=$2 fakebin=$3 log=$4
   PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_SEND_SETTLE=0 \
@@ -275,12 +271,8 @@ test_primary_budget_converges_with_exact_reread_and_safe_failures() {
     '-----END config/startup-memory-budget-----')
   [ "$(<"$instruction")" = "$expected" ] \
     || fail "budget reread payload was not the exact destination bytes"
-  assert_contains "$(inbox_record_body "$home/state/sm.inbox/001.msg")" "CONFIG_REREAD: $instruction" \
-    "budget propagation did not enqueue the pointer to its exact reread generation"
-  assert_contains "$(<"$log")" "Firstmate instruction waiting: list " \
-    "budget propagation did not ring the durable inbox doorbell"
-  assert_contains "$(<"$log")" "/state/sm.inbox/*.msg" \
-    "budget propagation doorbell did not identify the durable inbox"
+  assert_contains "$(<"$log")" "CONFIG_REREAD: $instruction" \
+    "budget propagation did not send the pointer to its exact reread generation"
 
   outside="$world/unsafe-budget"
   printf '555\n' > "$outside"

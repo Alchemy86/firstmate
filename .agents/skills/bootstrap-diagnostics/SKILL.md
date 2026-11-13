@@ -18,7 +18,7 @@ When any diagnostic needs captain attention, report the plain consequence and re
 
 - `MISSING: <tool> (install: <command>)` - list the missing tools to the captain with a one-line purpose each plus the printed install commands, wait for consent (one approval may cover the list), then run `bin/fm-bootstrap.sh install <approved tools...>`.
   For `treehouse`, this also covers an installed version whose `treehouse get` lacks `--lease`; treat it as an upgrade request.
-  For `no-mistakes`, this also covers an installed version older than 1.46.0, because this repo's PR gate requires structured pipeline attestation that older builds do not write.
+  For `no-mistakes`, this also covers an installed version older than 1.31.2, because crewmate validation briefs delegate gate mechanics to no-mistakes' version-matched guidance.
   For any axi-family tool - `gh-axi`, `lavish-axi`, `tasks-axi`, `quota-axi` - an installed version below its floor is a plain upgrade request; [`bin/fm-bootstrap.sh`](../../../bin/fm-bootstrap.sh) owns the floor policy, and never argue the floor down to whatever the home happens to have installed.
   For `tasks-axi`, this additionally covers an installed build that fails the separate feature probe (`bin/fm-tasks-axi-lib.sh` owns the definition); `config/backlog-backend=manual` only suppresses the verbose `BOOTSTRAP_INFO: tasks-axi available` fact, not this missing-tool report.
   For `quota-axi`, bootstrap requires it because firstmate reads its current output directly before resolving every crew-dispatch profile array; without it, report the missing requirement and do not choose around an unexamined candidate.
@@ -53,10 +53,21 @@ When any diagnostic needs captain attention, report the plain consequence and re
 - `SECONDMATE_SYNC: secondmate <id>: skipped: <reason>` - secondmate convergence left a live home on its existing checkout because the home was dirty, diverged, unsafe, on the wrong branch, missing its placement-specific target commit, unreachable, or otherwise not fast-forwardable, or because inherited local-material propagation failed; bootstrap continued, but inspect the reason because the secondmate's tracked instructions, inherited settings, or shared captain preferences may be stale after a primary update.
 - `SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed after <cause>: <reason>` - the session-start liveness sweep could not guarantee that the registered secondmate is running a real agent process.
   Investigate the reason because that secondmate is not guaranteed live.
-- `SECONDMATE_HANDOFF: secondmate <id>: pending delivery: <n> item(s)` - queued work has already left the main dispatchable backlog and remains safe in the named remote route's backlog-format outbox, pending backlog receipt or receiver-wake confirmation.
-  Preserve that outbox and rerun `bin/fm-backlog-handoff.sh --resume-pending` after the route or endpoint problem is resolved; never re-add or dispatch the items from the main backlog.
+- `SECONDMATE_HANDOFF: secondmate <id>: pending delivery: <n> item(s)` - queued work has already left the main dispatchable backlog and remains safe in the named remote route's backlog-format outbox.
+  Preserve that outbox and rerun `bin/fm-backlog-handoff.sh --resume-pending` after same-host connectivity returns; never re-add or dispatch the items from the main backlog.
   An unsafe-outbox variant requires path and file-type inspection before any retry.
 - `NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>` - secondmate convergence changed a running home's loaded instructions or inherited config, but the deterministic `fm-send.sh fm-<id>` re-read nudge failed.
   Inspect the reason, keep the pending marker under `state/.secondmate-nudge-pending/` intact, and rerun session start after the endpoint or metadata issue is fixed so bootstrap can retry the exact same marked send on the same local or remote route.
 - `FMX: X mode on ...` / `FMX: X mode off ...` - bootstrap confirmed or removed the local Relay poll artifacts (`docs/configuration.md` "Relay (.env)"); the emitted line still carries Relay's former `X mode` wording.
   Only when a running watcher needs the cadence transition applied immediately, restart the home-scoped watcher through the emitted harness supervision protocol; bootstrap deliberately never restarts the watcher itself.
+- `TELEGRAM: on (chat configured) - ...` / `TELEGRAM: off - removed ...` - bootstrap confirmed or removed this machine's Telegram captain-comms poll artifacts (`docs/telegram.md`).
+  Both are completed facts and need no action beyond the same optional cadence restart as the Relay line above.
+- `TELEGRAM: inbound is Claude-only on this setup - ...` - Telegram is configured but this primary's detected harness is not Claude, so only the two Claude-registered Stop hooks that surface a captain message and enforce a reply exist; nothing does that on this harness.
+  `bin/fm-tg-fetch.py` already refuses to send the arrival `...` acknowledgement in this case rather than falsely promise the captain his message is being handled, so an unanswered message here correctly looks unhandled instead of silently vanishing.
+  Outbound sends (`bin/fm-tg-send.sh`) are unaffected on every harness.
+  No action needed unless the captain actually wants inbound working on this harness, which is a standing scope decision (`docs/telegram.md` "Inbound is Claude-only"), not something to fix ad hoc.
+- `TELEGRAM: off - missing poll dependencies ...` - `curl` or `python3` is absent, so bootstrap disarmed the Telegram poll and printed the matching `MISSING:` line.
+  Handle the `MISSING:` line by the rule at the top of this skill; the poll rearms itself on the next bootstrap once the tool is installed.
+- `TELEGRAM: off - failed to arm ...` / `TELEGRAM: off - failed to remove ...` - bootstrap could not write, register, or clear the poll shim, its byte binding, or the cadence config, so the captain's Telegram channel is NOT being polled.
+  Inspect `state/tg-watch.check.sh`, `state/tg-watch.check-trust`, and `config/tg-mode.env` for a symlink, a wrong mode, or an unwritable parent, repair whatever is wrong, and rerun bootstrap; a `stale artifacts remain` variant means the leftovers are still on disk and must be cleared before the rearm can succeed.
+  Tell the captain his Telegram channel is down while this is unresolved, since he cannot tell the difference between a broken channel and firstmate having nothing to say.

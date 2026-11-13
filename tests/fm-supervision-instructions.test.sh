@@ -170,12 +170,31 @@ test_pi_snippet_uses_effective_extension_path() {
   assert_contains "$out" "-e $turnend -e $watch" "pi snippet did not render both effective extension launch paths"
   assert_contains "$out" "The turn-end guard extension lives at \`$turnend\`" "pi snippet did not render the turn-end guard extension path"
   assert_contains "$out" "The watcher extension lives at \`$watch\`" "pi snippet did not render the watcher extension path"
-  assert_contains "$out" "MAIN must not re-drain, re-run, or acknowledge it" "pi snippet lost merged-event ownership"
-  assert_contains "$out" "MAIN applies judgment about whether and how to surface, summarize, reference, or incorporate a merged sailboat outcome" "pi snippet imposed a mechanical sailboat treatment"
   assert_not_contains "$out" "__FM_PI_EXT__" "renderer leaked the Pi extension path placeholder"
   assert_not_contains "$out" "__FM_PI_TURNEND_EXT__" "renderer leaked the Pi turn-end extension path placeholder"
   assert_not_contains "$out" "state/fm-primary-pi-watch.ts" "pi snippet kept the old generated state-relative extension path"
   pass "pi supervision snippet renders the effective extension path"
+}
+
+test_telegram_only_cadence_not_contradicted_by_x_mode_line() {
+  local home config out
+  home="$TMP_ROOT/tg-only-home"
+  config="$TMP_ROOT/tg-only-config"
+  mkdir -p "$home/state" "$config"
+  # Telegram's tg-mode.env presence, with X mode left off, used to still print
+  # the unqualified "X mode: inactive; use the default watcher cadence" line
+  # immediately above "Telegram captain-comms: active; source ... 30s cadence
+  # is inherited" - two adjacent lines giving opposite cadence instructions
+  # for the same watcher launch. TG_MODE is detected from config/tg-mode.env
+  # presence, not a CLI flag (see bin/fm-bootstrap.sh's telegram_setup()).
+  printf 'FM_CHECK_INTERVAL=30\n' > "$config/tg-mode.env"
+  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$config" "$RENDER" --harness codex)
+  assert_contains "$out" "- Telegram captain-comms: active; source $config/tg-mode.env before launching any watcher process so the 30s cadence is inherited." \
+    "telegram stanza missing or path not rendered"
+  assert_not_contains "$out" "X mode: inactive; use the default watcher cadence" \
+    "X mode line still claimed the default cadence while Telegram's line said to source the 30s cadence file"
+  assert_contains "$out" "- X mode: inactive." "X mode line should still report its own inactive status"
+  pass "renderer does not contradict Telegram's cadence instruction with the X mode default-cadence line"
 }
 
 test_selected_harness_block_only
@@ -187,3 +206,4 @@ test_pi_signed_preserves_identity_with_pi_supervision_protocol
 test_grok_is_background_notify
 test_grok_command_sources_effective_config
 test_pi_snippet_uses_effective_extension_path
+test_telegram_only_cadence_not_contradicted_by_x_mode_line

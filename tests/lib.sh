@@ -34,6 +34,20 @@ FM_TEST_LIB_SOURCED=1
 # strips this to verify real refusal.
 export FM_GATE_REFUSE_BYPASS=1
 
+# Telegram captain-comms config lives at a fixed $HOME path, deliberately
+# outside any FM_HOME (docs/telegram.md - one captain, one bot per machine).
+# That means, unlike X mode's FM_HOME-scoped .env, it is not naturally
+# isolated by a suite's per-case FM_HOME scratch dirs: on a machine that has
+# real Telegram captain-comms configured (such as the one this repo's own
+# fleet runs on), any suite that calls fm-bootstrap.sh or fm-session-start.sh
+# without its own override would pick up the real ~/.config/fm-telegram.env
+# and leak an unexpected TELEGRAM: line into output it is pinning for other
+# reasons. Point every sourcing suite at a path that never exists by default,
+# the same fix tests/fm-bootstrap.test.sh already applied for itself; a suite
+# that actually exercises Telegram config (tests/fm-telegram.test.sh) exports
+# its own real path afterward, which overrides this default.
+export FM_TG_ENV_OVERRIDE="${TMPDIR:-/tmp}/fm-test-no-telegram-config.$$.env"
+
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.
 # shellcheck disable=SC2034

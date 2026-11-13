@@ -18,7 +18,8 @@
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed after <cause>: <reason>",
 #                 "SECONDMATE_HANDOFF: secondmate <id>: pending delivery: <n> item(s)",
-#                 "FMX: X mode on ..." or "FMX: X mode off ...".
+#                 "FMX: X mode on ..." or "FMX: X mode off ...",
+#                 "TELEGRAM: on (chat configured) ..." or "TELEGRAM: off ...".
 #          When a RUNNING local secondmate worktree is fast-forwarded to
 #          firstmate's own current default-branch commit, that update is a
 #          purely local fast-forward and never an origin fetch. Remote routes
@@ -51,7 +52,7 @@
 #          treehouse is also MISSING when its installed version lacks
 #          "treehouse get --lease" support.
 #          no-mistakes is also MISSING when its installed version is older than
-#          1.46.0 (structured pipeline attestation floor; see CONTRIBUTING.md).
+#          1.31.2.
 #          The AXI-family floor policy is owned beside GH_AXI_MIN and
 #          LAVISH_AXI_MIN below; the per-tool owners point there. An installed
 #          build below its floor reports MISSING like no-mistakes, so the operator
@@ -70,6 +71,11 @@
 #          X mode is OPTIONAL and inert unless FM_HOME/.env has a non-empty
 #          FMX_PAIRING_TOKEN. When opted in, bootstrap requires curl+jq, writes
 #          the relay poll shim and 30s cadence config, and prints an FMX line.
+#          Telegram captain-comms is OPTIONAL and inert unless
+#          $HOME/.config/fm-telegram.env (outside this repo, one file per
+#          machine) has non-empty TG_TOKEN and TG_CHAT_ID. When configured,
+#          bootstrap requires curl+python3, writes the poll shim and 30s
+#          cadence config, and prints a TELEGRAM line; see docs/telegram.md.
 #          Fleet sync fetches, fast-forwards safe default-branch states, reports
 #          recovered and STUCK clone drift, and prunes gone local branches; it is
 #          bounded by FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT when it is a non-empty
@@ -79,42 +85,38 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the seven MUTATING sweeps
 #          (PR-check migration, secondmate_sync, secondmate_liveness_sweep,
-#          secondmate_handoff_resume, x_mode_setup, fleet_sync) while still
-#          printing every read-only detect line
-#          above; the TANGLE line switches to advisory-only wording with no
-#          checkout command. Used by
+#          secondmate_handoff_resume, x_mode_setup, telegram_setup, fleet_sync)
+#          while still printing every read-only detect line above; the TANGLE
+#          line switches to advisory-only wording with no checkout command.
+#          Used by
 #          fm-session-start.sh's read-only path when another live session holds
 #          the fleet lock, so a second concurrent session never race-mutates
 #          PR-check artifacts, secondmate homes, pending handoff outboxes,
-#          X-mode artifacts, project clones, or repair instructions.
-#          Unset/0 (the default) runs all six sweeps - this flag is purely
-#          additive.
+#          X-mode artifacts, Telegram artifacts, project clones, or repair
+#          instructions.
+#          Unset/0 (the default) runs every sweep exactly as before - this flag
+#          is purely additive.
 #          Set FM_BOOTSTRAP_NETWORK to split this run by whether a step talks to
 #          the network, so a session start can print its digest from local reads
-#          alone and run the network half off the digest's blocking path:
-#            all  (default, and any unrecognized value) - every local and network
-#                 step. Unrecognized values fall back here on purpose: a typo
+#          alone and run the network half concurrently:
+#            all  (default, and any unrecognized value) - everything, exactly as
+#                 before. Unrecognized values fall back here on purpose: a typo
 #                 must never silently skip a safety sweep.
 #            skip - every LOCAL step, and none of the network ones. Skips
 #                 `gh auth status`, secondmate_liveness_sweep, secondmate_sync,
 #                 secondmate_handoff_resume, and fleet_sync.
 #            only - ONLY those network steps and nothing else. No tool detection,
 #                 no version floors, no tangle check, no PR-check migration, no
-#                 x_mode_setup: those already ran on the local pass.
+#                 x_mode_setup, no telegram_setup: those already ran on the
+#                 local pass.
 #          FM_BOOTSTRAP_DETECT_ONLY composes with it unchanged, so `only` plus
 #          detect-only is the read-only `gh auth status` probe on its own.
 #          bin/fm-startup-network.sh owns the deferral: it runs the `only` phase
 #          in a detached bounded worker and publishes the result. This file stays
 #          the single owner of every sweep, and the split changes only WHEN each
-#          runs, never WHETHER. During the network phase, project clone refresh
-#          overlaps the independent secondmate work. Per-secondmate remote
-#          liveness workers run concurrently and finish before per-secondmate
-#          remote convergence workers run concurrently, because convergence
-#          consumes respawned ids. Worker output is captured separately and
-#          replayed in spawn order; failure to create that private capture
-#          directory selects the sequential fallback.
+#          runs, never WHETHER.
 #          A relaunch that the liveness sweep performs during an `only` run is
 #          always reported, because a digest composed before that run already
 #          printed the superseded endpoint record.
@@ -189,55 +191,6 @@ network_sweep_authorized() {
   fi
   echo "NETWORK_CHECKS: fleet lock ownership changed before $label, so this stale worker skipped that sweep"
   return 1
-}
-
-# Concurrent per-item runner for the deferred network sweeps. Each worker's
-# stdout and stderr are captured to private files and replayed in original
-# order after every worker finishes, so concurrent probes cannot interleave
-# or mis-attribute SECONDMATE_LIVENESS / SECONDMATE_SYNC lines. Respawned ids
-# are collected from per-id files because background workers cannot mutate
-# the parent's SECONDMATE_RESPAWNED_IDS.
-bootstrap_parallel_begin() {
-  BOOTSTRAP_PAR_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-bootstrap-par.XXXXXX") || return 1
-  BOOTSTRAP_PAR_N=0
-  FM_BOOTSTRAP_PARALLEL_DIR=$BOOTSTRAP_PAR_DIR
-  export FM_BOOTSTRAP_PARALLEL_DIR
-}
-
-bootstrap_parallel_spawn() {
-  BOOTSTRAP_PAR_N=$((BOOTSTRAP_PAR_N + 1))
-  (
-    "$@"
-  ) >"$BOOTSTRAP_PAR_DIR/$BOOTSTRAP_PAR_N.out" 2>"$BOOTSTRAP_PAR_DIR/$BOOTSTRAP_PAR_N.err" &
-  printf '%s\n' "$!" > "$BOOTSTRAP_PAR_DIR/$BOOTSTRAP_PAR_N.pid"
-}
-
-bootstrap_parallel_finish() {
-  local i pid f
-  i=1
-  while [ "$i" -le "$BOOTSTRAP_PAR_N" ]; do
-    pid=$(cat "$BOOTSTRAP_PAR_DIR/$i.pid")
-    wait "$pid" || true
-    i=$((i + 1))
-  done
-  i=1
-  while [ "$i" -le "$BOOTSTRAP_PAR_N" ]; do
-    cat "$BOOTSTRAP_PAR_DIR/$i.out"
-    cat "$BOOTSTRAP_PAR_DIR/$i.err" >&2
-    i=$((i + 1))
-  done
-  for f in "$BOOTSTRAP_PAR_DIR"/respawned.*; do
-    [ -f "$f" ] || continue
-    SECONDMATE_RESPAWNED_IDS="$SECONDMATE_RESPAWNED_IDS $(tr -d '\n' < "$f")"
-  done
-  rm -rf "$BOOTSTRAP_PAR_DIR"
-  unset FM_BOOTSTRAP_PARALLEL_DIR BOOTSTRAP_PAR_DIR BOOTSTRAP_PAR_N
-}
-
-secondmate_note_respawned() {  # <id>
-  SECONDMATE_RESPAWNED_IDS="$SECONDMATE_RESPAWNED_IDS $1"
-  [ -n "${FM_BOOTSTRAP_PARALLEL_DIR:-}" ] || return 0
-  printf '%s\n' "$1" > "$FM_BOOTSTRAP_PARALLEL_DIR/respawned.$1"
 }
 
 fleet_sync_origin_backed_project_count() {
@@ -604,30 +557,17 @@ secondmate_sync() {
     return 0
   }
 
-  secondmate_sync_remote_one_timed() {  # <id> <home> <remote-host>
-    local id=$1 home=$2 remote_host=$3 __fm_timing_stamp
-    __fm_timing_stamp=$(fm_timing_now_ms)
-    secondmate_sync_remote_one "$id" "$home" "$remote_host"
-    fm_timing_record secondmate convergence "$__fm_timing_stamp" "$id@$remote_host"
-  }
-
   # Remote routes converge through the generic transport. Their code root and
   # inherited files are authoritative on that host; no local path probe or
   # local fast-forward is attempted for them.
-  local remote_host __fm_timing_stamp parallel=0
-  if bootstrap_parallel_begin; then
-    parallel=1
-  fi
+  local remote_host __fm_timing_stamp
   while IFS='|' read -r id _home _window meta; do
     remote_host=$(fm_meta_get "$meta" remote_host)
     [ -n "$remote_host" ] || continue
-    if [ "$parallel" -eq 1 ]; then
-      bootstrap_parallel_spawn secondmate_sync_remote_one_timed "$id" "$_home" "$remote_host"
-    else
-      secondmate_sync_remote_one_timed "$id" "$_home" "$remote_host"
-    fi
+    __fm_timing_stamp=$(fm_timing_now_ms)
+    secondmate_sync_remote_one "$id" "$_home" "$remote_host"
+    fm_timing_record secondmate convergence "$__fm_timing_stamp" "$id@$remote_host"
   done < <(live_secondmate_meta_records "$STATE" "$DATA/secondmates.md")
-  [ "$parallel" -eq 0 ] || bootstrap_parallel_finish
   return 0
 }
 
@@ -654,11 +594,8 @@ secondmate_liveness_sweep() {
   # primary-only no-op there. Mid-session liveness remains explicitly out of
   # scope and requires a separate periodic signal.
   [ -d "$STATE" ] || return 0
-  local meta id remote_host label __fm_timing_stamp parallel=0
+  local meta id remote_host label __fm_timing_stamp
   SECONDMATE_RESPAWNED_IDS=""
-  if bootstrap_parallel_begin; then
-    parallel=1
-  fi
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
     grep -q '^kind=secondmate$' "$meta" 2>/dev/null || continue
@@ -668,27 +605,18 @@ secondmate_liveness_sweep() {
     remote_host=$(fm_meta_get "$meta" remote_host)
     label=$id
     [ -z "$remote_host" ] || label="$id@$remote_host"
-    if [ "$parallel" -eq 1 ]; then
-      bootstrap_parallel_spawn secondmate_liveness_one_timed "$meta" "$id" "$label"
-    else
-      secondmate_liveness_one_timed "$meta" "$id" "$label"
-    fi
+    __fm_timing_stamp=$(fm_timing_now_ms)
+    secondmate_liveness_one "$meta" "$id"
+    fm_timing_record secondmate liveness "$__fm_timing_stamp" "$label"
   done
-  [ "$parallel" -eq 0 ] || bootstrap_parallel_finish
   return 0
-}
-
-secondmate_liveness_one_timed() {  # <meta> <id> <label>
-  local meta=$1 id=$2 label=$3 __fm_timing_stamp
-  __fm_timing_stamp=$(fm_timing_now_ms)
-  secondmate_liveness_one "$meta" "$id"
-  fm_timing_record secondmate liveness "$__fm_timing_stamp" "$label"
 }
 
 # One secondmate's liveness check. Split out of the sweep so each is individually
 # timed; every `return` here was a `continue` in the loop and means exactly the
-# same thing - move on to the next secondmate. Respawned ids are recorded through
-# secondmate_note_respawned so a concurrent sweep can collect them after wait.
+# same thing - move on to the next secondmate. SECONDMATE_RESPAWNED_IDS stays a
+# global that this appends to, so the sweep's hand-off to secondmate_sync is
+# unchanged.
 secondmate_liveness_one() {  # <meta> <id>
   local meta=$1 id=$2
   local window harness backend target agent_state out cause remote_host remote_rc readiness_reason route_out remote_backend
@@ -750,7 +678,7 @@ secondmate_liveness_one() {  # <meta> <id>
       dead|missing)
         cause="remote endpoint $agent_state on its configured host"
         if out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate 2>&1); then
-          secondmate_note_respawned "$id"
+          SECONDMATE_RESPAWNED_IDS="$SECONDMATE_RESPAWNED_IDS $id"
           report_relaunch "$id" "$cause" "host=$remote_host"
         else
           echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed after $cause: $(first_line "$out")"
@@ -787,7 +715,7 @@ secondmate_liveness_one() {  # <meta> <id>
         cause="recorded endpoint confidently missing"
       fi
       if out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate 2>&1); then
-        secondmate_note_respawned "$id"
+        SECONDMATE_RESPAWNED_IDS="$SECONDMATE_RESPAWNED_IDS $id"
         report_relaunch "$id" "$cause" "backend=$backend"
       else
         echo "SECONDMATE_LIVENESS: secondmate $id: respawn failed after $cause: $(first_line "$out")"
@@ -832,7 +760,7 @@ secondmate_handoff_detect() {
 
 install_cmd() {
   case "$1" in
-    tmux|node|git|gh|curl|jq|orca|zellij) echo "brew install $1  # or the platform's package manager" ;;
+    tmux|node|git|gh|curl|jq|orca|zellij|python3) echo "brew install $1  # or the platform's package manager" ;;
     cmux) echo "brew install --cask cmux  # or see https://cmux.com" ;;
     treehouse) echo "curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh" ;;
     no-mistakes) echo "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh" ;;
@@ -872,7 +800,7 @@ if ! BACKEND_TOOLS=$(fm_backend_required_tools "$BACKEND"); then
   BACKEND_TOOLS=""
 fi
 TOOLS="$BACKEND_TOOLS $COMMON_TOOLS"
-NO_MISTAKES_MIN=1.46.0
+NO_MISTAKES_MIN=1.31.2
 # AXI-FAMILY FLOOR POLICY. Every axi-family floor is the CURRENT LATEST published
 # version of that tool, captain-bumped periodically to keep the whole fleet on the
 # newest axi tools. It is NOT the minimum feature-introduced version. These floors
@@ -964,6 +892,52 @@ x_mode_remove_artifact() {
   ! x_mode_artifact_present "$artifact"
 }
 
+# --- shared poll-mode arm/disarm shape ---------------------------------------
+# X mode and Telegram captain-comms arm the same way: a generated watcher poll
+# shim plus a generated cadence config, both idempotent and both removed again
+# on opt-out. These three helpers are the whole of that shared shape, so the
+# two setups cannot drift apart on validation or on cadence wording.
+
+# Exit 0 when any of the named artifacts still exists.
+poll_mode_any_artifact_present() {
+  local artifact
+  for artifact in "$@"; do
+    x_mode_artifact_present "$artifact" && return 0
+  done
+  return 1
+}
+
+# Remove every named artifact through the validating remover (never a bare
+# rm -f: the parent must be a real directory and the target a single link).
+poll_mode_remove_artifacts() {
+  local artifact failed=0
+  for artifact in "$@"; do
+    x_mode_remove_artifact "$artifact" || failed=1
+  done
+  [ "$failed" -eq 0 ]
+}
+
+# The cadence config body. One wording, one interval, both modes.
+poll_mode_cadence_body() {  # <label>
+  cat <<EOF
+# Auto-generated by fm-bootstrap.sh - $1 watcher cadence.
+# Source this before the active harness protocol starts a watcher process so
+# fm-watch.sh polls this home's checks every 30s. An instance without this
+# file keeps the default 300s cadence.
+export FM_CHECK_INTERVAL=30
+EOF
+}
+
+# Resolve FM_HOME to an absolute path: a generated shim runs from the watcher's
+# cwd, not from bootstrap's, so a relative FM_HOME would resolve a different
+# home entirely.
+poll_mode_shim_home() {
+  case "$FM_HOME" in
+    /*) printf '%s' "$FM_HOME" ;;
+    *) (CDPATH='' cd -- "$FM_HOME" 2>/dev/null && pwd -P) || return 1 ;;
+  esac
+}
+
 # X mode (opt-in): when this home's .env carries a non-empty FMX_PAIRING_TOKEN,
 # wire the relay poll into the existing authenticated watcher dispatch.
 # Drops two idempotent, gitignored artifacts:
@@ -988,10 +962,7 @@ x_mode_setup() {
   [ -f "$env_file" ] && token=$(fmx_env_get FMX_PAIRING_TOKEN "$env_file")
 
   x_mode_remove_artifacts() {
-    local failed=0
-    x_mode_remove_artifact "$shim" || failed=1
-    x_mode_remove_artifact "$cadence" || failed=1
-    [ "$failed" -eq 0 ]
+    poll_mode_remove_artifacts "$shim" "$cadence"
   }
 
   x_mode_supervision_repair() {
@@ -1004,7 +975,7 @@ x_mode_setup() {
   if [ -z "$token" ]; then
     # Opt-out (or never opted in): drop any X artifacts; stay silent unless we
     # actually removed something.
-    if x_mode_artifact_present "$shim" || x_mode_artifact_present "$cadence"; then
+    if poll_mode_any_artifact_present "$shim" "$cadence"; then
       if x_mode_remove_artifacts; then
         echo "FMX: X mode off - removed relay poll shim and 30s cadence; default cadence applies on the next supervision cycle; $(x_mode_supervision_repair)"
       else
@@ -1022,7 +993,7 @@ x_mode_setup() {
     fi
   done
   if [ "$missing" -ne 0 ]; then
-    if x_mode_artifact_present "$shim" || x_mode_artifact_present "$cadence"; then
+    if poll_mode_any_artifact_present "$shim" "$cadence"; then
       if x_mode_remove_artifacts; then
         echo "FMX: X mode off - missing relay poll dependencies; install them and rerun bootstrap"
       else
@@ -1042,29 +1013,139 @@ x_mode_setup() {
 
   mkdir -p "$STATE" "$CONFIG" 2>/dev/null || { fmx_arm_failed; return 0; }
 
-  case "$FM_HOME" in
-    /*) shim_home=$FM_HOME ;;
-    *)
-      shim_home=$(CDPATH='' cd -- "$FM_HOME" 2>/dev/null && pwd -P) \
-        || { fmx_arm_failed; return 0; }
-      ;;
-  esac
+  shim_home=$(poll_mode_shim_home) || { fmx_arm_failed; return 0; }
   shim_body=$(fmx_poll_shim_content "$shim_home" "$FM_ROOT")
   x_mode_write_if_changed "$shim" "$shim_body" 700 || { fmx_arm_failed; return 0; }
   fmx_poll_shim_valid "$shim" "$shim_home" "$FM_ROOT" \
     || { fmx_arm_failed; return 0; }
 
-  cadence_body=$(cat <<'EOF'
-# Auto-generated by fm-bootstrap.sh - X mode watcher cadence.
-# Source this before the active harness protocol starts a watcher process so
-# fm-watch.sh polls the X check every 30s. Non-X instances have no such file and
-# keep the default 300s cadence.
-export FM_CHECK_INTERVAL=30
-EOF
-)
+  cadence_body=$(poll_mode_cadence_body "X mode")
   x_mode_write_if_changed "$cadence" "$cadence_body" 600 || { fmx_arm_failed; return 0; }
 
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
+}
+
+# Telegram captain-comms (opt-in): shares x_mode_setup's presence-gated
+# artifact shape (poll_mode_* helpers above), docs/telegram.md. When
+# $HOME/.config/fm-telegram.env (outside this repo, one file per machine - one
+# captain, one bot, regardless of how many firstmate homes exist) carries
+# non-empty TG_TOKEN and TG_CHAT_ID, wires the existing watcher check mechanism
+# to poll Telegram every 30s instead of the default 300s, which used to leave a
+# captain message unfetched for up to five minutes. Drops three idempotent,
+# gitignored artifacts:
+#   state/tg-watch.check.sh   - check shim that execs bin/fm-tg-poll.sh
+#   state/tg-watch.check-trust - the shim's byte binding; without it the watcher
+#                             refuses to run the shim at all and reports it as
+#                             an unauthenticated check on every cycle
+#   config/tg-mode.env        - exports FM_CHECK_INTERVAL=30, sourced by the
+#                             watcher arm so only a Telegram-configured
+#                             instance polls at the 30s cadence
+# On opt-out (missing config, or either value empty) it removes any such
+# artifacts so the instance reverts to the default 300s no-poll behavior.
+# Absent config AND no leftover artifacts is a complete no-op (nothing
+# written, nothing printed). Never writes the token or chat id anywhere.
+telegram_setup() {
+  local env_file token chat_id shim trust cadence shim_body cadence_body tool missing shim_home
+  # The config this keys on is deliberately machine-wide ($HOME/.config, not
+  # FM_HOME-scoped like X mode's own .env), so without this gate a live
+  # secondmate home would ALSO arm its own 30s poller against the same bot
+  # token - and since getUpdates offsets are server-side, whichever home polls
+  # first consumes the update, silently stealing captain messages the primary
+  # never sees. A secondmate is passive here, same as
+  # startup_memory_budget_setup: only the primary owns arming this.
+  if [ -e "$FM_HOME/.fm-secondmate-home" ] || [ -L "$FM_HOME/.fm-secondmate-home" ]; then
+    return 0
+  fi
+  env_file="${FM_TG_ENV_OVERRIDE:-$HOME/.config/fm-telegram.env}"
+  shim="$STATE/tg-watch.check.sh"
+  trust="$STATE/tg-watch.check-trust"
+  cadence="$CONFIG/tg-mode.env"
+
+  token=
+  chat_id=
+  if [ -f "$env_file" ]; then
+    token=$(fmx_env_get TG_TOKEN "$env_file")
+    chat_id=$(fmx_env_get TG_CHAT_ID "$env_file")
+  fi
+
+  telegram_remove_artifacts() {
+    poll_mode_remove_artifacts "$shim" "$trust" "$cadence"
+  }
+
+  if [ -z "$token" ] || [ -z "$chat_id" ]; then
+    if poll_mode_any_artifact_present "$shim" "$trust" "$cadence"; then
+      if telegram_remove_artifacts; then
+        echo "TELEGRAM: off - removed poll shim and 30s cadence; restart the watcher (bin/fm-watch-arm.sh --restart) to drop back to the default cadence"
+      else
+        echo "TELEGRAM: off - failed to remove poll shim or 30s cadence"
+      fi
+    fi
+    return 0
+  fi
+
+  missing=0
+  for tool in curl python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "MISSING: $tool (install: $(install_cmd "$tool"))"
+      missing=1
+    fi
+  done
+  if [ "$missing" -ne 0 ]; then
+    if poll_mode_any_artifact_present "$shim" "$trust" "$cadence"; then
+      if telegram_remove_artifacts; then
+        echo "TELEGRAM: off - missing poll dependencies; install them and rerun bootstrap"
+      else
+        echo "TELEGRAM: off - failed to remove poll shim or 30s cadence after missing poll dependencies"
+      fi
+    fi
+    return 0
+  fi
+
+  telegram_arm_failed() {
+    if telegram_remove_artifacts; then
+      echo "TELEGRAM: off - failed to arm poll shim or 30s cadence"
+    else
+      echo "TELEGRAM: off - failed to arm poll shim or 30s cadence; stale artifacts remain"
+    fi
+  }
+
+  mkdir -p "$STATE" "$CONFIG" 2>/dev/null || { telegram_arm_failed; return 0; }
+
+  shim_home=$(poll_mode_shim_home) || { telegram_arm_failed; return 0; }
+  shim_body=$(cat <<EOF
+#!/usr/bin/env bash
+# Auto-generated by fm-bootstrap.sh - Telegram poll shim.
+# The watcher runs this each check cycle; output becomes a check: wake.
+export FM_HOME=$(printf '%q' "$shim_home")
+exec $(printf '%q' "$FM_ROOT/bin/fm-tg-poll.sh")
+EOF
+)
+  x_mode_write_if_changed "$shim" "$shim_body" 700 || { telegram_arm_failed; return 0; }
+  # The watcher executes a custom state check ONLY against a current byte
+  # binding (bin/fm-check-lib.sh); an unregistered shim is never run and is
+  # reported as an unauthenticated check on every single cycle instead.
+  FM_HOME="$shim_home" FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-check-register.sh" tg-watch >/dev/null 2>&1 \
+    || { telegram_arm_failed; return 0; }
+
+  cadence_body=$(poll_mode_cadence_body "Telegram")
+  x_mode_write_if_changed "$cadence" "$cadence_body" 600 || { telegram_arm_failed; return 0; }
+
+  echo "TELEGRAM: on (chat configured) - poll armed via state/tg-watch.check.sh; 30s watcher cadence in config/tg-mode.env"
+
+  # Inbound is Claude-only (docs/telegram.md "Stop hook registration"): only
+  # .claude/settings.json registers the surface/reply-guard Stop hooks, so on
+  # any other primary a captain message is still recorded and acked by the
+  # watcher poll above, but never actually surfaces to the model or gets a
+  # reply enforced. bin/fm-tg-fetch.py independently refuses to send that ack
+  # at all on a non-Claude harness (the captain's ruling, 2026-08-23: an ack
+  # with nothing behind it is a false promise, worse than none), so this line
+  # exists to say plainly, once per session start, WHY messages will look
+  # unacknowledged rather than leave that silently discovered.
+  case "$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null)" in
+    claude) ;;
+    *) echo "TELEGRAM: inbound is Claude-only on this setup - this primary is not Claude, so a captain message will be recorded but never surfaced or acknowledged; outbound sends still work normally" ;;
+  esac
 }
 
 crew_dispatch_validate() {
@@ -1280,9 +1361,8 @@ detect_local_config() {
 # Each network owner below is bracketed by an elapsed-time record, so a deferred
 # stage that ran long can be attributed to the phase that spent the time.
 # fm-timing-lib.sh discards the record unless the caller asked for timings, and
-# every sweep is still called directly. Per-secondmate remote probes run
-# concurrently; clone refresh overlaps them. Diagnostic lines are replayed in
-# original order so attribution is unchanged.
+# every sweep is still called directly and in the same order, so nothing about
+# what runs, in what sequence, or what it returns changes.
 # The stamp variable is named for the library rather than `start` on purpose:
 # fleet_sync and others assign plain names like `start` without `local`, and
 # bash's dynamic scoping would let them overwrite a stamp held by a caller.
@@ -1296,25 +1376,7 @@ local_phase && detect_local_config
 
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   # secondmate_sync consumes SECONDMATE_RESPAWNED_IDS from the liveness sweep, so
-  # those two always run together in the same phase. Clone refresh does not
-  # depend on them, so it starts in the background and overlaps their wall clock.
-  fleet_sync_pid=
-  fleet_sync_out=
-  if network_phase && network_sweep_authorized 'project clone refresh'; then
-    fleet_sync_out=$(mktemp "${TMPDIR:-/tmp}/fm-bootstrap-fleet.XXXXXX") || fleet_sync_out=
-    if [ -n "$fleet_sync_out" ]; then
-      (
-        __fm_timing_stamp=$(fm_timing_now_ms)
-        fleet_sync
-        fm_timing_record phase fleet-sync "$__fm_timing_stamp"
-      ) >"$fleet_sync_out" 2>&1 &
-      fleet_sync_pid=$!
-    else
-      __fm_timing_stamp=$(fm_timing_now_ms)
-      fleet_sync
-      fm_timing_record phase fleet-sync "$__fm_timing_stamp"
-    fi
-  fi
+  # those two always run together in the same phase.
   if network_phase; then
     if network_sweep_authorized 'dead-secondmate relaunch'; then
       __fm_timing_stamp=$(fm_timing_now_ms)
@@ -1334,10 +1396,12 @@ if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   fi
   # x_mode_setup writes local Relay artifacts only and never leaves the machine.
   local_phase && x_mode_setup
-  if [ -n "$fleet_sync_pid" ]; then
-    wait "$fleet_sync_pid" || true
-    cat "$fleet_sync_out"
-    rm -f "$fleet_sync_out"
+  # telegram_setup likewise writes local Telegram poll artifacts only.
+  local_phase && telegram_setup
+  if network_phase && network_sweep_authorized 'project clone refresh'; then
+    __fm_timing_stamp=$(fm_timing_now_ms)
+    fleet_sync
+    fm_timing_record phase fleet-sync "$__fm_timing_stamp"
   fi
 fi
 local_phase && secondmate_handoff_detect

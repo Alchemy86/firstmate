@@ -144,16 +144,14 @@ PARK_CHILD='
 '
 
 # Run the park as a child of the fake cursor harness that holds the home lock.
-# Clear PI_CODING_AGENT so a Pi host session running this suite cannot make the
-# Cursor park stand down before the fixture under test is exercised.
 run_park() {  # <dir> [loop_count] [loop_ceiling]
   local dir=$1 loop=${2:-0} ceiling=${3:-} payload
   payload=$(printf '{"session_id":"sess-cursor","generation_id":"gen-%s","loop_count":%s,"status":"completed","hook_event_name":"stop","cursor_version":"2026.08.11-e8db854"}' "$loop" "$loop")
   if [ -n "$ceiling" ]; then
-    printf '%s' "$payload" | env -u PI_CODING_AGENT FM_HOME="$dir" FM_CURSOR_PARK_POLL=1 \
+    printf '%s' "$payload" | FM_HOME="$dir" FM_CURSOR_PARK_POLL=1 \
       FM_CURSOR_TURNEND_LOOP_CEILING="$ceiling" "$FAKE_CURSOR" -c "$PARK_CHILD" 2>/dev/null
   else
-    printf '%s' "$payload" | env -u PI_CODING_AGENT FM_HOME="$dir" FM_CURSOR_PARK_POLL=1 \
+    printf '%s' "$payload" | FM_HOME="$dir" FM_CURSOR_PARK_POLL=1 \
       "$FAKE_CURSOR" -c "$PARK_CHILD" 2>/dev/null
   fi
 }
@@ -233,6 +231,47 @@ SH
   out=$(printf '{"source":"startup","session_id":"s"}' | FM_HOME="$dir" bash "$dir/bin/fm-sessionstart-run.sh" 2>&1)
   case "$out" in *'DIGEST BODY'*) ;; *) fail "a Claude-shaped payload must still run the digest, got: $out" ;; esac
   pass "fm-sessionstart-run: inert on a Cursor payload, unchanged otherwise"
+}
+
+# The two Telegram Stop entries are tracked in .claude/settings.json too, and
+# Cursor loads that file. Cursor has no asyncRewake, so an unguarded
+# bin/fm-tg-hook.sh would run its long poll SYNCHRONOUSLY inside Cursor's stop
+# step and hold that turn for its whole FM_TG_HOOK_MAX, and the reply guard
+# would block a turn Cursor's own adapter already owns.
+test_telegram_stop_hooks_stand_down_on_cursor_payload() {
+  local dir out status f
+  dir=$(make_primary_dir "$TMP_ROOT/host-telegram")
+  for f in fm-tg-guard.sh fm-tg-hook.sh fm-tg-hook-lib.sh fm-tg-isfirstmate.sh \
+           fm-tg-send.sh fm-tg-wait.sh fm-tg-drain.py fm-tg-archive.py; do
+    cp "$ROOT/bin/$f" "$dir/bin/$f"
+  done
+  chmod +x "$dir"/bin/*.sh
+  printf 'TG_TOKEN=faketoken\nTG_CHAT_ID=999\n' > "$dir/tg.env"
+  mkdir -p "$dir/state/tg-inbox" "$dir/state/tg-processed"
+  printf '{"update_id": 1, "ts": 1, "text": "captain question", "acked": 1}' \
+    > "$dir/state/tg-inbox/1.json"
+  touch "$dir/state/.tg-last-surfaced"
+
+  # Both hooks WOULD block on this state, so a silent exit 0 can only come from
+  # the host stand-down. Run from the home itself: the identity check condemns
+  # a linked-worktree cwd, and this suite runs from one.
+  out=$(cd "$dir" && printf '%s' "$CURSOR_PAYLOAD" | FM_HOME="$dir" \
+    FM_TG_ENV_OVERRIDE="$dir/tg.env" bash "$dir/bin/fm-tg-guard.sh" 2>&1); status=$?
+  expect_code 0 "$status" "the Telegram reply guard must not block through the Claude-settings duplicate"
+  [ -z "$out" ] || fail "the Telegram reply guard produced output under Cursor: $out"
+
+  out=$(cd "$dir" && printf '%s' "$CURSOR_PAYLOAD" | FM_HOME="$dir" \
+    FM_TG_ENV_OVERRIDE="$dir/tg.env" FM_TG_HOOK_MAX=1 bash "$dir/bin/fm-tg-hook.sh" 2>&1); status=$?
+  expect_code 0 "$status" "the Telegram surface hook must not block through the Claude-settings duplicate"
+  [ -z "$out" ] || fail "the Telegram surface hook produced output under Cursor: $out"
+  grep -q surfaced "$dir/state/tg-inbox/1.json" \
+    && fail "the Telegram surface hook drained the captain's inbox under Cursor"
+
+  out=$(cd "$dir" && printf '%s' "$CLAUDE_STOP_PAYLOAD" | FM_HOME="$dir" \
+    FM_TG_ENV_OVERRIDE="$dir/tg.env" bash "$dir/bin/fm-tg-guard.sh" 2>&1); status=$?
+  expect_code 2 "$status" "the host guard must not disturb a genuine Claude Stop payload"
+  case "$out" in *'UNANSWERED CAPTAIN MESSAGE'*) ;; *) fail "expected the unanswered-reply banner, got: $out" ;; esac
+  pass "telegram Stop hooks: inert on a Cursor-delivered payload, unchanged under Claude"
 }
 
 test_pretool_guards_deduplicate_and_render_cursor_deny() {
@@ -471,46 +510,6 @@ test_park_inert_when_afk() {
   pass "cursor park: inert while away mode is active"
 }
 
-test_park_inert_under_pi_coding_agent() {
-  local dir out payload
-  dir=$(make_primary_dir "$TMP_ROOT/park-pi-host")
-  : > "$dir/state/task1.meta"
-  write_arm_fixture "$dir" actionable
-  payload=$(printf '{"session_id":"sess-cursor","generation_id":"gen-0","loop_count":0,"status":"completed","hook_event_name":"stop","cursor_version":"2026.08.11-e8db854"}')
-  # No Cursor identity markers: Pi host alone must stand the park down.
-  out=$(printf '%s' "$payload" | env -u CURSOR_AGENT -u CURSOR_INVOKED_AS \
-    FM_HOME="$dir" PI_CODING_AGENT=true FM_CURSOR_PARK_POLL=1 \
-    "$FAKE_CURSOR" -c "$PARK_CHILD" 2>/dev/null)
-  [ -z "$out" ] || fail "Pi-hosted Cursor SDK must not park or wake: $out"
-  [ ! -e "$dir/state/arm-ran" ] || fail "the park armed under PI_CODING_AGENT=true"
-  pass "cursor park: inert when PI_CODING_AGENT marks a Pi host session"
-}
-
-test_park_still_parks_with_pi_leak_and_cursor_identity() {
-  local dir out body payload
-  dir=$(make_primary_dir "$TMP_ROOT/park-pi-leak-cursor")
-  : > "$dir/state/task1.meta"
-  write_arm_fixture "$dir" actionable
-  payload=$(printf '{"session_id":"sess-cursor","generation_id":"gen-0","loop_count":0,"status":"completed","hook_event_name":"stop","cursor_version":"2026.08.11-e8db854"}')
-  # Hand-started cursor-agent may inherit PI_CODING_AGENT; Cursor identity wins.
-  out=$(printf '%s' "$payload" | env -u CURSOR_INVOKED_AS \
-    FM_HOME="$dir" PI_CODING_AGENT=true CURSOR_AGENT=1 FM_CURSOR_PARK_POLL=1 \
-    "$FAKE_CURSOR" -c "$PARK_CHILD" 2>/dev/null)
-  [ -e "$dir/state/arm-ran" ] || fail "CURSOR_AGENT must still park despite PI_CODING_AGENT leak"
-  [ "$(kind_of_followup "$out")" = watcher ] \
-    || fail "CURSOR_AGENT park must deliver the wake despite PI leak: $out"
-  body=$(followup_of "$out")
-  case "$body" in *'stale: fixture-win needs a look'*) ;; *) fail "CURSOR_AGENT wake reason missing: $body" ;; esac
-  rm -f "$dir/state/arm-ran"
-  out=$(printf '%s' "$payload" | env -u CURSOR_AGENT \
-    FM_HOME="$dir" PI_CODING_AGENT=true CURSOR_INVOKED_AS=cursor-agent FM_CURSOR_PARK_POLL=1 \
-    "$FAKE_CURSOR" -c "$PARK_CHILD" 2>/dev/null)
-  [ -e "$dir/state/arm-ran" ] || fail "CURSOR_INVOKED_AS must still park despite PI_CODING_AGENT leak"
-  [ "$(kind_of_followup "$out")" = watcher ] \
-    || fail "CURSOR_INVOKED_AS park must deliver the wake despite PI leak: $out"
-  pass "cursor park: parks when PI_CODING_AGENT leaks alongside Cursor identity"
-}
-
 test_park_stands_down_when_away_mode_activates_before_commit() {
   local dir park_pid out waited budget_count
   dir=$(make_primary_dir "$TMP_ROOT/park-afk-transition")
@@ -549,7 +548,7 @@ test_park_inert_without_session_lock() {
   dir=$(make_primary_dir "$TMP_ROOT/park-nolock")
   : > "$dir/state/task1.meta"
   write_arm_fixture "$dir" actionable
-  out=$(printf '%s' "$CURSOR_PAYLOAD" | env -u PI_CODING_AGENT FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard-cursor.sh" 2>/dev/null)
+  out=$(printf '%s' "$CURSOR_PAYLOAD" | FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard-cursor.sh" 2>/dev/null)
   [ -z "$out" ] || fail "a session that does not hold the home lock must not arm or wake: $out"
   [ ! -e "$dir/state/arm-ran" ] || fail "the park armed without owning the session lock"
   pass "cursor park: inert when this session does not hold the home lock"
@@ -598,9 +597,9 @@ test_park_ignores_malformed_payload() {
   dir=$(make_primary_dir "$TMP_ROOT/park-malformed")
   : > "$dir/state/task1.meta"
   write_arm_fixture "$dir" actionable
-  out=$(printf 'not json at all' | env -u PI_CODING_AGENT FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard-cursor.sh" 2>/dev/null)
+  out=$(printf 'not json at all' | FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard-cursor.sh" 2>/dev/null)
   [ -z "$out" ] || fail "a malformed payload must fail open, got: $out"
-  out=$(printf '{"loop_count":"three","cursor_version":"x"}' | env -u PI_CODING_AGENT FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard-cursor.sh" 2>/dev/null)
+  out=$(printf '{"loop_count":"three","cursor_version":"x"}' | FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard-cursor.sh" 2>/dev/null)
   [ -z "$out" ] || fail "a non-numeric loop_count must fail open, got: $out"
   pass "cursor park: malformed payloads fail open without arming"
 }
@@ -684,6 +683,7 @@ test_autoarm_stands_down_on_cursor_payload
 test_sessionstart_run_stands_down_on_cursor_payload
 test_pretool_guards_deduplicate_and_render_cursor_deny
 test_cd_guard_renders_cursor_deny
+test_telegram_stop_hooks_stand_down_on_cursor_payload
 test_park_silent_when_nothing_in_flight
 test_park_delivers_actionable_wake_as_followup
 test_park_never_exits_two
@@ -695,8 +695,6 @@ test_park_stands_down_when_superseded
 test_park_serializes_supersession_with_followup_commit
 test_superseded_park_does_not_consume_nag_budget
 test_park_inert_when_afk
-test_park_inert_under_pi_coding_agent
-test_park_still_parks_with_pi_leak_and_cursor_identity
 test_park_stands_down_when_away_mode_activates_before_commit
 test_park_inert_without_session_lock
 test_park_stands_down_after_session_takeover

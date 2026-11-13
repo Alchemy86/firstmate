@@ -95,19 +95,6 @@ REC=$(fm_busy_record_path "$STATE" "$ID")
 GEN_FILE=$(fm_busy_gen_path "$STATE" "$ID")
 LOCK="$REC.lock"
 
-# Portable mtime in epoch seconds. macOS (BSD) stat uses `-f <fmt>`; Linux (GNU)
-# stat uses `-c <fmt>`. Do NOT collapse this into `stat -f <fmt> ... || stat -c
-# <fmt> ...`: on GNU `-f` is *filesystem* stat, so it reads the format string as
-# a path, reports that on stderr, prints a partial filesystem dump ("  File:
-# ...") on stdout, and still exits 0 - the fallback never runs and the caller
-# gets a non-numeric token. Detect the platform once and pick the right form,
-# exactly as bin/fm-watch.sh does.
-if [ "$(uname)" = Darwin ]; then
-  lock_mtime() { stat -f %m "$1" 2>/dev/null; }
-else
-  lock_mtime() { stat -c %Y "$1" 2>/dev/null; }
-fi
-
 # Serialize writers. The lock protects seq advancement and the sidecar/record
 # pair; a holder that died mid-write is broken after FM_BUSY_LOCK_STALE_SECS.
 lock_acquire() {
@@ -116,11 +103,7 @@ lock_acquire() {
     tries=$((tries + 1))
     if [ "$tries" -ge 40 ]; then
       now=$(date +%s)
-      mtime=$(lock_mtime "$LOCK" || true)
-      # Anything unreadable or non-numeric reads as "just created", so an
-      # unforeseen stat surprise degrades to a lock-timeout refusal instead of
-      # aborting the writer - and its caller, fm-teardown.sh - under `set -u`.
-      case "$mtime" in ''|*[!0-9]*) mtime=$now ;; esac
+      mtime=$(stat -f %m "$LOCK" 2>/dev/null || stat -c %Y "$LOCK" 2>/dev/null || echo "$now")
       age=$((now - mtime))
       if [ "$age" -ge "${FM_BUSY_LOCK_STALE_SECS:-5}" ]; then
         rmdir "$LOCK" 2>/dev/null || rm -rf "$LOCK" 2>/dev/null || true

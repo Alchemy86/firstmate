@@ -103,7 +103,13 @@ async function isPrimaryRoot(root, home) {
 
 function shouldArm(paths) {
   if (existsSync(`${paths.state}/.afk`)) return false;
+  // Telegram captain-comms needs the watcher armed on an idle home for the
+  // same reason X mode does (AGENTS.md section 8): with no fleet work, this
+  // is the only signal that forces an arm at all, so a Telegram-configured
+  // idle OpenCode primary without this line never armed, and the cadence fix
+  // above sourcing config/tg-mode.env was unreachable in that case.
   if (existsSync(`${paths.config}/x-mode.env`)) return true;
+  if (existsSync(`${paths.config}/tg-mode.env`)) return true;
   try {
     return readdirSync(paths.state).some((name) => name.endsWith(".meta"));
   } catch {
@@ -342,7 +348,13 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
     FM_CONFIG_OVERRIDE: paths.config,
     FM_WATCH_PREDECESSOR_ARM_PID: predecessorArmPid,
   };
-  const armChild = spawn("bash", ["-lc", 'config_dir="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"; [ -f "$config_dir/x-mode.env" ] && . "$config_dir/x-mode.env"; exec "$FM_ROOT_OVERRIDE/bin/fm-watch-arm.sh" --restart'], {
+  // Source whichever generated cadence config this home has (both export the
+  // same FM_CHECK_INTERVAL, so sourcing both in either order is harmless) -
+  // same contract as bin/fm-claude-stop-autoarm.sh and
+  // bin/fm-turnend-guard-cursor.sh. Missing the tg-mode.env half here left a
+  // Telegram-configured OpenCode primary polling at the 300s default instead
+  // of tg-mode.env's 30s, the exact delay that file exists to remove.
+  const armChild = spawn("bash", ["-lc", 'config_dir="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"; [ -f "$config_dir/x-mode.env" ] && . "$config_dir/x-mode.env"; [ -f "$config_dir/tg-mode.env" ] && . "$config_dir/tg-mode.env"; exec "$FM_ROOT_OVERRIDE/bin/fm-watch-arm.sh" --restart'], {
     cwd: paths.root,
     env,
     stdio: ["ignore", "pipe", "pipe"],

@@ -49,14 +49,19 @@
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
 # "blocked:": pause for a known external wait expected to clear on its own,
 # blocked when firstmate must act.
-# Every scaffold also carries the steering-inbox receive-and-ack section:
-# process state/<id>.inbox/*.msg in order and acknowledge each by moving it to
-# handled/ (record, doorbell, and ladder owned by bin/fm-task-inbox-lib.sh).
 # Ship tasks include a project-memory section so durable project-intrinsic
 # learnings can be committed to AGENTS.md through the project's delivery path;
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
 # over copied detail) and has the crewmate add the fm-ensure-agents-md.sh
 # self-governance section when a touched project AGENTS.md lacks it.
+# Ship and scout briefs also carry a fixed "# Standing rules" block, so the
+# rules firstmate has been retyping from memory into every {TASK} body (and
+# sometimes missing) are guaranteed present instead: existing tooling first,
+# never bend a test or baseline, measure rather than quote a doc, report
+# faithfully, no AI attribution, and the shared-stash ban; ship briefs get one
+# further rule about branching from a freshly fetched remote. A secondmate
+# charter does not touch a project worktree itself, so it carries none of this -
+# its own crewmates get it from their own generated briefs.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -180,20 +185,6 @@ shell_quote() {
 }
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
-INBOX_DIR=$(shell_quote "$STATE/$ID.inbox")
-
-# The receive-and-ack half of the steering-inbox contract, included in every
-# scaffold kind. The record format, doorbell line, and re-ring ladder are
-# owned by bin/fm-task-inbox-lib.sh; the doorbell itself is self-describing,
-# so this section is reinforcement for the natural-checkpoint habit, not the
-# only carrier of the instruction.
-IFS= read -r -d '' INBOX_SECTION <<EOF || true
-# Firstmate instruction inbox
-Firstmate steers you through durable message files in $INBOX_DIR.
-When a terminal message says an instruction is waiting there - and at any natural checkpoint when you are unsure - list $INBOX_DIR/*.msg, read and act on each message in numeric order, then acknowledge each handled message by moving it: \`mv $INBOX_DIR/NNN.msg $INBOX_DIR/handled/\`.
-The move IS the acknowledgement: without it firstmate rings again and eventually treats you as stuck. An empty or absent inbox needs no action.
-EOF
-INBOX_SECTION=${INBOX_SECTION%$'\n'}
 
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
@@ -248,9 +239,6 @@ For a terse result, a status line is the whole answer.
 For a detailed answer (an investigation, a plan, an audit), write it to a doc under your home's \`data/\` and append a status line that points to that doc - the scout-report pattern - so the main firstmate is woken and can read it.
 Before treating an investigation or visual review as complete, load \`captain-hold-lifecycle\` from this home's \`.agents/skills/\` and pass its shared completion gate.
 A message with NO marker is the captain typing directly into your pane: treat it as authoritative captain intervention and stay conversational exactly as you would for any captain message; do not force it onto the status path.
-A request arriving through the instruction inbox below follows the same marker and reply rules.
-
-$INBOX_SECTION
 
 # Escalation to main firstmate
 Handle routine work yourself.
@@ -258,8 +246,7 @@ Report only true captain-relevant outcomes or a declared external wait by append
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
 States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
 Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) only when your domain is deliberately idling on a known external wait you expect to clear on its own; use \`blocked:\` when you are stuck and need firstmate to act.
-Use this only for material phase changes, a captain decision, a real blocker, a failure, work ready for review, or work you landed.
-Work you landed includes a merge you performed yourself under standing merge authority and one the captain merged on the forge: under that authority nothing is ever \"ready for review\", so a landed merge that goes unreported reaches the captain as silence.
+Use this only for material phase changes, a captain decision, a real blocker, a failure, or work ready for review.
 This is also how you return the answer to a marked from-firstmate request above.
 A marked request requires one correlated answer after the work; it does not require a separate receipt or start acknowledgement.
 Never append \`working:\` merely to acknowledge receipt or announce that a marked request has started.
@@ -312,11 +299,32 @@ HERDR_SECTION=$(printf '%s\n' \
 else
 IFS= read -r -d '' HERDR_SECTION <<'EOF' || true
 # Herdr lifecycle declaration - NOT ENABLED
-**HARD SAFETY GATE:** this scaffold cannot inspect the task text filled in above.
+**HARD SAFETY GATE:** this scaffold cannot inspect the task text that replaces `{TASK}` later.
 If the task will start, stop, delete, restart, profile, or otherwise drive Herdr lifecycle behavior, stop and regenerate the brief with `--herdr-lab` before dispatch.
 Do not add Herdr lifecycle commands to this unguarded brief by hand.
 EOF
 HERDR_SECTION=${HERDR_SECTION%$'\n'}
+fi
+
+# Standing rules: engineering practice that is always true, never situational,
+# and repeated in hand-written brief after hand-written brief until it earned a
+# fixed place in the scaffold instead of depending on being retyped correctly
+# every time. Keep this list tight - a wall of boilerplate gets skimmed and
+# defeats its own purpose.
+# shellcheck disable=SC2016  # single quotes are deliberate: these lines are literal brief text whose backtick-wrapped code spans must reach the reading agent verbatim, not expand at scaffold time.
+STANDING_RULES=$(printf '%s\n' \
+  '# Standing rules' \
+  'These hold on every task here, no exception:' \
+  '- **Use the existing tooling.** Check the project'\''s CLI `--help`, its `Makefile`, its `tools/` directory, and its docs before building anything. These repos are mature and tooled; building a worse duplicate of something that already exists is the single most common failure here. If you cannot find a tool for the job, say so explicitly before building one.' \
+  '- **Prefer the system rule to the maintained list.** Before you accept a fix, ask whether it needs editing again the next time the world grows. An allowlist of maps, a per-area threshold, a per-species rule, a per-link special case all fail that test. A rule derived from the system'\''s own mechanics passes - a battle menu implies a battle started, a level-up prompt implies four full move slots. If your fix begins by enumerating where something is allowed, it is the wrong fix.' \
+  '- Never weaken, disable, special-case, or re-bless a test or a baseline to make a number look better.' \
+  '- Measure, do not quote a doc figure - a number in a document is a hypothesis; verify it and cite what you ran.' \
+  '- Report faithfully: an honest negative is worth more than a fake win, and a gap you name is worth more than one you paper over.' \
+  '- No AI attribution anywhere you write - no `Co-Authored-By`, no "Generated with", no robot emoji, in any commit, PR, or doc.' \
+  '- `git stash` is banned - this worktree pool is shared and a stash can eat another task'\''s work. Use a WIP commit instead.')
+if [ "$KIND" = ship ]; then
+STANDING_RULES=$(printf '%s\n%s\n' "$STANDING_RULES" \
+  '- Branch from the freshly fetched remote default branch, not a stale pooled-clone ref, and say how far behind you started - a stale base can revert everything merged since it was cut.')
 fi
 
 if [ "$KIND" = scout ]; then
@@ -357,7 +365,7 @@ The report is the only thing that survives, so anything worth keeping must be in
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
 
-$INBOX_SECTION
+$STANDING_RULES
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -476,7 +484,7 @@ $RULE1
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
 
-$INBOX_SECTION
+$STANDING_RULES
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.

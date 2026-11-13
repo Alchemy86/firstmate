@@ -138,15 +138,6 @@
 #   origin, resolves the current remote default branch, and resets to its tip.
 #   An unreachable origin, unresolved default branch, or non-clean worktree
 #   refuses the spawn rather than risking a PR based on stale history.
-#   A slot whose only deviation is a stale submodule gitlink is refused by that
-#   same clean check, but is reported as a stale checkout naming each submodule
-#   and both pins; nothing is converged or removed, and no remedy is suggested.
-#   That report is only reached when each submodule's checked-out commit is
-#   already contained in one of its remotes, so a submodule carrying an unpushed
-#   commit keeps the conservative uncommitted-work refusal instead. That
-#   containment test reads local refs only and never fetches, so this gate stays
-#   usable offline; a stale remote-tracking ref can therefore make an unpushed
-#   commit look contained, which is exactly why no remedy command is printed.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -275,6 +266,41 @@ fm_refuse_if_gate_agent
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
+
+# ── memory guard ─────────────────────────────────────────────────────────────
+# Crews are multi-gigabyte processes. On 2026-08-14 eleven of them ran at once
+# on a 30 GiB box: individual crew windows peaked at 9.4/5.3/4.8/4.6/4.5/3.2 GiB,
+# one process was OOM-killed holding 8.7 GiB, and the machine hard-locked with no
+# OOM record at all (the kernel had no memory left to write one). Scale crew
+# count against RAM, never against ambition.
+#
+# FM_MAX_CREWS      hard cap on concurrent crews (default 8)
+# FM_MIN_FREE_MB    refuse to spawn below this much available memory (default 6000)
+# FM_SPAWN_FORCE=1  override both, deliberately
+fm_memory_guard() {
+  [ -z "${FM_SPAWN_FORCE:-}" ] || return 0
+  local cap="${FM_MAX_CREWS:-8}" minfree="${FM_MIN_FREE_MB:-6000}" live avail
+  live=$(ls "$STATE"/*.meta 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${live:-0}" -ge "$cap" ]; then
+    printf 'refusing to spawn: %s crews already live (cap %s).
+' "$live" "$cap" >&2
+    printf '  Crews are multi-GB each; exceeding this has hard-locked the machine.
+' >&2
+    printf '  Let some finish, raise FM_MAX_CREWS deliberately, or set FM_SPAWN_FORCE=1.
+' >&2
+    return 1
+  fi
+  avail=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 99999)
+  if [ "${avail:-99999}" -lt "$minfree" ]; then
+    printf 'refusing to spawn: only %s MiB available (need %s).
+' "$avail" "$minfree" >&2
+    printf '  Wait for memory to free, or set FM_SPAWN_FORCE=1 deliberately.
+' >&2
+    return 1
+  fi
+  return 0
+}
+fm_memory_guard || exit 1
 KIND=ship
 KIND_SET=0
 HARNESS_ARG=
@@ -896,26 +922,11 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
 fi
 ID=${POS[0]}
 fm_task_id_creation_valid "$ID" || { echo "error: invalid task id" >&2; exit 2; }
-# Role partition: spawning NEW work is MAIN-owned. A relaunch of an existing
-# task is legitimate branch recovery (fm-control drives it through this same
-# entrypoint), so only a fresh spawn refuses the branch actor (contract:
-# bin/fm-lease-lib.sh; no-op in homes without a branch actor).
-# shellcheck source=bin/fm-lease-lib.sh
-. "$SCRIPT_DIR/fm-lease-lib.sh"
-if [ "$RELAUNCH" -ne 1 ]; then
-  fm_lease_forbid_branch "new-task spawn (fm-spawn)"
-fi
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_CONTROL_LOCK="$STATE/.control-$ID.lock"
   control_owner=$(cat "$SPAWN_CONTROL_LOCK/pid" 2>/dev/null || true)
   if [ "$control_owner" = "$PPID" ] && fm_pid_alive "$control_owner"; then
     SPAWN_CONTROL_PARENT=1
-  elif [ "$(fm_lease_actor)" = branch ]; then
-    # Role partition refinement: branch recovery relaunches only through the
-    # fm-control transaction that owns the control lock, never by invoking
-    # this entrypoint directly (contract: bin/fm-lease-lib.sh).
-    echo "error: relaunch (fm-spawn) refused - the supervision branch must relaunch through fm-control" >&2
-    exit "$FM_LEASE_REFUSE_EXIT"
   elif fm_lock_try_acquire "$SPAWN_CONTROL_LOCK"; then
     SPAWN_CONTROL_LOCK_HELD=1
   else
@@ -1751,47 +1762,6 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
-# A pooled slot whose only deviation is a submodule gitlink is stale, not dirty:
-# an earlier refresh moved the superproject and left the submodule checkout on
-# the pin the previous base recorded. The refusal still stands and this gate
-# never touches the slot; it only names the cause, because "is not clean" while
-# the operator's own `git status` reads clean gives neither a cause nor a remedy.
-# A pin is only reported as stale when the commit the slot holds is already
-# contained in one of the submodule's remotes. Anything that cannot be proven
-# contained - an unpushed commit, a submodule with no remote, a git error - falls
-# through to the conservative uncommitted-work refusal, as does any entry that is
-# not exactly a clean submodule sitting on a different pin. The diagnosis is
-# buffered and only emitted once every entry qualifies, so it can never
-# contradict the verdict.
-#
-# No remedy command is printed, deliberately. That containment check reads local
-# refs only and never fetches, because this gate has to stay usable offline. A
-# remote-tracking ref that has gone stale - its upstream branch deleted or
-# force-pushed, and never pruned - therefore still reads as containment, so a
-# commit that is really unpushed can look contained. Naming the submodule and both
-# pins is what the operator actually needs; printing a checkout command on a
-# judgement that can be fooled could cost them that commit, so the remedy is left
-# to the operator, who can see the whole picture.
-describe_stale_submodule_pins() {  # <worktree> <status>
-  local worktree=$1 status=$2 line path want have unpushed lines=
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case $line in ' M '*) path=${line#' M '} ;; *) return 1 ;; esac
-    [ "$(git -C "$worktree" ls-files --stage -- "$path" 2>/dev/null | cut -c1-6)" = 160000 ] || return 1
-    [ -z "$(git -C "$worktree/$path" status --porcelain 2>/dev/null)" ] || return 1
-    want=$(git -C "$worktree" rev-parse --verify --quiet "HEAD:$path" 2>/dev/null) || return 1
-    have=$(git -C "$worktree/$path" rev-parse --verify --quiet HEAD 2>/dev/null) || return 1
-    [ "$want" != "$have" ] || return 1
-    unpushed=$(git -C "$worktree/$path" log --format=%H --max-count=1 "$have" --not --remotes -- 2>/dev/null) || return 1
-    [ -z "$unpushed" ] || return 1
-    lines+="error: submodule '$path' is checked out at $have, but this base records $want"$'\n'
-  done <<EOF
-$status
-EOF
-  [ -n "$lines" ] || return 1
-  printf '%s' "$lines" >&2
-}
-
 freshen_spawn_worktree_base() {  # <worktree>
   local worktree=$1 default target expected actual status
   if ! git -C "$worktree" fetch --quiet origin; then
@@ -1815,16 +1785,12 @@ freshen_spawn_worktree_base() {  # <worktree>
     echo "error: '$target' is not a commit for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
     return 1
   }
-  status=$(git -C "$worktree" -c core.quotePath=false status --porcelain) || {
+  status=$(git -C "$worktree" status --porcelain) || {
     echo "error: could not inspect pooled worktree '$worktree' before refreshing its base" >&2
     return 1
   }
   if [ -n "$status" ]; then
-    if describe_stale_submodule_pins "$worktree" "$status"; then
-      echo "error: pooled worktree '$worktree' has a stale submodule checkout, not uncommitted work; refusing to launch and leaving it untouched" >&2
-    else
-      echo "error: pooled worktree '$worktree' is not clean; refusing to discard uncommitted work while refreshing its base" >&2
-    fi
+    echo "error: pooled worktree '$worktree' is not clean; refusing to discard uncommitted work while refreshing its base" >&2
     return 1
   fi
   if ! git -C "$worktree" reset --hard "$target" >/dev/null; then

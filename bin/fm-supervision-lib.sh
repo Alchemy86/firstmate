@@ -3,8 +3,10 @@
 # Usage: . bin/fm-supervision-lib.sh
 #
 # Reports whether a firstmate home needs supervision because it has in-flight
-# work (a state/<id>.meta exists) or an X-mode relay poll
-# (state/x-watch.check.sh), and whether its watcher has a fresh liveness beacon
+# work (a state/<id>.meta exists), an X-mode relay poll (state/x-watch.check.sh),
+# or a Telegram captain-comms poll (state/tg-watch.check.sh, docs/telegram.md -
+# the two are armed the same way and need the watcher live on an idle home for
+# the identical reason), and whether its watcher has a fresh liveness beacon
 # (state/.last-watcher-beat, touched every poll cycle, within the grace window).
 # bin/fm-turnend-guard.sh uses the PID-strict fm_watcher_healthy from
 # bin/fm-wake-lib.sh for its block decision. bin/fm-guard.sh uses the model-aware
@@ -25,9 +27,10 @@ fm_sup_stat_mtime() {
 # Populates, for the state dir at $1:
 #   FM_SUP_IN_FLIGHT      count of state/*.meta (in-flight tasks)
 #   FM_SUP_SOURCES        count of registered process-to-event sources
-#   FM_SUP_NEEDED         true/false - in-flight work, an X-mode relay poll, or a
-#                         registered event source (a source is a wait on an
-#                         external process, not a task, so it has no metadata)
+#   FM_SUP_NEEDED         true/false - in-flight work, an X-mode relay poll, a
+#                         Telegram captain-comms poll, or a registered event
+#                         source (a source is a wait on an external process,
+#                         not a task, so it has no metadata)
 #   FM_SUP_WATCHER_FRESH  true/false - a watcher beacon within the grace window
 #   FM_SUP_BEACON_DESC    human-readable beacon age, for banners ("never" if absent)
 #   FM_SUP_QUEUE_PENDING  true/false - state/.wake-queue has unread records
@@ -52,6 +55,7 @@ fm_supervision_status() {
   done
   if [ "$FM_SUP_IN_FLIGHT" -gt 0 ] \
     || [ -f "$state/x-watch.check.sh" ] \
+    || [ -f "$state/tg-watch.check.sh" ] \
     || [ "$FM_SUP_SOURCES" -gt 0 ]; then
     FM_SUP_NEEDED=true
   fi
@@ -79,6 +83,32 @@ fm_supervision_status() {
 fm_supervision_needed() {
   fm_supervision_status "$@"
   [ "$FM_SUP_NEEDED" = true ]
+}
+
+# fm_supervision_poll_need_desc <state-dir>
+# Echoes a human-readable name for whichever poll shim(s) at <state-dir> are
+# the reason FM_SUP_NEEDED can be true with zero in-flight tasks and zero
+# process-event sources - the only case a caller ever needs this for. X mode
+# and Telegram captain-comms are both armed by writing state/x-watch.check.sh
+# and state/tg-watch.check.sh respectively (bin/fm-bootstrap.sh), and a home
+# can have either, both, or (if this is ever called when neither poll shim
+# nor any other need exists) neither, so this is the one owner of naming
+# whichever is actually present - bin/fm-guard.sh and bin/fm-turnend-guard.sh
+# each hand-rolled this same check three times between them before (a
+# no-mistakes review finding, 2026-08-23), which is exactly the drift risk a
+# shared predicate exists to avoid.
+fm_supervision_poll_need_desc() {
+  local state=$1 desc=
+  [ -f "$state/x-watch.check.sh" ] && desc="X-mode relay polling"
+  if [ -f "$state/tg-watch.check.sh" ]; then
+    if [ -n "$desc" ]; then
+      desc="$desc and Telegram captain-comms polling"
+    else
+      desc="Telegram captain-comms polling"
+    fi
+  fi
+  [ -n "$desc" ] || desc="a poll shim"
+  printf '%s\n' "$desc"
 }
 
 # fm_supervision_unhealthy <state-dir> [grace-seconds]

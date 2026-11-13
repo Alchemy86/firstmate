@@ -39,6 +39,17 @@ export FM_BACKEND_CMUX_BUNDLE_BIN="$TMP_ROOT/no-bundled-cmux"
 unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
   CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_SOCKET_PATH CMUX_TAB_ID CMUX_PANEL_ID 2>/dev/null || true
 
+# Telegram captain-comms config lives at a fixed $HOME path, deliberately
+# outside any FM_HOME (docs/telegram.md - one captain, one bot per machine).
+# That means, unlike X mode's FM_HOME-scoped .env, it is NOT naturally
+# isolated by this suite's per-case FM_HOME scratch dirs: on a machine that
+# has real Telegram captain-comms configured (such as the one this repo's own
+# fleet runs on), every bootstrap call below would otherwise pick up the real
+# ~/.config/fm-telegram.env and leak an unexpected TELEGRAM: line into cases
+# that are pinning unrelated tool-detection output. Point it at a path that
+# never exists so this suite stays hermetic regardless of the host machine.
+export FM_TG_ENV_OVERRIDE="$TMP_ROOT/no-telegram-config-in-this-suite.env"
+
 # A fake toolchain where every required tool is present and gh is authenticated.
 # treehouse's `get --help` advertises --lease only when FM_FAKE_TREEHOUSE_LEASE_HELP=1.
 make_fake_toolchain() {
@@ -79,7 +90,7 @@ SH
   cat > "$fakebin/no-mistakes" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = --version ]; then
-  printf '%s\n' "${FM_FAKE_NO_MISTAKES_VERSION:-no-mistakes version v1.46.0 (fake) 2026-06-27T00:02:18Z}"
+  printf '%s\n' "${FM_FAKE_NO_MISTAKES_VERSION:-no-mistakes version v1.31.2 (fake) 2026-06-27T00:02:18Z}"
   exit 0
 fi
 exit 0
@@ -332,10 +343,10 @@ test_no_mistakes_min_version() {
         [ "$out" = "$missing" ] || fail "$label: expected '$missing', got: $out" ;;
     esac
   done <<'ROWS'
-minimum no-mistakes version is accepted^no-mistakes version v1.46.0 (fake)^empty
-newer no-mistakes minor is accepted^no-mistakes version v1.47.0 (fake)^empty
+minimum no-mistakes version is accepted^no-mistakes version v1.31.2 (fake)^empty
+newer no-mistakes minor is accepted^no-mistakes version v1.32.0 (fake)^empty
 newer no-mistakes major is accepted^no-mistakes version v2.0.0 (fake)^empty
-older no-mistakes patch reports an upgrade^no-mistakes version v1.45.4 (fake)^missing
+older no-mistakes patch reports an upgrade^no-mistakes version v1.31.1 (fake)^missing
 unparseable no-mistakes version reports an upgrade^no-mistakes development build^missing
 ROWS
   pass "bootstrap enforces no-mistakes minimum version"

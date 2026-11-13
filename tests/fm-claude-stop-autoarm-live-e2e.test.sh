@@ -26,6 +26,15 @@ fail() {
 
 command -v claude >/dev/null 2>&1 || fail "claude not found"
 
+# Telegram captain-comms config lives at a fixed $HOME path outside any
+# FM_HOME (docs/telegram.md), so the FM_HOME isolation below does not shield
+# this suite from a real ~/.config/fm-telegram.env: fm-session-start.sh calls
+# fm-bootstrap.sh's telegram_setup(), which would otherwise pick up the host
+# machine's real config and leak a TELEGRAM: line and a live cadence-relevant
+# side effect into this credentialed live run. Point it at a path that never
+# exists, the same fix applied to the hermetic suites via tests/lib.sh.
+export FM_TG_ENV_OVERRIDE="${TMPDIR:-/tmp}/fm-test-no-telegram-config.$$.env"
+
 LAB="$ROOT/.claude-autoarm-live-e2e.$$"
 PROJECT="$LAB/project"
 HOME_DIR="$LAB/fmhome"

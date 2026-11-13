@@ -25,6 +25,7 @@
   ],
   "readmeSetupTargets": [
     "docs/configuration.md",
+    "docs/telegram.md",
     "docs/wedge-alarm.md",
     "docs/tmux-backend.md",
     "docs/herdr-backend.md",
@@ -237,6 +238,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/captain-hold-lifecycle.md",
+      "audience": "maintainer-architecture"
+    },
+    {
       "path": "docs/cd-guard.md",
       "audience": "maintainer-architecture"
     },
@@ -251,10 +256,6 @@
     {
       "path": "docs/configuration.md",
       "audience": "operator-current"
-    },
-    {
-      "path": "docs/captain-hold-lifecycle.md",
-      "audience": "maintainer-architecture"
     },
     {
       "path": "docs/documentation-audiences.md",
@@ -289,12 +290,12 @@
       "audience": "operator-current"
     },
     {
-      "path": "docs/orca-backend.md",
+      "path": "docs/host-memory.md",
       "audience": "operator-current"
     },
     {
-      "path": "docs/pi-supervision-branch.md",
-      "audience": "maintainer-architecture"
+      "path": "docs/orca-backend.md",
+      "audience": "operator-current"
     },
     {
       "path": "docs/remote-secondmates.md",
@@ -339,6 +340,10 @@
     {
       "path": "docs/supervision-protocols/unknown.md",
       "audience": "agent-runtime"
+    },
+    {
+      "path": "docs/telegram.md",
+      "audience": "operator-current"
     },
     {
       "path": "docs/tmux-backend.md",

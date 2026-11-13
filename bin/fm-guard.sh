@@ -208,7 +208,15 @@ if [ "$watcher_healthy" = false ]; then
       elif [ "$sources" -gt 0 ]; then
         printf '●  %s process-event source(s) registered, but %s.\n' "$sources" "$watcher_cause"
       else
-        printf '●  X-mode relay polling needs supervision, but %s.\n' "$watcher_cause"
+        # The only remaining reason fm_supervision_status
+        # (bin/fm-supervision-lib.sh) can have set FM_SUP_NEEDED with zero
+        # in-flight tasks and zero sources: a poll shim needs the watcher
+        # live on an otherwise-idle home. fm_supervision_poll_need_desc is
+        # the shared owner of naming whichever is actually present (a
+        # no-mistakes review finding, 2026-08-23: this and two sibling call
+        # sites in bin/fm-turnend-guard.sh each hand-rolled the identical
+        # check before it existed).
+        printf '●  %s needs supervision, but %s.\n' "$(fm_supervision_poll_need_desc "$STATE")" "$watcher_cause"
       fi
       if [ "$READ_ONLY" -eq 1 ]; then
         printf '●  This read-only session should report the lapse, not repair it.\n'

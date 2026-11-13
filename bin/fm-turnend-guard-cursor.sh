@@ -49,12 +49,6 @@
 # park owner in state/.cursor-park-owner, and once a newer stop has published its
 # claim, an older park still running stands down without emitting. Newest stop
 # wins; the arm's own singleton keeps the overlap from starting a second watcher.
-#
-# PI STAND-DOWN. Exit 0 without parking when PI_CODING_AGENT=true and neither
-# CURSOR_AGENT nor CURSOR_INVOKED_AS is set, so a Pi host that loaded
-# .cursor/hooks.json via pi-cursor-sdk does not dual-watch against
-# fm_watch_arm_pi. Cursor identity keeps parking despite a leaked
-# PI_CODING_AGENT. docs/turnend-guard.md owns the contract.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -108,14 +102,6 @@ SESSION_ID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // "unknown"' 2>/dev/nu
 case "$SESSION_ID" in ''|*[!A-Za-z0-9._-]*) SESSION_ID=unknown ;; esac
 
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
-
-# Pi-host stand-down: docs/turnend-guard.md owns the PI_CODING_AGENT /
-# CURSOR_AGENT / CURSOR_INVOKED_AS contract summarized in this script's header.
-if [ "${PI_CODING_AGENT:-}" = "true" ] \
-  && [ -z "${CURSOR_AGENT:-}" ] \
-  && [ -z "${CURSOR_INVOKED_AS:-}" ]; then
-  exit 0
-fi
 
 lock_acquire_bounded() {  # <lock>
   local lock=$1 attempt=0
@@ -282,9 +268,12 @@ if ! fm_supervision_needed "$STATE" "$GRACE"; then
   exit 0
 fi
 
-# X mode cadence: an opted-in home polls Relay at its generated cadence.
+# Fast poll cadence: an opted-in home polls Relay, or Telegram, at its
+# generated cadence. Both configs export the same FM_CHECK_INTERVAL.
 # shellcheck source=/dev/null
 [ -f "$CONFIG/x-mode.env" ] && . "$CONFIG/x-mode.env"
+# shellcheck source=/dev/null
+[ -f "$CONFIG/tg-mode.env" ] && . "$CONFIG/tg-mode.env"
 
 # --- the park ----------------------------------------------------------------
 # The arm runs as a tracked child of THIS hook process, which stays alive and
